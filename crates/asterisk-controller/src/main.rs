@@ -3,24 +3,30 @@
 //! The Asterisk controller of a Gabion telephony node.
 //!
 //! Runs next to Asterisk on the same machine and controls it on behalf of
-//! the application. Asterisk opens a control connection to the controller
-//! for every call; for every call the controller opens a conversation
-//! connection to the application and translates between Asterisk's language
-//! and the Gabion node protocol. For audio Asterisk opens media connections
-//! to the same address, told apart by the path it asks for.
+//! the application. The controller writes Asterisk's configuration, connects
+//! to Asterisk's control interface on the loopback address, and for every
+//! call opens a conversation connection to the application and translates
+//! between Asterisk's language and the Gabion node protocol. For audio
+//! Asterisk opens media connections to the controller.
 //!
 //! Nothing reaches the controller from the network: it listens on the
 //! loopback address only, and every connection to the application is opened
 //! from here.
 
 mod ari;
+mod asterisk;
+mod asterisk_files;
 mod config;
 mod conversation;
+mod destination;
 mod media;
+mod node;
 mod playout;
+mod settings;
 
 use std::{process::ExitCode, sync::Arc};
 
+use node_protocol::messages::Settings;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::{
     accept_hdr_async,
@@ -30,26 +36,22 @@ use tokio_tungstenite::{
     },
 };
 
-use crate::config::Config;
-
-/// The path Asterisk asks for when it opens a call's control connection.
-const CONTROL_PATH: &str = "/";
-/// The WebSocket subprotocol Asterisk speaks on a control connection.
-const CONTROL_SUBPROTOCOL: &str = "ari";
-
-/// What Asterisk opened a connection for.
-#[derive(Clone, Copy)]
-enum Purpose {
-    /// To have a call controlled.
-    Control,
-    /// To carry the audio of a media channel.
-    Media,
-}
+use crate::{config::Config, node::Node};
 
 #[tokio::main]
 async fn main() -> ExitCode {
     let config = match Config::from_arguments(std::env::args().skip(1)) {
-        Ok(config) => Arc::new(config),
+        Ok(config) => config,
+        Err(problem) => {
+            eprintln!("asterisk-controller: {problem}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Asterisk is started on what is written here, so it is written before
+    // the controller says it is ready.
+    let (settings, secret) = match prepare_asterisk(&config) {
+        Ok(prepared) => prepared,
         Err(problem) => {
             eprintln!("asterisk-controller: {problem}");
             return ExitCode::FAILURE;
@@ -66,15 +68,25 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    // The line a supervisor waits for: the controller accepts Asterisk.
+    // The line whoever starts the node waits for: Asterisk's configuration
+    // is written and its media connections will be accepted. Asterisk may be
+    // started now; the controller finds it by itself.
     println!("asterisk-controller ready on {}", config.listen);
 
-    let door = media::Door::default();
+    let asterisk = asterisk::Asterisk::new(config.asterisk_http, &secret);
+    let node = Arc::new(Node {
+        config,
+        settings,
+        door: media::Door::default(),
+        lines: node::Lines::default(),
+    });
+    tokio::spawn(asterisk::run(Arc::clone(&node), asterisk));
+
     loop {
         tokio::select! {
             accepted = listener.accept() => match accepted {
                 Ok((stream, _peer)) => {
-                    tokio::spawn(accept(stream, Arc::clone(&config), door.clone()));
+                    tokio::spawn(accept_media(stream, node.door.clone()));
                 }
                 Err(error) => eprintln!("asterisk-controller: accept failed: {error}"),
             },
@@ -83,35 +95,53 @@ async fn main() -> ExitCode {
     }
 }
 
-/// Complete the WebSocket handshake of one connection of Asterisk and serve
-/// it as what its path says it is.
-async fn accept(stream: TcpStream, config: Arc<Config>, door: media::Door) {
-    let mut purpose = None;
+/// Read the node's settings and write Asterisk's configuration from them.
+/// Returns the settings and the secret of the control user.
+fn prepare_asterisk(config: &Config) -> Result<(Settings, String), String> {
+    let tree = asterisk_files::Tree::read(&config.asterisk_tree)?;
+    let applied = settings::stored(&config.state)?;
+    let secret = asterisk_files::control_secret(&config.state)?;
+    let main_file = asterisk_files::write(config, &tree, &applied.settings, &secret)?;
+
+    match &applied.fingerprint {
+        Some(fingerprint) => eprintln!(
+            "asterisk-controller: settings {fingerprint} are applied: {} operators, {} lines, \
+             {} entries",
+            applied.settings.operators.len(),
+            applied.settings.lines.len(),
+            applied.settings.entries.len(),
+        ),
+        None => eprintln!(
+            "asterisk-controller: the node has no settings yet: no call enters or leaves it"
+        ),
+    }
+    eprintln!(
+        "asterisk-controller: Asterisk {} is to be started with {}",
+        tree.version,
+        main_file.display()
+    );
+    Ok((applied.settings, secret))
+}
+
+/// Complete the WebSocket handshake of a media connection of Asterisk and
+/// serve it.
+async fn accept_media(stream: TcpStream, door: media::Door) {
     #[expect(
         clippy::result_large_err,
         reason = "the callback's signature is the WebSocket library's"
     )]
     let agree = |request: &Request, mut response: Response| {
-        let (asked_for, subprotocol) = match request.uri().path() {
-            CONTROL_PATH => (Purpose::Control, CONTROL_SUBPROTOCOL),
-            media::PATH => (Purpose::Media, media::SUBPROTOCOL),
-            other => return Err(not_found(other)),
-        };
-        purpose = Some(asked_for);
+        if request.uri().path() != media::PATH {
+            return Err(not_found(request.uri().path()));
+        }
         response.headers_mut().insert(
             SEC_WEBSOCKET_PROTOCOL,
-            HeaderValue::from_static(subprotocol),
+            HeaderValue::from_static(media::SUBPROTOCOL),
         );
         Ok(response)
     };
-
     match accept_hdr_async(stream, agree).await {
-        Ok(asterisk) => match purpose {
-            Some(Purpose::Control) => conversation::serve(asterisk, config, door).await,
-            Some(Purpose::Media) => media::serve(asterisk, door).await,
-            // A handshake that succeeded has been through `agree`.
-            None => {}
-        },
+        Ok(asterisk) => media::serve(asterisk, door).await,
         Err(error) => eprintln!("asterisk-controller: handshake with Asterisk failed: {error}"),
     }
 }

@@ -11,19 +11,13 @@
 use std::fmt::Write as _;
 
 use serde::Deserialize;
-use serde_json::json;
 
-/// A message Asterisk sends on a call's control connection.
+/// Something Asterisk says about the node's application.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type")]
 pub enum Message {
     /// A channel entered the application.
     StasisStart {
-        /// Asterisk's name for the application the channel entered. For a
-        /// call's control connection it is the call's own: channels the
-        /// controller adds to the call are told to enter the same one, and
-        /// so are reported on the same connection.
-        application: String,
         /// Arguments the dialplan gave the application.
         args: Vec<String>,
         /// The channel.
@@ -46,17 +40,52 @@ pub enum Message {
         /// The channel.
         channel: Channel,
     },
-    /// The answer to a request the controller sent on this connection.
-    #[serde(rename = "RESTResponse")]
-    RestResponse {
-        /// The identifier the controller gave the request.
-        request_id: String,
-        /// HTTP status of the answer.
-        status_code: u16,
+    /// A channel is no more.
+    ChannelDestroyed {
+        /// Why, as the telephone network numbers its reasons.
+        cause: i64,
+        /// The channel.
+        channel: Channel,
     },
     /// Anything else Asterisk says.
     #[serde(other)]
     Other,
+}
+
+impl Message {
+    /// The channel a message is about, when it is about one.
+    pub fn channel(&self) -> Option<&str> {
+        match self {
+            Self::StasisStart { channel, .. }
+            | Self::StasisEnd { channel }
+            | Self::ChannelStateChange { channel }
+            | Self::ChannelDtmfReceived { channel, .. }
+            | Self::ChannelDestroyed { channel, .. } => Some(&channel.id),
+            Self::Other => None,
+        }
+    }
+}
+
+/// What is in a Stasis application, as Asterisk describes it.
+#[derive(Debug, Deserialize)]
+pub struct Application {
+    /// Channels the application is told about.
+    pub channel_ids: Vec<String>,
+    /// Bridges the application is told about.
+    pub bridge_ids: Vec<String>,
+}
+
+/// Read Asterisk's description of an application.
+///
+/// # Errors
+///
+/// Text that is not such a description is an error.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "this is Asterisk's language, not the node protocol: there is no description to judge it"
+)]
+pub fn read_application(text: &str) -> Result<Application, serde_json::Error> {
+    serde_json::from_str(text)
 }
 
 /// A channel, as Asterisk describes it.
@@ -108,15 +137,4 @@ pub fn query(value: &str) -> String {
         }
     }
     escaped
-}
-
-/// The text of a request to Asterisk over the call's own connection.
-pub fn request(request_id: &str, method: &str, uri: &str) -> String {
-    json!({
-        "type": "RESTRequest",
-        "request_id": request_id,
-        "method": method,
-        "uri": uri,
-    })
-    .to_string()
 }

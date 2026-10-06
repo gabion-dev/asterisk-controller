@@ -9,9 +9,9 @@
 //! Besides audio the connection carries short messages in Asterisk's own
 //! words; this is the one place that knows them.
 //!
-//! Like a call's control connection, a media connection is closed by
-//! Asterisk and never by the controller: the controller ends the media
-//! channel through the control connection and reads this one to its end.
+//! A media connection is closed by Asterisk and never by the controller:
+//! the controller ends the media channel with a request to Asterisk and
+//! reads this one to its end.
 
 use std::{
     collections::HashMap,
@@ -190,7 +190,7 @@ pub async fn serve(mut socket: Socket, door: Door) {
         Ok(waiter) => carry(socket, waiter).await,
         Err(problem) => {
             eprintln!("asterisk-controller: a media connection was not taken — {problem}");
-            // Nobody will end this channel through a control connection, so
+            // Nobody will end this channel with a request of a conversation, so
             // Asterisk is asked here to end it — and then closes.
             let _ = socket.send(Frame::text(command("HANGUP"))).await;
             while let Some(Ok(_)) = socket.next().await {}

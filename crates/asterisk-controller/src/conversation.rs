@@ -1,17 +1,15 @@
 // crates/asterisk-controller/src/conversation.rs
 
-//! One conversation: Asterisk's control connection for a call on one side,
-//! the application's conversation connection on the other, and the
-//! translation between them.
+//! One conversation: its participants in Asterisk on one side, the
+//! application's conversation connection on the other, and the translation
+//! between them.
 //!
-//! Asterisk opens a control connection for every call. For each one the
-//! controller opens one conversation connection to the application; the
-//! instance that accepts it owns the conversation. From then on events of
-//! Asterisk become events of the node protocol, and commands of the
-//! application become requests to Asterisk.
-//!
-//! The control connection is closed by Asterisk and never by the controller
-//! (see [`until_asterisk_closes`]).
+//! A call that arrives becomes a conversation. For each one the controller
+//! opens one conversation connection to the application; the instance that
+//! accepts it owns the conversation. From then on what Asterisk says about
+//! the conversation's channels becomes events of the node protocol, and
+//! commands of the application become requests to Asterisk
+//! ([`crate::asterisk`]).
 //!
 //! Audio between the application and a participant takes a path of its own
 //! inside Asterisk — a media channel joined to the participant's channel —
@@ -27,8 +25,8 @@ use node_protocol::{
     audio::{AudioFrame, AudioFrameError},
     messages::{
         ApplicationMessage, Command, CommandOutcome, CommandRejection, ControllerMessage,
-        Departure, EndReason, Event, Opening, Origin, Participant, ParticipantId,
-        ParticipantMedium, SegmentId,
+        Departure, EndReason, Event, LineId, Opening, Origin, Participant, ParticipantId,
+        ParticipantMedium, PhoneNumber, RejectReason, SegmentId,
     },
 };
 use tokio::{net::TcpStream, sync::mpsc};
@@ -42,12 +40,15 @@ use tokio_tungstenite::{
 
 use crate::{
     ari,
-    config::{Config, PROTOCOL_VERSION},
+    asterisk::{FromAsterisk, Line},
+    asterisk_files::{APPLICATION, operator_name},
+    config::PROTOCOL_VERSION,
+    destination,
     media::{self, FromMedia},
+    node::{Node, Place},
     playout::{FRAME_BYTES, Outcome, Playout, ToMedium},
 };
 
-type AsteriskSocket = WebSocketStream<TcpStream>;
 type ApplicationSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 /// Milliseconds of audio in one heard frame.
@@ -93,6 +94,13 @@ enum ParticipantState {
     InConversation,
 }
 
+impl Member {
+    /// Whether they called in and have not been answered yet.
+    fn rings_in(&self) -> bool {
+        self.state == ParticipantState::Ringing && !self.awaiting_answer
+    }
+}
+
 struct Member {
     id: ParticipantId,
     channel: String,
@@ -102,6 +110,13 @@ struct Member {
     removed_by_us: bool,
     /// The participant's audio path, once the application has asked for it.
     sound: Option<Sound>,
+    /// The node is calling them and they have not answered. Until they do,
+    /// their channel is not in the node's application: it can be dropped
+    /// and nothing else.
+    awaiting_answer: bool,
+    /// Their place on the outbound line they were called on; given back
+    /// when they are gone.
+    _place: Option<Place>,
 }
 
 /// The audio path between the application and one participant.
@@ -151,18 +166,25 @@ impl fmt::Display for SoundStep {
 }
 
 /// What a request to Asterisk was for — what to do with its answer.
+///
+/// A command of the application is answered at once, from what the
+/// controller itself knows of the conversation, and what Asterisk then does
+/// arrives as events. The answer to a command never waits for Asterisk —
+/// with the one exception below.
 enum Pending {
-    /// A command of the application; its outcome is owed.
-    Command(u64),
+    /// The `dial` command: Asterisk's word that the call is being placed
+    /// makes the participant known to the application.
+    Dial(u64, Participant),
     /// A step of opening a participant's audio path.
     Sound(ParticipantId, SoundStep),
     /// Housekeeping of the controller; nobody waits for the answer.
     Internal,
 }
 
-struct Conversation<'a> {
+struct Conversation {
     id: String,
-    asterisk: &'a mut AsteriskSocket,
+    node: Arc<Node>,
+    asterisk: Line,
     application: ApplicationSocket,
     members: Vec<Member>,
     pending: HashMap<String, Pending>,
@@ -170,119 +192,51 @@ struct Conversation<'a> {
     /// Set by the `end` command: the conversation ends when the last
     /// participant is gone, and it ends because the handler said so.
     ended_by_handler: bool,
-    /// Asterisk's name for this call's application: channels the controller
-    /// adds to the call enter it, and are reported on this call's connection.
-    asterisk_application: String,
-    door: media::Door,
     /// What the media connections of this conversation say.
     from_media: mpsc::Receiver<FromMedia>,
     /// The other end of `from_media`, given to each media connection.
     media_inbox: mpsc::Sender<FromMedia>,
     /// How many audio paths have been opened: names their channels.
     sounds_opened: u64,
+    /// How many participants the conversation has had: names the next one.
+    participants: u64,
+    /// Participants being called whom the application does not know yet,
+    /// with what has happened to them meanwhile. The application learns of
+    /// such a participant from the answer to its `dial` command, and that
+    /// answer waits for Asterisk's; events about them wait with it.
+    unannounced: HashMap<ParticipantId, Vec<Event>>,
 }
 
-/// Serve one control connection of Asterisk, from its first word until
-/// Asterisk closes it.
-pub async fn serve(mut asterisk: AsteriskSocket, config: Arc<Config>, door: media::Door) {
-    match first_participant(&mut asterisk).await {
-        Ok(arrival) => {
-            // A conversation exists from the moment it has a participant, so
-            // it is named here and not when the connection was accepted: a
-            // connection that brings no channel is not a conversation.
-            let id = uuid::Uuid::new_v4().to_string();
-            match carry(&id, &mut asterisk, arrival, &config, door).await {
-                Ok(()) => eprintln!("conversation {id}: ended"),
-                Err(fault) => eprintln!("conversation {id}: FAILED — {fault}"),
-            }
-        }
-        Err(fault) => {
-            eprintln!("asterisk-controller: a control connection carried no call — {fault}");
-        }
-    }
-    until_asterisk_closes(&mut asterisk).await;
+/// The channel a call arrived on.
+pub struct Arrival {
+    /// The channel.
+    pub channel: ari::Channel,
+    /// The entry it came through.
+    pub origin: Origin,
 }
 
 /// Carry one conversation from its first participant to its end.
-async fn carry(
-    id: &str,
-    asterisk: &mut AsteriskSocket,
-    arrival: Arrival,
-    config: &Config,
-    door: media::Door,
-) -> Result<(), Fault> {
-    let (mut conversation, hello) = open(id, asterisk, arrival, config, door).await?;
-    // From here on a participant is on the line. Whatever goes wrong — the
-    // application declines, vanishes, breaks the protocol — the participant
-    // is not left there with no one in control.
-    let result = async {
-        conversation.tell(&hello).await?;
-        conversation.await_acceptance().await?;
-        conversation.run().await
+pub async fn carry(id: String, asterisk: Line, arrival: Arrival, node: Arc<Node>) {
+    let outcome = async {
+        let (mut conversation, hello) = open(&id, asterisk, arrival, node).await?;
+        // From here on a participant is on the line. Whatever goes wrong —
+        // the application declines, vanishes, breaks the protocol — the
+        // participant is not left there with no one in control.
+        let result = async {
+            conversation.tell(&hello).await?;
+            conversation.await_acceptance().await?;
+            conversation.run().await
+        }
+        .await;
+        if let Err(fault) = &result {
+            conversation.abandon(fault).await;
+        }
+        result
     }
     .await;
-    if let Err(fault) = &result {
-        conversation.abandon(fault).await;
-    }
-    result
-}
-
-/// Leave the closing of a control connection to Asterisk: read it to its end.
-///
-/// Asterisk closes the connection of a call itself, a few seconds after the
-/// call's last channel has left — it still has events to send about channels
-/// that are being torn down. A peer that closes first, however properly, is
-/// to Asterisk a peer that was lost: it drops the connection and opens it
-/// again for the same call. And while it drops a connection, an event it
-/// sends for that call can crash it — Asterisk 22.11.0 dies of a
-/// segmentation fault in its WebSocket write. So the controller never closes
-/// this connection and never lets go of it early; what Asterisk says
-/// meanwhile needs no answer, since the conversation is already over.
-async fn until_asterisk_closes(asterisk: &mut AsteriskSocket) {
-    while let Some(Ok(_)) = asterisk.next().await {}
-}
-
-/// The channel a control connection was opened for.
-struct Arrival {
-    channel: ari::Channel,
-    /// The entry it came through.
-    origin: Origin,
-    /// Asterisk's name for the call's application.
-    application: String,
-}
-
-/// Wait for the channel that opened the connection and read which entry it
-/// came through.
-async fn first_participant(asterisk: &mut AsteriskSocket) -> Result<Arrival, Fault> {
-    loop {
-        let text = next_text(asterisk).await?.ok_or_else(|| {
-            Fault::Asterisk("closed the connection before any channel entered".into())
-        })?;
-        if let ari::Message::StasisStart {
-            application,
-            args,
-            channel,
-        } = read_asterisk(&text)?
-        {
-            return match entry(&args) {
-                Ok(origin) => Ok(Arrival {
-                    channel,
-                    origin,
-                    application,
-                }),
-                Err(fault) => {
-                    // A channel nobody can own must not stay up: Asterisk is
-                    // told to drop it before the fault is reported.
-                    let drop = ari::request(
-                        "entry-refused",
-                        "DELETE",
-                        &format!("channels/{}", channel.id),
-                    );
-                    let _ = asterisk.send(Frame::text(drop)).await;
-                    Err(fault)
-                }
-            };
-        }
+    match outcome {
+        Ok(()) => eprintln!("conversation {id}: ended"),
+        Err(fault) => eprintln!("conversation {id}: FAILED — {fault}"),
     }
 }
 
@@ -290,7 +244,7 @@ async fn first_participant(asterisk: &mut AsteriskSocket) -> Result<Arrival, Fau
 ///
 /// The dialplan is written by the controller, so the arguments are its own
 /// words: `dialed_number,<number>`.
-fn entry(arguments: &[String]) -> Result<Origin, Fault> {
+pub fn entry(arguments: &[String]) -> Result<Origin, Fault> {
     match arguments {
         [kind, number] if kind == "dialed_number" => Ok(Origin::DialedNumber {
             dialed: number
@@ -302,18 +256,14 @@ fn entry(arguments: &[String]) -> Result<Origin, Fault> {
 }
 
 /// Open the conversation connection and prepare the hello for it.
-async fn open<'a>(
+async fn open(
     id: &str,
-    asterisk: &'a mut AsteriskSocket,
+    asterisk: Line,
     arrival: Arrival,
-    config: &Config,
-    door: media::Door,
-) -> Result<(Conversation<'a>, ControllerMessage), Fault> {
-    let Arrival {
-        channel,
-        origin,
-        application: asterisk_application,
-    } = arrival;
+    node: Arc<Node>,
+) -> Result<(Conversation, ControllerMessage), Fault> {
+    let Arrival { channel, origin } = arrival;
+    let config = &node.config;
     let first = Member {
         id: participant_id(1)?,
         channel: channel.id,
@@ -324,14 +274,15 @@ async fn open<'a>(
         },
         removed_by_us: false,
         sound: None,
+        awaiting_answer: false,
+        _place: None,
     };
 
     let connected = connect_async(config.application_url.as_str()).await;
     let application = match connected {
         Ok((socket, _response)) => socket,
         Err(error) => {
-            let drop = ari::request("no-owner", "DELETE", &format!("channels/{}", first.channel));
-            let _ = asterisk.send(Frame::text(drop)).await;
+            asterisk.ask("no-owner", "DELETE", &format!("channels/{}", first.channel));
             return Err(Fault::Application(format!(
                 "cannot open a conversation connection to {}: {error}",
                 config.application_url
@@ -367,22 +318,23 @@ async fn open<'a>(
     let (media_inbox, from_media) = mpsc::channel(MEDIA_BACKLOG);
     let conversation = Conversation {
         id: id.to_owned(),
+        node: Arc::clone(&node),
         asterisk,
         application,
         members: vec![first],
         pending: HashMap::new(),
         next_request: 0,
         ended_by_handler: false,
-        asterisk_application,
-        door,
         from_media,
         media_inbox,
         sounds_opened: 0,
+        participants: 1,
+        unannounced: HashMap::new(),
     };
     Ok((conversation, hello))
 }
 
-impl Conversation<'_> {
+impl Conversation {
     /// Wait for the application to take the conversation.
     async fn await_acceptance(&mut self) -> Result<(), Fault> {
         loop {
@@ -412,13 +364,18 @@ impl Conversation<'_> {
 
     /// Translate in both directions until the conversation is over.
     async fn run(&mut self) -> Result<(), Fault> {
-        while !self.members.is_empty() {
+        // The conversation lasts while it has a participant — or is still
+        // owed Asterisk's word about one it tried to call: the application
+        // has a `dial` command waiting for its answer.
+        while !(self.members.is_empty() && self.unannounced.is_empty()) {
             tokio::select! {
-                said = next_text(self.asterisk) => match said? {
-                    Some(text) => self.on_asterisk(read_asterisk(&text)?).await?,
-                    // Asterisk closes the connection when the last channel
-                    // is gone; whoever is still listed left with it.
-                    None => self.asterisk_gone().await?,
+                said = self.asterisk.next() => match said {
+                    FromAsterisk::Said(message) => self.on_asterisk(message).await?,
+                    FromAsterisk::Answered { request, status } => {
+                        self.answered(&request, status).await?;
+                    }
+                    // Whoever is still listed left with Asterisk.
+                    FromAsterisk::Gone => self.asterisk_gone().await?,
                 },
                 said = self.application.next() => match said {
                     Some(Ok(Frame::Text(text))) => {
@@ -452,6 +409,7 @@ impl Conversation<'_> {
                 let answered = self.members.iter_mut().find(|member| {
                     member.channel == channel.id
                         && member.state == ParticipantState::Ringing
+                        && !member.awaiting_answer
                         && channel.state == ari::STATE_UP
                 });
                 if let Some(member) = answered {
@@ -475,35 +433,61 @@ impl Conversation<'_> {
                         .await?;
                 }
             }
-            ari::Message::StasisEnd { channel } => self.left(&channel.id).await?,
-            ari::Message::RestResponse {
-                request_id,
-                status_code,
-            } => match self.pending.remove(&request_id) {
-                Some(Pending::Command(id)) => {
-                    let outcome = outcome_of(status_code)?;
-                    self.tell(&ControllerMessage::CommandResult { id, outcome })
-                        .await?;
-                }
-                Some(Pending::Sound(participant, step)) => {
-                    self.sound_step_answered(&participant, step, status_code)
-                        .await?;
-                }
-                Some(Pending::Internal) | None => {}
-            },
-            // The first channel has already entered. The only channels that
-            // enter later are media channels the controller itself created;
-            // participants are added by commands this build does not have yet.
-            ari::Message::StasisStart { channel, .. } => {
-                self.media_channel_entered(&channel.id).await?;
+            ari::Message::StasisEnd { channel } => self.left(&channel.id, None).await?,
+            // A participant who was being called and did not answer was
+            // never in the application: the end of their channel is the
+            // only word of them. For anyone else it comes after the word
+            // that they left, and finds nobody.
+            ari::Message::ChannelDestroyed { cause, channel } => {
+                self.left(&channel.id, Some(cause)).await?;
             }
+            ari::Message::StasisStart { channel, .. } => self.entered(&channel.id).await?,
             ari::Message::Other => {}
         }
         Ok(())
     }
 
-    /// A channel is gone: its participant left.
-    async fn left(&mut self, channel: &str) -> Result<(), Fault> {
+    /// Asterisk answered a request of this conversation.
+    async fn answered(&mut self, request_id: &str, status_code: u16) -> Result<(), Fault> {
+        match self.pending.remove(request_id) {
+            Some(Pending::Dial(id, participant)) => {
+                self.call_placed(id, participant, status_code).await
+            }
+            Some(Pending::Sound(participant, step)) => {
+                self.sound_step_answered(&participant, step, status_code)
+                    .await
+            }
+            Some(Pending::Internal) | None => Ok(()),
+        }
+    }
+
+    /// A channel of this conversation entered the node's application: a
+    /// participant who was being called has answered, or the media channel
+    /// of a participant is ready to be joined to them.
+    async fn entered(&mut self, channel: &str) -> Result<(), Fault> {
+        let answered = self
+            .members
+            .iter_mut()
+            .find(|member| member.channel == channel && member.awaiting_answer);
+        if let Some(member) = answered {
+            member.awaiting_answer = false;
+            member.state = ParticipantState::InConversation;
+            let participant = member.id.clone();
+            return self
+                .about(
+                    &participant.clone(),
+                    Event::ParticipantAnswered { participant },
+                )
+                .await;
+        }
+        self.media_channel_entered(channel);
+        Ok(())
+    }
+
+    /// A channel is gone: its participant left. `cause` is the telephone
+    /// network's reason, when the channel ended without ever having been in
+    /// the application.
+    async fn left(&mut self, channel: &str, cause: Option<i64>) -> Result<(), Fault> {
         let Some(position) = self
             .members
             .iter()
@@ -518,18 +502,36 @@ impl Conversation<'_> {
             let mut outcomes = Vec::new();
             sound.playout.abandon(&mut outcomes);
             self.report(&member.id, outcomes).await?;
-            self.close_sound(&sound).await?;
+            self.close_sound(&sound);
         }
         let departure = if member.removed_by_us {
             Departure::Removed
+        } else if member.awaiting_answer {
+            unanswered(cause)
         } else {
             Departure::HungUp
         };
-        self.event(Event::ParticipantLeft {
-            participant: member.id,
-            departure,
-        })
+        let participant = member.id.clone();
+        self.about(
+            &participant.clone(),
+            Event::ParticipantLeft {
+                participant,
+                departure,
+            },
+        )
         .await
+    }
+
+    /// Tell the application something about a participant — at once, or,
+    /// while it does not know the participant yet, as soon as it does.
+    async fn about(&mut self, participant: &ParticipantId, event: Event) -> Result<(), Fault> {
+        match self.unannounced.get_mut(participant) {
+            Some(waiting) => {
+                waiting.push(event);
+                Ok(())
+            }
+            None => self.event(event).await,
+        }
     }
 
     async fn asterisk_gone(&mut self) -> Result<(), Fault> {
@@ -539,7 +541,7 @@ impl Conversation<'_> {
             .map(|member| member.channel.clone())
             .collect();
         for channel in channels {
-            self.left(&channel).await?;
+            self.left(&channel, None).await?;
         }
         Ok(())
     }
@@ -557,49 +559,29 @@ impl Conversation<'_> {
 
     async fn command(&mut self, id: u64, command: Command) -> Result<(), Fault> {
         match command {
-            Command::Answer { participant } => {
-                let Some(channel) = self.channel_of(&participant) else {
-                    return self.reject(id, CommandRejection::UnknownParticipant).await;
-                };
-                self.ask(
-                    Pending::Command(id),
-                    "POST",
-                    &format!("channels/{channel}/answer"),
-                )
-                .await
-            }
-            Command::Remove { participant } | Command::Reject { participant, .. } => {
-                let Some(member) = self
-                    .members
-                    .iter_mut()
-                    .find(|member| member.id == participant)
-                else {
+            Command::Answer { participant } => self.answer(id, &participant).await,
+            Command::Reject {
+                participant,
+                reason,
+            } => self.turn_away(id, &participant, reason).await,
+            Command::Remove { participant } => {
+                let Some(member) = self.member(&participant) else {
                     return self.reject(id, CommandRejection::UnknownParticipant).await;
                 };
                 member.removed_by_us = true;
                 let channel = member.channel.clone();
-                self.ask(
-                    Pending::Command(id),
-                    "DELETE",
-                    &format!("channels/{channel}"),
-                )
-                .await
+                self.ask(Pending::Internal, "DELETE", &format!("channels/{channel}"));
+                self.accept(id).await
             }
+            Command::Dial {
+                number,
+                line,
+                answer_limit_ms,
+            } => self.dial(id, &number, &line, answer_limit_ms).await,
             Command::SendDigits {
                 participant,
                 digits,
-            } => {
-                let Some(channel) = self.channel_of(&participant) else {
-                    return self.reject(id, CommandRejection::UnknownParticipant).await;
-                };
-                let digits = digits.as_str().replace('#', "%23").replace('*', "%2A");
-                self.ask(
-                    Pending::Command(id),
-                    "POST",
-                    &format!("channels/{channel}/dtmf?dtmf={digits}"),
-                )
-                .await
-            }
+            } => self.send_digits(id, &participant, digits.as_str()).await,
             Command::End => {
                 self.ended_by_handler = true;
                 let channels: Vec<String> = self
@@ -611,8 +593,7 @@ impl Conversation<'_> {
                     })
                     .collect();
                 for channel in channels {
-                    self.ask(Pending::Internal, "DELETE", &format!("channels/{channel}"))
-                        .await?;
+                    self.ask(Pending::Internal, "DELETE", &format!("channels/{channel}"));
                 }
                 self.accept(id).await
             }
@@ -631,7 +612,6 @@ impl Conversation<'_> {
                 segment,
             } => self.play(id, &participant, segment).await,
             Command::FlushPlayback { participant } => self.flush_playback(id, &participant).await,
-            Command::Dial { .. } => Err(Fault::NotImplemented("dial")),
             Command::Connect { .. } => Err(Fault::NotImplemented("connect")),
             Command::Separate { .. } => Err(Fault::NotImplemented("separate")),
             Command::HoldFor { .. } => Err(Fault::NotImplemented("hold_for")),
@@ -640,11 +620,80 @@ impl Conversation<'_> {
         }
     }
 
-    fn channel_of(&self, participant: &ParticipantId) -> Option<String> {
-        self.members
-            .iter()
-            .find(|member| member.id == *participant)
-            .map(|member| member.channel.clone())
+    /// The participant a command is about, if they are in the state the
+    /// command needs; otherwise the reason the command is rejected for.
+    fn member_who(
+        &mut self,
+        participant: &ParticipantId,
+        is_ready: impl Fn(&Member) -> bool,
+    ) -> Result<&mut Member, CommandRejection> {
+        match self.member(participant) {
+            None => Err(CommandRejection::UnknownParticipant),
+            Some(member) if is_ready(member) => Ok(member),
+            Some(_) => Err(CommandRejection::ParticipantNotInRequiredState),
+        }
+    }
+
+    /// Answer a participant who called in and still rings. One the node is
+    /// calling answers by themselves.
+    async fn answer(&mut self, id: u64, participant: &ParticipantId) -> Result<(), Fault> {
+        let channel = match self.member_who(participant, Member::rings_in) {
+            Ok(member) => member.channel.clone(),
+            Err(reason) => return self.reject(id, reason).await,
+        };
+        self.ask(
+            Pending::Internal,
+            "POST",
+            &format!("channels/{channel}/answer"),
+        );
+        self.accept(id).await
+    }
+
+    /// Turn away a call that still rings; the caller's network is told why.
+    async fn turn_away(
+        &mut self,
+        id: u64,
+        participant: &ParticipantId,
+        reason: RejectReason,
+    ) -> Result<(), Fault> {
+        let channel = match self.member_who(participant, Member::rings_in) {
+            Ok(member) => {
+                member.removed_by_us = true;
+                member.channel.clone()
+            }
+            Err(reason) => return self.reject(id, reason).await,
+        };
+        let said = match reason {
+            RejectReason::Busy => "busy",
+            RejectReason::Declined => "rejected",
+            RejectReason::RateLimited => "congestion",
+        };
+        self.ask(
+            Pending::Internal,
+            "DELETE",
+            &format!("channels/{channel}?reason={said}"),
+        );
+        self.accept(id).await
+    }
+
+    /// Send tone digits to a participant who is in the conversation.
+    async fn send_digits(
+        &mut self,
+        id: u64,
+        participant: &ParticipantId,
+        digits: &str,
+    ) -> Result<(), Fault> {
+        let in_conversation = |member: &Member| member.state == ParticipantState::InConversation;
+        let channel = match self.member_who(participant, in_conversation) {
+            Ok(member) => member.channel.clone(),
+            Err(reason) => return self.reject(id, reason).await,
+        };
+        self.ask(
+            Pending::Internal,
+            "POST",
+            &format!("channels/{channel}/dtmf?dtmf={}", ari::query(digits)),
+        );
+        self.accept(id).await
     }
 
     fn member(&mut self, participant: &ParticipantId) -> Option<&mut Member> {
@@ -670,15 +719,12 @@ impl Conversation<'_> {
             .await
     }
 
-    /// Send a request to Asterisk over the call's own connection.
-    async fn ask(&mut self, pending: Pending, method: &str, uri: &str) -> Result<(), Fault> {
+    /// Send a request to Asterisk; what its answer is for is remembered.
+    fn ask(&mut self, pending: Pending, method: &str, uri: &str) {
         self.next_request += 1;
-        let request_id = format!("{}-{}", self.id, self.next_request);
-        self.pending.insert(request_id.clone(), pending);
-        self.asterisk
-            .send(Frame::text(ari::request(&request_id, method, uri)))
-            .await
-            .map_err(|error| Fault::Asterisk(error.to_string()))
+        let request = self.next_request.to_string();
+        self.pending.insert(request.clone(), pending);
+        self.asterisk.ask(&request, method, uri);
     }
 
     async fn event(&mut self, event: Event) -> Result<(), Fault> {
@@ -695,7 +741,7 @@ impl Conversation<'_> {
 
     /// The application asks to hear a participant.
     async fn listen(&mut self, id: u64, participant: &ParticipantId) -> Result<(), Fault> {
-        if let Some(reason) = self.open_sound(participant).await? {
+        if let Some(reason) = self.open_sound(participant) {
             return self.reject(id, reason).await;
         }
         if let Some(sound) = self.sound(participant) {
@@ -711,7 +757,7 @@ impl Conversation<'_> {
         participant: &ParticipantId,
         segment: SegmentId,
     ) -> Result<(), Fault> {
-        if let Some(reason) = self.open_sound(participant).await? {
+        if let Some(reason) = self.open_sound(participant) {
             return self.reject(id, reason).await;
         }
         let queued = self
@@ -744,22 +790,19 @@ impl Conversation<'_> {
 
     /// Make sure a participant has an audio path, opening one if they have
     /// none. Answers with the reason when they cannot have one.
-    async fn open_sound(
-        &mut self,
-        participant: &ParticipantId,
-    ) -> Result<Option<CommandRejection>, Fault> {
+    fn open_sound(&mut self, participant: &ParticipantId) -> Option<CommandRejection> {
         let Some(member) = self
             .members
             .iter_mut()
             .find(|member| member.id == *participant)
         else {
-            return Ok(Some(CommandRejection::UnknownParticipant));
+            return Some(CommandRejection::UnknownParticipant);
         };
         if member.state != ParticipantState::InConversation {
-            return Ok(Some(CommandRejection::ParticipantNotInRequiredState));
+            return Some(CommandRejection::ParticipantNotInRequiredState);
         }
         if member.sound.is_some() {
-            return Ok(None);
+            return None;
         }
 
         self.sounds_opened += 1;
@@ -776,7 +819,8 @@ impl Conversation<'_> {
         });
         // Asterisk opens the media connection as soon as the channel exists:
         // whoever is to take it must be waiting before the channel is asked for.
-        self.door.expect(
+        self.asterisk.own(&channel);
+        self.node.door.expect(
             channel.clone(),
             media::Waiter {
                 participant: participant.clone(),
@@ -786,7 +830,7 @@ impl Conversation<'_> {
         let uri = format!(
             "channels/externalMedia?app={}&external_host={}&transport=websocket\
              &encapsulation=none&format={}&channelId={}&transport_data={}",
-            ari::query(&self.asterisk_application),
+            ari::query(APPLICATION),
             media::CONNECTION,
             media::FORMAT,
             ari::query(&channel),
@@ -796,14 +840,13 @@ impl Conversation<'_> {
             Pending::Sound(participant.clone(), SoundStep::MediaChannel),
             "POST",
             &uri,
-        )
-        .await?;
-        Ok(None)
+        );
+        None
     }
 
-    /// A channel entered the call's application. If it is the media channel
-    /// of a participant, it is joined to that participant now.
-    async fn media_channel_entered(&mut self, channel: &str) -> Result<(), Fault> {
+    /// If a channel that entered the application is the media channel of a
+    /// participant, it is joined to that participant now.
+    fn media_channel_entered(&mut self, channel: &str) {
         let path = self.members.iter().find_map(|member| {
             member
                 .sound
@@ -818,14 +861,13 @@ impl Conversation<'_> {
                 })
         });
         let Some((participant, participant_channel, bridge)) = path else {
-            return Ok(());
+            return;
         };
         self.ask(
             Pending::Sound(participant.clone(), SoundStep::Bridge),
             "POST",
             &format!("bridges?type=mixing&bridgeId={}", ari::query(&bridge)),
-        )
-        .await?;
+        );
         self.ask(
             Pending::Sound(participant, SoundStep::Join),
             "POST",
@@ -834,8 +876,7 @@ impl Conversation<'_> {
                 ari::query(&participant_channel),
                 ari::query(channel),
             ),
-        )
-        .await
+        );
     }
 
     /// Asterisk answered a step of opening a participant's audio path.
@@ -865,20 +906,100 @@ impl Conversation<'_> {
 
     /// End a participant's audio path in Asterisk. Asterisk then closes the
     /// media connection itself.
-    async fn close_sound(&mut self, sound: &Sound) -> Result<(), Fault> {
-        self.door.forget(&sound.channel);
-        self.ask(
-            Pending::Internal,
-            "DELETE",
-            &format!("channels/{}", sound.channel),
-        )
-        .await?;
-        self.ask(
-            Pending::Internal,
-            "DELETE",
-            &format!("bridges/{}", sound.bridge),
-        )
-        .await
+    fn close_sound(&self, sound: &Sound) {
+        self.node.door.forget(&sound.channel);
+        for gone in [
+            format!("channels/{}", sound.channel),
+            format!("bridges/{}", sound.bridge),
+        ] {
+            self.asterisk.ask("sound-closed", "DELETE", &gone);
+        }
+    }
+
+    /// The application adds a participant by dialling.
+    async fn dial(
+        &mut self,
+        id: u64,
+        number: &PhoneNumber,
+        line: &LineId,
+        answer_limit_ms: u64,
+    ) -> Result<(), Fault> {
+        let node = Arc::clone(&self.node);
+        let route = match destination::judge(&node.settings, line, number) {
+            Ok(route) => route,
+            Err(reason) => return self.reject(id, reason).await,
+        };
+        let Some(place) = node.lines.take(route.line) else {
+            return self
+                .reject(id, CommandRejection::OutboundLimitReached)
+                .await;
+        };
+
+        self.participants += 1;
+        let participant = Participant {
+            id: participant_id(self.participants)?,
+            medium: ParticipantMedium::TelephoneNetwork,
+            number: Some(number.clone()),
+        };
+        let channel = format!("{}.participant-{}", self.id, self.participants);
+        self.asterisk.own(&channel);
+        self.members.push(Member {
+            id: participant.id.clone(),
+            channel: channel.clone(),
+            state: ParticipantState::Ringing,
+            removed_by_us: false,
+            sound: None,
+            awaiting_answer: true,
+            _place: Some(place),
+        });
+        self.unannounced.insert(participant.id.clone(), Vec::new());
+
+        // Asterisk counts the wait for an answer in whole seconds.
+        let wait_seconds = answer_limit_ms.div_ceil(1000).max(1);
+        let uri = format!(
+            "channels?endpoint={}&app={}&callerId={}&timeout={wait_seconds}&channelId={}",
+            ari::query(&format!(
+                "PJSIP/{}@{}",
+                number.as_str(),
+                operator_name(route.operator)
+            )),
+            ari::query(APPLICATION),
+            // The number shown is the line's: no command chooses it.
+            ari::query(route.line.number.as_str()),
+            ari::query(&channel),
+        );
+        self.ask(Pending::Dial(id, participant), "POST", &uri);
+        Ok(())
+    }
+
+    /// Asterisk answered the request to place a call. Only now does the
+    /// application learn of the participant — or that there is none.
+    async fn call_placed(
+        &mut self,
+        id: u64,
+        participant: Participant,
+        status_code: u16,
+    ) -> Result<(), Fault> {
+        let waiting = self.unannounced.remove(&participant.id).unwrap_or_default();
+        if !(200..=299).contains(&status_code) {
+            // Asterisk could not even begin: the operator's trunk is not
+            // there for it. Nobody was called.
+            self.members.retain(|member| member.id != participant.id);
+            return self
+                .reject(id, CommandRejection::NoOperatorForDestination)
+                .await;
+        }
+        let outcome = CommandOutcome::AcceptedParticipant {
+            participant: participant.id.clone(),
+        };
+        self.tell(&ControllerMessage::CommandResult { id, outcome })
+            .await?;
+        self.event(Event::ParticipantRinging { participant })
+            .await?;
+        for event in waiting {
+            self.event(event).await?;
+        }
+        Ok(())
     }
 
     /// Hand to a participant's media channel as much of their playback queue
@@ -1059,15 +1180,10 @@ impl Conversation<'_> {
     /// one controls, and the application is told why its connection closes.
     async fn abandon(&mut self, fault: &Fault) {
         for member in &self.members {
-            let mut uris = vec![format!("channels/{}", member.channel)];
+            self.asterisk
+                .ask("abandon", "DELETE", &format!("channels/{}", member.channel));
             if let Some(sound) = &member.sound {
-                self.door.forget(&sound.channel);
-                uris.push(format!("channels/{}", sound.channel));
-                uris.push(format!("bridges/{}", sound.bridge));
-            }
-            for uri in uris {
-                let drop = ari::request("abandon", "DELETE", &uri);
-                let _ = self.asterisk.send(Frame::text(drop)).await;
+                self.close_sound(sound);
             }
         }
         let close = CloseFrame {
@@ -1102,19 +1218,14 @@ async fn hand_over(sink: &mut media::Sink, to_medium: Vec<ToMedium>) -> Result<(
     sink.flush().await.map_err(failed)
 }
 
-/// What Asterisk's answer to a request means for the command behind it.
-fn outcome_of(status_code: u16) -> Result<CommandOutcome, Fault> {
-    match status_code {
-        200..=299 => Ok(CommandOutcome::Accepted),
-        404 => Ok(CommandOutcome::Rejected {
-            reason: CommandRejection::UnknownParticipant,
-        }),
-        400 | 409 | 412 | 422 => Ok(CommandOutcome::Rejected {
-            reason: CommandRejection::ParticipantNotInRequiredState,
-        }),
-        other => Err(Fault::Asterisk(format!(
-            "answered a request with status {other}"
-        ))),
+/// Why a participant who was being called is gone without having answered,
+/// from the telephone network's reason for the end of their channel.
+fn unanswered(cause: Option<i64>) -> Departure {
+    match cause {
+        Some(17) => Departure::Busy,
+        // No answer in the time allowed, or no response at all.
+        Some(18 | 19) | None => Departure::NotAnswered,
+        Some(medium_code) => Departure::DialFailed(medium_code),
     }
 }
 
@@ -1124,21 +1235,15 @@ fn participant_id(number: u64) -> Result<ParticipantId, Fault> {
         .map_err(|_| Fault::Asterisk("participant identifier is not valid".into()))
 }
 
-fn read_asterisk(text: &str) -> Result<ari::Message, Fault> {
-    ari::read(text).map_err(|error| Fault::Asterisk(format!("said something unreadable: {error}")))
-}
-
-/// The next text message of a connection; `None` when it has closed.
-async fn next_text<S>(socket: &mut WebSocketStream<S>) -> Result<Option<String>, Fault>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-{
+/// The next text message of the conversation connection; `None` when it
+/// has closed.
+async fn next_text(socket: &mut ApplicationSocket) -> Result<Option<String>, Fault> {
     loop {
         match socket.next().await {
             Some(Ok(Frame::Text(text))) => return Ok(Some(text.as_str().to_owned())),
             Some(Ok(Frame::Close(_))) | None => return Ok(None),
             Some(Ok(Frame::Binary(_) | Frame::Ping(_) | Frame::Pong(_) | Frame::Frame(_))) => {}
-            Some(Err(error)) => return Err(Fault::Asterisk(error.to_string())),
+            Some(Err(error)) => return Err(Fault::Application(error.to_string())),
         }
     }
 }
