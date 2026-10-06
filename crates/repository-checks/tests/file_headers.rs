@@ -1,5 +1,7 @@
 // crates/repository-checks/tests/file_headers.rs
-//! Every file states its own path, from the repository root, at its top.
+
+//! Every file states its own path, from the repository root, at its top,
+//! and an empty line sets that line apart from the file's own content.
 //!
 //! A file opened on its own — in a review, a search result, a pasted
 //! fragment — then says where it lives. The form of the line depends on the
@@ -40,7 +42,7 @@ enum Marking {
 fn marking_of(file_name: &str) -> Option<Marking> {
     let extension = Path::new(file_name).extension().and_then(|e| e.to_str());
     match (file_name, extension) {
-        (_, Some("rs")) => Some(Marking::Line {
+        (_, Some("rs" | "java")) => Some(Marking::Line {
             prefix: "// ",
             suffix: "",
         }),
@@ -118,6 +120,10 @@ fn every_file_states_its_path_at_the_top() -> TestResult {
                 if stated != expected {
                     problems.push(format!(
                         "{relative}: the top of the file must read `{expected}`, found `{stated}`"
+                    ));
+                } else if lines.next().is_some_and(|after| !after.trim().is_empty()) {
+                    problems.push(format!(
+                        "{relative}: the path line must be followed by an empty line"
                     ));
                 }
             }

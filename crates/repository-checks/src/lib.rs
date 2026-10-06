@@ -1,4 +1,5 @@
 // crates/repository-checks/src/lib.rs
+
 //! Checks of the repository itself.
 //!
 //! This crate has no code of its own. Its tests hold the repository to

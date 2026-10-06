@@ -1,4 +1,5 @@
 // crates/node-protocol/tests/audio_vectors.rs
+
 //! The audio frame implementation against the shared vectors.
 //!
 //! `protocol/audio-frames.vectors.json` is read by this test and by the
@@ -79,6 +80,10 @@ fn name_of(error: AudioFrameError) -> &'static str {
 }
 
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "reads the vector file of this repository, not a message"
+)]
 fn every_shared_vector_is_decoded_or_refused_as_stated() -> TestResult {
     let text = std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),

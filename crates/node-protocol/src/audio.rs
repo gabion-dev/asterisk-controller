@@ -1,4 +1,5 @@
 // crates/node-protocol/src/audio.rs
+
 //! Binary audio frames of a conversation connection.
 //!
 //! The format is described in `protocol/audio-frames.md`. This module is one

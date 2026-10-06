@@ -1,4 +1,5 @@
 // crates/node-protocol/build.rs
+
 //! Generates the protocol message types from the protocol description.
 //!
 //! The description — `protocol/node-protocol.schema.json` at the repository
@@ -10,6 +11,10 @@ use std::{env, error::Error, fs, path::PathBuf};
 
 use typify::{TypeSpace, TypeSpaceSettings};
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "reads the protocol description of this repository, not a message"
+)]
 fn main() -> Result<(), Box<dyn Error>> {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
     let schema_path = manifest_dir.join("../../protocol/node-protocol.schema.json");

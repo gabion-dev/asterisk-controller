@@ -38,30 +38,50 @@ place that accepts commands.
 | `protocol/node-protocol.schema.json` | The protocol description: messages of the conversation and   |
 |                                      | service connections and the settings the application gives   |
 |                                      | the node — the single source of the types of both sides      |
+| `protocol/messages.vectors.json`     | Messages every implementation must accept, or refuse, the    |
+|                                      | same                                                         |
 | `protocol/audio-frames.md`           | The binary audio frames of a conversation connection         |
 | `protocol/audio-frames.vectors.json` | Frames every implementation must decode, or refuse, the same |
-| `crates/node-protocol/`              | Rust message types generated from the description, and the   |
-|                                      | audio frame implementation                                   |
+| `crates/node-protocol/`              | Rust: message types generated from the description, the      |
+|                                      | checked decoding, the audio frames                           |
+| `crates/protocol-java/`              | Generator of the Java library for the application side       |
+| `java/`                              | The hand-written part of the Java library: the checked       |
+|                                      | decoding and the audio frames                                |
+| `java-check/`                        | Compiles the Java library and runs it through the vectors    |
 | `crates/repository-checks/`          | Checks of the repository itself, run by `cargo test`         |
 
-## The protocol description is the single source
+## The protocol description is the judge
 
-The Rust types here and the Java types of the application are both generated
-from `protocol/node-protocol.schema.json`; neither side keeps a hand-written
-copy. The generated types are strict: a field the description does not name,
-a missing required field, or a message, command, event or request of an
-unknown kind is a decoding error — nothing is skipped and nothing is
-defaulted.
+`protocol/node-protocol.schema.json` is the single source of the message types
+of both sides: the Rust types here are generated from it at build time, and
+the Java library of the application is generated from it by
+`crates/protocol-java`. Neither side keeps a hand-written copy.
 
-The build refuses a description that promises more than the types check. The
-type generator silently drops some JSON Schema keywords (`minItems` and
-`maximum` were found that way), so `crates/node-protocol/build.rs` stops the
-build on any keyword outside the list it knows to be enforced, and names the
-place. A rule the types cannot carry becomes a refusal with a reason at the
-point where it is checked, never a line of the description nobody enforces.
+It is also the judge of what is accepted. On both sides a message is first
+checked against the description itself and only then turned into its type;
+the types alone are not trusted with that. Decoding derived from types lets
+through things the description forbids — an extra field on a message that has
+none, `null` for a field that may only be absent, a number written as text —
+and which of them depends on the library and its settings. The shared vectors
+found such holes on the Rust side before the checked decoding existed. In
+Rust, decoding JSON directly is refused by the linter (`clippy.toml`); the
+few places that must do it say so with a reason.
 
-Audio frames are binary and written by hand on each side. What keeps the two
-implementations together is the vector file: both must pass it.
+The description may use only the words both checkers enforce. The build stops
+on any other word and names the place (`crates/node-protocol/build.rs`): a
+type generator silently drops some of them — `minItems` and `maximum` were
+found that way. A rule that cannot be stated in those words becomes a refusal
+with a reason at the point where it is checked, never a line nobody enforces.
+
+## Two sides, one set of vectors
+
+`protocol/messages.vectors.json` and `protocol/audio-frames.vectors.json` list
+messages and frames together with what must happen to each: accepted — and
+then encoded back to the same thing — or refused. The Rust tests read them,
+and `java-check/run.sh` compiles the generated Java library with a real
+compiler, warnings as errors, against the Jackson version the Gabion framework
+uses, and runs it through the same files. A message one side accepts and the
+other refuses cannot go unnoticed.
 
 ## Checks
 
@@ -71,8 +91,8 @@ unsafe code is forbidden, warnings are errors, the linter runs in its pedantic
 mode, and code paths that could panic (`unwrap`, `expect`, indexing) do not
 compile.
 
-Every file states its own path from the repository root at its top, so that a
-file seen on its own says where it lives. A test holds the repository to it;
+Every file states its own path from the repository root at its top, with an
+empty line under it, so that a file seen on its own says where it lives. A test holds the repository to it;
 the file types a comment would break (JSON) and the files that must not carry
 one (`README.md`, `LICENSE`, `Cargo.lock`) are listed in that test by name,
 and a file of a type the test does not know fails it.
@@ -81,13 +101,16 @@ and a file of a type the test does not know fails it.
 cargo fmt --all --check
 cargo clippy --all-targets
 cargo test
+java-check/run.sh        # needs a JDK 21
 ```
+
+The same four run on every push (`.github/workflows/checks.yml`).
 
 ## Status
 
-Early development: the protocol — its description, the Rust types and the
-audio frames. The controller itself is not written yet; no release has been
-published.
+Early development: the protocol — its description, the Rust types, the Java
+library and the audio frames — held together by the shared vectors. The
+controller itself is not written yet; no release has been published.
 
 ## License
 

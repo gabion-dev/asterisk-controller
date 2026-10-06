@@ -1,0 +1,51 @@
+# .github/workflows/checks.yml
+
+name: Checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# =============================================================================
+# Every check this repository has, on every push.
+#
+# The Gabion development environment does not check this code, so this
+# workflow and the compiler are its whole net. Nothing here is advisory: a
+# formatting difference, a linter finding, a failed test or a vector the Java
+# side decodes differently all fail the run.
+# =============================================================================
+
+jobs:
+  checks:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+
+      # The toolchain is pinned in rust-toolchain.toml; rustup, which the
+      # runner already has, installs exactly that version on first use.
+      - name: Rust toolchain
+        run: rustup show active-toolchain
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Linter (strict)
+        run: cargo clippy --all-targets --locked
+
+      - name: Tests
+        run: cargo test --locked
+
+      - name: Java 21
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Java side against the shared vectors
+        run: bash java-check/run.sh

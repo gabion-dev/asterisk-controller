@@ -1,0 +1,14 @@
+# clippy.toml
+
+# Protocol messages are decoded with `node_protocol::decode`, which checks a
+# message against the protocol description before it becomes a value. The
+# generated types can also be decoded directly — and then accept things the
+# description forbids. Decoding JSON directly is therefore refused everywhere;
+# the few places that must do it (the checker itself, files of this repository
+# read by tests) say so with a reason.
+disallowed-methods = [
+    { path = "serde_json::from_str", reason = "decode protocol messages with node_protocol::decode" },
+    { path = "serde_json::from_slice", reason = "decode protocol messages with node_protocol::decode" },
+    { path = "serde_json::from_value", reason = "decode protocol messages with node_protocol::decode_value" },
+    { path = "serde_json::from_reader", reason = "decode protocol messages with node_protocol::decode" },
+]

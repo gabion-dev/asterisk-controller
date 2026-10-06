@@ -1,0 +1,1454 @@
+{
+ "description": "Messages that every implementation of node-protocol.schema.json must accept or refuse exactly as stated here. An accepted message must also encode back to the same JSON value.",
+ "vectors": [
+  {
+   "name": "hello for a new conversation",
+   "type": "ControllerMessage",
+   "accept": true,
+   "json": {
+    "type": "hello",
+    "protocol": 1,
+    "node": "node-1",
+    "controller_version": "0.1.0",
+    "conversation": "c-1",
+    "opening": {
+     "type": "started",
+     "origin": {
+      "type": "dialed_number",
+      "dialed": "+19715870050"
+     },
+     "first": {
+      "id": "p-1",
+      "medium": "telephone_network",
+      "number": "+15035550100"
+     }
+    }
+   }
+  },
+  {
+   "name": "hello whose first participant has no number",
+   "type": "ControllerMessage",
+   "accept": true,
+   "json": {
+    "type": "hello",
+    "protocol": 1,
+    "node": "node-1",
+    "controller_version": "0.1.0",
+    "conversation": "c-1",
+    "opening": {
+     "type": "started",
+     "origin": {
+      "type": "dialed_number",
+      "dialed": "+19715870050"
+     },
+     "first": {
+      "id": "p-1",
+      "medium": "telephone_network"
+     }
+    }
+   }
+  },
+  {
+   "name": "hello for a resumed conversation",
+   "type": "ControllerMessage",
+   "accept": true,
+   "json": {
+    "type": "hello",
+    "protocol": 1,
+    "node": "node-1",
+    "controller_version": "0.1.0",
+    "conversation": "c-1",
+    "opening": {
+     "type": "resumed",
+     "origin": {
+      "type": "web_pass",
+      "pass": "pass-1"
+     },
+     "participants": [
+      {
+       "participant": {
+        "id": "p-1",
+        "medium": "browser"
+       },
+       "state": "in_conversation"
+      },
+      {
+       "participant": {
+        "id": "p-2",
+        "medium": "telephone_network",
+        "number": "+15035550100"
+       },
+       "state": "held"
+      }
+     ],
+     "connected": [
+      [
+       "p-1",
+       "p-2"
+      ]
+     ],
+     "recordings": [
+      "r-1"
+     ]
+    }
+   }
+  },
+  {
+   "name": "hello with a field the description does not name",
+   "type": "ControllerMessage",
+   "accept": false,
+   "json": {
+    "type": "hello",
+    "protocol": 1,
+    "node": "node-1",
+    "controller_version": "0.1.0",
+    "conversation": "c-1",
+    "opening": {
+     "type": "started",
+     "origin": {
+      "type": "dialed_number",
+      "dialed": "+19715870050"
+     },
+     "first": {
+      "id": "p-1",
+      "medium": "telephone_network",
+      "number": "+15035550100"
+     }
+    },
+    "extra": true
+   }
+  },
+  {
+   "name": "hello with an unnamed field deep inside",
+   "type": "ControllerMessage",
+   "accept": false,
+   "json": {
+    "type": "hello",
+    "protocol": 1,
+    "node": "node-1",
+    "controller_version": "0.1.0",
+    "conversation": "c-1",
+    "opening": {
+     "type": "started",
+     "origin": {
+      "type": "dialed_number",
+      "dialed": "+19715870050"
+     },
+     "first": {
+      "id": "p-1",
+      "medium": "telephone_network",
+      "number": "+15035550100",
+      "nickname": "x"
+     }
+    }
+   }
+  },
+  {
+   "name": "hello without its protocol version",
+   "type": "ControllerMessage",
+   "accept": false,
+   "json": {
+    "type": "hello",
+    "node": "node-1",
+    "controller_version": "0.1.0",
+    "conversation": "c-1",
+    "opening": {
+     "type": "started",
+     "origin": {
+      "type": "dialed_number",
+      "dialed": "+19715870050"
+     },
+     "first": {
+      "id": "p-1",
+      "medium": "telephone_network",
+      "number": "+15035550100"
+     }
+    }
+   }
+  },
+  {
+   "name": "hello with protocol version zero",
+   "type": "ControllerMessage",
+   "accept": false,
+   "json": {
+    "type": "hello",
+    "protocol": 0,
+    "node": "node-1",
+    "controller_version": "0.1.0",
+    "conversation": "c-1",
+    "opening": {
+     "type": "started",
+     "origin": {
+      "type": "dialed_number",
+      "dialed": "+19715870050"
+     },
+     "first": {
+      "id": "p-1",
+      "medium": "telephone_network",
+      "number": "+15035550100"
+     }
+    }
+   }
+  },
+  {
+   "name": "hello with the protocol version as text",
+   "type": "ControllerMessage",
+   "accept": false,
+   "json": {
+    "type": "hello",
+    "protocol": "1",
+    "node": "node-1",
+    "controller_version": "0.1.0",
+    "conversation": "c-1",
+    "opening": {
+     "type": "started",
+     "origin": {
+      "type": "dialed_number",
+      "dialed": "+19715870050"
+     },
+     "first": {
+      "id": "p-1",
+      "medium": "telephone_network",
+      "number": "+15035550100"
+     }
+    }
+   }
+  },
+  {
+   "name": "hello with a fractional protocol version",
+   "type": "ControllerMessage",
+   "accept": false,
+   "json": {
+    "type": "hello",
+    "protocol": 1.5,
+    "node": "node-1",
+    "controller_version": "0.1.0",
+    "conversation": "c-1",
+    "opening": {
+     "type": "started",
+     "origin": {
+      "type": "dialed_number",
+      "dialed": "+19715870050"
+     },
+     "first": {
+      "id": "p-1",
+      "medium": "telephone_network",
+      "number": "+15035550100"
+     }
+    }
+   }
+  },
+  {
+   "name": "hello with a null node",
+   "type": "ControllerMessage",
+   "accept": false,
+   "json": {
+    "type": "hello",
+    "protocol": 1,
+    "node": null,
+    "controller_version": "0.1.0",
+    "conversation": "c-1",
+    "opening": {
+     "type": "started",
+     "origin": {
+      "type": "dialed_number",
+      "dialed": "+19715870050"
+     },
+     "first": {
+      "id": "p-1",
+      "medium": "telephone_network",
+      "number": "+15035550100"
+     }
+    }
+   }
+  },
+  {
+   "name": "hello with a number for the node",
+   "type": "ControllerMessage",
+   "accept": false,
+   "json": {
+    "type": "hello",
+    "protocol": 1,
+    "node": 7,
+    "controller_version": "0.1.0",
+    "conversation": "c-1",
+    "opening": {
+     "type": "started",
+     "origin": {
+      "type": "dialed_number",
+      "dialed": "+19715870050"
+     },
+     "first": {
+      "id": "p-1",
+      "medium": "telephone_network",
+      "number": "+15035550100"
+     }
+    }
+   }
+  },
+  {
+   "name": "hello with an unknown medium",
+   "type": "ControllerMessage",
+   "accept": false,
+   "json": {
+    "type": "hello",
+    "protocol": 1,
+    "node": "node-1",
+    "controller_version": "0.1.0",
+    "conversation": "c-1",
+    "opening": {
+     "type": "started",
+     "origin": {
+      "type": "dialed_number",
+      "dialed": "+19715870050"
+     },
+     "first": {
+      "id": "p-1",
+      "medium": "fax",
+      "number": "+15035550100"
+     }
+    }
+   }
+  },
+  {
+   "name": "hello with an unknown kind of opening",
+   "type": "ControllerMessage",
+   "accept": false,
+   "json": {
+    "type": "hello",
+    "protocol": 1,
+    "node": "node-1",
+    "controller_version": "0.1.0",
+    "conversation": "c-1",
+    "opening": {
+     "type": "recovered",
+     "origin": {
+      "type": "dialed_number",
+      "dialed": "+19715870050"
+     },
+     "first": {
+      "id": "p-1",
+      "medium": "telephone_network",
+      "number": "+15035550100"
+     }
+    }
+   }
+  },
+  {
+   "name": "hello with an opening that is not an object",
+   "type": "ControllerMessage",
+   "accept": false,
+   "json": {
+    "type": "hello",
+    "protocol": 1,
+    "node": "node-1",
+    "controller_version": "0.1.0",
+    "conversation": "c-1",
+    "opening": "started"
+   }
+  },
+  {
+   "name": "message of an unknown kind",
+   "type": "ControllerMessage",
+   "accept": false,
+   "json": {
+    "type": "greetings"
+   }
+  },
+  {
+   "name": "message without a kind",
+   "type": "ControllerMessage",
+   "accept": false,
+   "json": {
+    "protocol": 1
+   }
+  },
+  {
+   "name": "message that is an array",
+   "type": "ControllerMessage",
+   "accept": false,
+   "json": [
+    {
+     "type": "hello",
+     "protocol": 1,
+     "node": "node-1",
+     "controller_version": "0.1.0",
+     "conversation": "c-1",
+     "opening": {
+      "type": "started",
+      "origin": {
+       "type": "dialed_number",
+       "dialed": "+19715870050"
+      },
+      "first": {
+       "id": "p-1",
+       "medium": "telephone_network",
+       "number": "+15035550100"
+      }
+     }
+    }
+   ]
+  },
+  {
+   "name": "event: participant left after a failed dial",
+   "type": "ControllerMessage",
+   "accept": true,
+   "json": {
+    "type": "event",
+    "event": {
+     "type": "participant_left",
+     "participant": "p-2",
+     "departure": {
+      "type": "dial_failed",
+      "medium_code": 486
+     }
+    }
+   }
+  },
+  {
+   "name": "event: digit",
+   "type": "ControllerMessage",
+   "accept": true,
+   "json": {
+    "type": "event",
+    "event": {
+     "type": "digit_received",
+     "participant": "p-1",
+     "digit": "#"
+    }
+   }
+  },
+  {
+   "name": "event: microphone stopped, reported by the device",
+   "type": "ControllerMessage",
+   "accept": true,
+   "json": {
+    "type": "event",
+    "event": {
+     "type": "microphone_stopped",
+     "participant": "p-1",
+     "origin": "reported_by_device"
+    }
+   }
+  },
+  {
+   "name": "command result carrying a new participant",
+   "type": "ControllerMessage",
+   "accept": true,
+   "json": {
+    "type": "command_result",
+    "id": 3,
+    "outcome": {
+     "type": "accepted_participant",
+     "participant": "p-2"
+    }
+   }
+  },
+  {
+   "name": "command result: rejected",
+   "type": "ControllerMessage",
+   "accept": true,
+   "json": {
+    "type": "command_result",
+    "id": 4,
+    "outcome": {
+     "type": "rejected",
+     "reason": "too_few_participants"
+    }
+   }
+  },
+  {
+   "name": "event of an unknown kind",
+   "type": "Event",
+   "accept": false,
+   "json": {
+    "type": "voicemail_detected",
+    "participant": "p-1"
+   }
+  },
+  {
+   "name": "departure of an unknown kind",
+   "type": "Event",
+   "accept": false,
+   "json": {
+    "type": "participant_left",
+    "participant": "p-1",
+    "departure": {
+     "type": "voicemail"
+    }
+   }
+  },
+  {
+   "name": "digit event with two digits",
+   "type": "Event",
+   "accept": false,
+   "json": {
+    "type": "digit_received",
+    "participant": "p-1",
+    "digit": "12"
+   }
+  },
+  {
+   "name": "command result with an unknown rejection",
+   "type": "ControllerMessage",
+   "accept": false,
+   "json": {
+    "type": "command_result",
+    "id": 4,
+    "outcome": {
+     "type": "rejected",
+     "reason": "because"
+    }
+   }
+  },
+  {
+   "name": "command result with a negative identifier",
+   "type": "ControllerMessage",
+   "accept": false,
+   "json": {
+    "type": "command_result",
+    "id": -1,
+    "outcome": {
+     "type": "accepted"
+    }
+   }
+  },
+  {
+   "name": "application accepts the conversation",
+   "type": "ApplicationMessage",
+   "accept": true,
+   "json": {
+    "type": "accept"
+   }
+  },
+  {
+   "name": "application declines the conversation",
+   "type": "ApplicationMessage",
+   "accept": true,
+   "json": {
+    "type": "decline",
+    "reason": "draining"
+   }
+  },
+  {
+   "name": "command: dial",
+   "type": "ApplicationMessage",
+   "accept": true,
+   "json": {
+    "type": "command",
+    "id": 3,
+    "command": {
+     "type": "dial",
+     "number": "+15035550100",
+     "line": "main",
+     "answer_limit_ms": 20000
+    }
+   }
+  },
+  {
+   "name": "command: connect",
+   "type": "Command",
+   "accept": true,
+   "json": {
+    "type": "connect",
+    "participants": [
+     "p-1",
+     "p-2"
+    ]
+   }
+  },
+  {
+   "name": "command: end",
+   "type": "Command",
+   "accept": true,
+   "json": {
+    "type": "end"
+   }
+  },
+  {
+   "name": "command: start recording kept until released",
+   "type": "Command",
+   "accept": true,
+   "json": {
+    "type": "start_recording",
+    "retention": {
+     "type": "until_released"
+    }
+   }
+  },
+  {
+   "name": "command: start recording kept for a period",
+   "type": "Command",
+   "accept": true,
+   "json": {
+    "type": "start_recording",
+    "retention": {
+     "type": "for",
+     "period_ms": 86400000
+    }
+   }
+  },
+  {
+   "name": "accept with a field",
+   "type": "ApplicationMessage",
+   "accept": false,
+   "json": {
+    "type": "accept",
+    "note": "x"
+   }
+  },
+  {
+   "name": "command of an unknown kind",
+   "type": "Command",
+   "accept": false,
+   "json": {
+    "type": "transfer",
+    "participant": "p-1"
+   }
+  },
+  {
+   "name": "dial without its answer limit",
+   "type": "Command",
+   "accept": false,
+   "json": {
+    "type": "dial",
+    "number": "+15035550100",
+    "line": "main"
+   }
+  },
+  {
+   "name": "dial with a negative answer limit",
+   "type": "Command",
+   "accept": false,
+   "json": {
+    "type": "dial",
+    "number": "+15035550100",
+    "line": "main",
+    "answer_limit_ms": -1
+   }
+  },
+  {
+   "name": "dial to a number that is not E.164 (1)",
+   "type": "Command",
+   "accept": false,
+   "json": {
+    "type": "dial",
+    "number": "5035550100",
+    "line": "main",
+    "answer_limit_ms": 20000
+   }
+  },
+  {
+   "name": "dial to a number that is not E.164 (2)",
+   "type": "Command",
+   "accept": false,
+   "json": {
+    "type": "dial",
+    "number": "+0123456789",
+    "line": "main",
+    "answer_limit_ms": 20000
+   }
+  },
+  {
+   "name": "dial to a number that is not E.164 (3)",
+   "type": "Command",
+   "accept": false,
+   "json": {
+    "type": "dial",
+    "number": "+1503555010012345678",
+    "line": "main",
+    "answer_limit_ms": 20000
+   }
+  },
+  {
+   "name": "dial to a number that is not E.164 (4)",
+   "type": "Command",
+   "accept": false,
+   "json": {
+    "type": "dial",
+    "number": "+1 503 555 0100",
+    "line": "main",
+    "answer_limit_ms": 20000
+   }
+  },
+  {
+   "name": "dial to a number that is not E.164 (5)",
+   "type": "Command",
+   "accept": false,
+   "json": {
+    "type": "dial",
+    "number": "",
+    "line": "main",
+    "answer_limit_ms": 20000
+   }
+  },
+  {
+   "name": "answer with an empty participant identifier",
+   "type": "Command",
+   "accept": false,
+   "json": {
+    "type": "answer",
+    "participant": ""
+   }
+  },
+  {
+   "name": "answer with a participant identifier that is too long",
+   "type": "Command",
+   "accept": false,
+   "json": {
+    "type": "answer",
+    "participant": "ppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp"
+   }
+  },
+  {
+   "name": "answer with a participant identifier of the largest length",
+   "type": "Command",
+   "accept": true,
+   "json": {
+    "type": "answer",
+    "participant": "pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp"
+   }
+  },
+  {
+   "name": "send digits with a letter that is not a digit",
+   "type": "Command",
+   "accept": false,
+   "json": {
+    "type": "send_digits",
+    "participant": "p-1",
+    "digits": "12x"
+   }
+  },
+  {
+   "name": "end with a field",
+   "type": "Command",
+   "accept": false,
+   "json": {
+    "type": "end",
+    "reason": "done"
+   }
+  },
+  {
+   "name": "service hello without settings",
+   "type": "NodeMessage",
+   "accept": true,
+   "json": {
+    "type": "hello",
+    "protocol": 1,
+    "node": "node-1",
+    "controller_version": "0.1.0",
+    "asterisk_version": "22.11.0"
+   }
+  },
+  {
+   "name": "service hello with settings",
+   "type": "NodeMessage",
+   "accept": true,
+   "json": {
+    "type": "hello",
+    "protocol": 1,
+    "node": "node-1",
+    "controller_version": "0.1.0",
+    "asterisk_version": "22.11.0",
+    "applied_settings": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+   }
+  },
+  {
+   "name": "service hello with settings set to null",
+   "type": "NodeMessage",
+   "accept": false,
+   "json": {
+    "type": "hello",
+    "protocol": 1,
+    "node": "node-1",
+    "controller_version": "0.1.0",
+    "asterisk_version": "22.11.0",
+    "applied_settings": null
+   }
+  },
+  {
+   "name": "report: fallback applied",
+   "type": "NodeMessage",
+   "accept": true,
+   "json": {
+    "type": "report",
+    "report": {
+     "type": "fallback_applied",
+     "conversation": "c-1",
+     "origin": {
+      "type": "dialed_number",
+      "dialed": "+19715870050"
+     },
+     "fallback": "message",
+     "at_unix_ms": 1791226292824
+    }
+   }
+  },
+  {
+   "name": "request: begin a browser leg",
+   "type": "ApplicationServiceMessage",
+   "accept": true,
+   "json": {
+    "type": "request",
+    "id": 1,
+    "request": {
+     "type": "browser_leg_begin",
+     "leg": "leg-1",
+     "origin": {
+      "type": "web_pass",
+      "pass": "pass-1"
+     },
+     "offer": "v=0"
+    }
+   }
+  },
+  {
+   "name": "browser leg that names a destination",
+   "type": "Request",
+   "accept": false,
+   "json": {
+    "type": "browser_leg_begin",
+    "leg": "leg-1",
+    "origin": {
+     "type": "web_pass",
+     "pass": "pass-1"
+    },
+    "offer": "v=0",
+    "number": "+15035550100"
+   }
+  },
+  {
+   "name": "browser leg that claims to come from the telephone network",
+   "type": "Request",
+   "accept": false,
+   "json": {
+    "type": "browser_leg_begin",
+    "leg": "leg-1",
+    "origin": {
+     "type": "dialed_number",
+     "dialed": "+19715870050"
+    },
+    "offer": "v=0"
+   }
+  },
+  {
+   "name": "request of an unknown kind",
+   "type": "Request",
+   "accept": false,
+   "json": {
+    "type": "originate",
+    "number": "+15035550100"
+   }
+  },
+  {
+   "name": "device fact of an unknown kind",
+   "type": "Request",
+   "accept": false,
+   "json": {
+    "type": "device_fact",
+    "leg": "leg-1",
+    "fact": "battery_low"
+   }
+  },
+  {
+   "name": "settings",
+   "type": "Settings",
+   "accept": true,
+   "json": {
+    "operators": [
+     {
+      "id": "chime",
+      "host": "abc.voiceconnector.chime.aws",
+      "port": 5060,
+      "transport": "udp",
+      "source_networks": [
+       "3.80.16.0/23"
+      ],
+      "countries": [
+       "US",
+       "CA"
+      ]
+     }
+    ],
+    "lines": [
+     {
+      "id": "main",
+      "number": "+19715870050",
+      "operator": "chime",
+      "allowed_countries": [
+       "US"
+      ],
+      "concurrent_outbound_limit": 2
+     }
+    ],
+    "entries": [
+     {
+      "key": {
+       "type": "dialed_number",
+       "number": "+19715870050"
+      },
+      "fallback": {
+       "type": "message",
+       "prompt": "away"
+      }
+     }
+    ],
+    "prompts": [
+     {
+      "id": "away",
+      "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+     }
+    ]
+   }
+  },
+  {
+   "name": "settings with operator credentials",
+   "type": "Settings",
+   "accept": true,
+   "json": {
+    "operators": [
+     {
+      "id": "chime",
+      "host": "abc.voiceconnector.chime.aws",
+      "port": 5060,
+      "transport": "udp",
+      "source_networks": [
+       "3.80.16.0/23"
+      ],
+      "countries": [
+       "US",
+       "CA"
+      ],
+      "credentials": {
+       "username": "u",
+       "password": "p"
+      }
+     }
+    ],
+    "lines": [
+     {
+      "id": "main",
+      "number": "+19715870050",
+      "operator": "chime",
+      "allowed_countries": [
+       "US"
+      ],
+      "concurrent_outbound_limit": 2
+     }
+    ],
+    "entries": [
+     {
+      "key": {
+       "type": "dialed_number",
+       "number": "+19715870050"
+      },
+      "fallback": {
+       "type": "message",
+       "prompt": "away"
+      }
+     }
+    ],
+    "prompts": [
+     {
+      "id": "away",
+      "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+     }
+    ]
+   }
+  },
+  {
+   "name": "empty settings",
+   "type": "Settings",
+   "accept": true,
+   "json": {
+    "operators": [],
+    "lines": [],
+    "entries": [],
+    "prompts": []
+   }
+  },
+  {
+   "name": "entry without a fallback",
+   "type": "Settings",
+   "accept": false,
+   "json": {
+    "operators": [
+     {
+      "id": "chime",
+      "host": "abc.voiceconnector.chime.aws",
+      "port": 5060,
+      "transport": "udp",
+      "source_networks": [
+       "3.80.16.0/23"
+      ],
+      "countries": [
+       "US",
+       "CA"
+      ]
+     }
+    ],
+    "lines": [
+     {
+      "id": "main",
+      "number": "+19715870050",
+      "operator": "chime",
+      "allowed_countries": [
+       "US"
+      ],
+      "concurrent_outbound_limit": 2
+     }
+    ],
+    "entries": [
+     {
+      "key": {
+       "type": "dialed_number",
+       "number": "+19715870050"
+      }
+     }
+    ],
+    "prompts": [
+     {
+      "id": "away",
+      "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+     }
+    ]
+   }
+  },
+  {
+   "name": "entry with an unknown fallback",
+   "type": "Settings",
+   "accept": false,
+   "json": {
+    "operators": [
+     {
+      "id": "chime",
+      "host": "abc.voiceconnector.chime.aws",
+      "port": 5060,
+      "transport": "udp",
+      "source_networks": [
+       "3.80.16.0/23"
+      ],
+      "countries": [
+       "US",
+       "CA"
+      ]
+     }
+    ],
+    "lines": [
+     {
+      "id": "main",
+      "number": "+19715870050",
+      "operator": "chime",
+      "allowed_countries": [
+       "US"
+      ],
+      "concurrent_outbound_limit": 2
+     }
+    ],
+    "entries": [
+     {
+      "key": {
+       "type": "dialed_number",
+       "number": "+19715870050"
+      },
+      "fallback": {
+       "type": "queue"
+      }
+     }
+    ],
+    "prompts": [
+     {
+      "id": "away",
+      "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+     }
+    ]
+   }
+  },
+  {
+   "name": "operator country that is not a country code",
+   "type": "Settings",
+   "accept": false,
+   "json": {
+    "operators": [
+     {
+      "id": "chime",
+      "host": "abc.voiceconnector.chime.aws",
+      "port": 5060,
+      "transport": "udp",
+      "source_networks": [
+       "3.80.16.0/23"
+      ],
+      "countries": [
+       "usa"
+      ]
+     }
+    ],
+    "lines": [
+     {
+      "id": "main",
+      "number": "+19715870050",
+      "operator": "chime",
+      "allowed_countries": [
+       "US"
+      ],
+      "concurrent_outbound_limit": 2
+     }
+    ],
+    "entries": [
+     {
+      "key": {
+       "type": "dialed_number",
+       "number": "+19715870050"
+      },
+      "fallback": {
+       "type": "message",
+       "prompt": "away"
+      }
+     }
+    ],
+    "prompts": [
+     {
+      "id": "away",
+      "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+     }
+    ]
+   }
+  },
+  {
+   "name": "operator network that is not a network",
+   "type": "Settings",
+   "accept": false,
+   "json": {
+    "operators": [
+     {
+      "id": "chime",
+      "host": "abc.voiceconnector.chime.aws",
+      "port": 5060,
+      "transport": "udp",
+      "source_networks": [
+       "everywhere"
+      ],
+      "countries": [
+       "US",
+       "CA"
+      ]
+     }
+    ],
+    "lines": [
+     {
+      "id": "main",
+      "number": "+19715870050",
+      "operator": "chime",
+      "allowed_countries": [
+       "US"
+      ],
+      "concurrent_outbound_limit": 2
+     }
+    ],
+    "entries": [
+     {
+      "key": {
+       "type": "dialed_number",
+       "number": "+19715870050"
+      },
+      "fallback": {
+       "type": "message",
+       "prompt": "away"
+      }
+     }
+    ],
+    "prompts": [
+     {
+      "id": "away",
+      "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+     }
+    ]
+   }
+  },
+  {
+   "name": "operator transport of an unknown kind",
+   "type": "Settings",
+   "accept": false,
+   "json": {
+    "operators": [
+     {
+      "id": "chime",
+      "host": "abc.voiceconnector.chime.aws",
+      "port": 5060,
+      "transport": "sctp",
+      "source_networks": [
+       "3.80.16.0/23"
+      ],
+      "countries": [
+       "US",
+       "CA"
+      ]
+     }
+    ],
+    "lines": [
+     {
+      "id": "main",
+      "number": "+19715870050",
+      "operator": "chime",
+      "allowed_countries": [
+       "US"
+      ],
+      "concurrent_outbound_limit": 2
+     }
+    ],
+    "entries": [
+     {
+      "key": {
+       "type": "dialed_number",
+       "number": "+19715870050"
+      },
+      "fallback": {
+       "type": "message",
+       "prompt": "away"
+      }
+     }
+    ],
+    "prompts": [
+     {
+      "id": "away",
+      "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+     }
+    ]
+   }
+  },
+  {
+   "name": "operator port zero",
+   "type": "Settings",
+   "accept": false,
+   "json": {
+    "operators": [
+     {
+      "id": "chime",
+      "host": "abc.voiceconnector.chime.aws",
+      "port": 0,
+      "transport": "udp",
+      "source_networks": [
+       "3.80.16.0/23"
+      ],
+      "countries": [
+       "US",
+       "CA"
+      ]
+     }
+    ],
+    "lines": [
+     {
+      "id": "main",
+      "number": "+19715870050",
+      "operator": "chime",
+      "allowed_countries": [
+       "US"
+      ],
+      "concurrent_outbound_limit": 2
+     }
+    ],
+    "entries": [
+     {
+      "key": {
+       "type": "dialed_number",
+       "number": "+19715870050"
+      },
+      "fallback": {
+       "type": "message",
+       "prompt": "away"
+      }
+     }
+    ],
+    "prompts": [
+     {
+      "id": "away",
+      "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+     }
+    ]
+   }
+  },
+  {
+   "name": "line number that is not E.164",
+   "type": "Settings",
+   "accept": false,
+   "json": {
+    "operators": [
+     {
+      "id": "chime",
+      "host": "abc.voiceconnector.chime.aws",
+      "port": 5060,
+      "transport": "udp",
+      "source_networks": [
+       "3.80.16.0/23"
+      ],
+      "countries": [
+       "US",
+       "CA"
+      ]
+     }
+    ],
+    "lines": [
+     {
+      "id": "main",
+      "number": "9715870050",
+      "operator": "chime",
+      "allowed_countries": [
+       "US"
+      ],
+      "concurrent_outbound_limit": 2
+     }
+    ],
+    "entries": [
+     {
+      "key": {
+       "type": "dialed_number",
+       "number": "+19715870050"
+      },
+      "fallback": {
+       "type": "message",
+       "prompt": "away"
+      }
+     }
+    ],
+    "prompts": [
+     {
+      "id": "away",
+      "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+     }
+    ]
+   }
+  },
+  {
+   "name": "prompt digest in uppercase",
+   "type": "Settings",
+   "accept": false,
+   "json": {
+    "operators": [
+     {
+      "id": "chime",
+      "host": "abc.voiceconnector.chime.aws",
+      "port": 5060,
+      "transport": "udp",
+      "source_networks": [
+       "3.80.16.0/23"
+      ],
+      "countries": [
+       "US",
+       "CA"
+      ]
+     }
+    ],
+    "lines": [
+     {
+      "id": "main",
+      "number": "+19715870050",
+      "operator": "chime",
+      "allowed_countries": [
+       "US"
+      ],
+      "concurrent_outbound_limit": 2
+     }
+    ],
+    "entries": [
+     {
+      "key": {
+       "type": "dialed_number",
+       "number": "+19715870050"
+      },
+      "fallback": {
+       "type": "message",
+       "prompt": "away"
+      }
+     }
+    ],
+    "prompts": [
+     {
+      "id": "away",
+      "sha256": "9F86D081884C7D659A2FEAA0C55AD015A3BF4F1B2B0B822CD15D6C15B0F00A08"
+     }
+    ]
+   }
+  },
+  {
+   "name": "settings without their lines",
+   "type": "Settings",
+   "accept": false,
+   "json": {
+    "operators": [
+     {
+      "id": "chime",
+      "host": "abc.voiceconnector.chime.aws",
+      "port": 5060,
+      "transport": "udp",
+      "source_networks": [
+       "3.80.16.0/23"
+      ],
+      "countries": [
+       "US",
+       "CA"
+      ]
+     }
+    ],
+    "entries": [
+     {
+      "key": {
+       "type": "dialed_number",
+       "number": "+19715870050"
+      },
+      "fallback": {
+       "type": "message",
+       "prompt": "away"
+      }
+     }
+    ],
+    "prompts": [
+     {
+      "id": "away",
+      "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+     }
+    ]
+   }
+  },
+  {
+   "name": "settings whose lines are not a list",
+   "type": "Settings",
+   "accept": false,
+   "json": {
+    "operators": [
+     {
+      "id": "chime",
+      "host": "abc.voiceconnector.chime.aws",
+      "port": 5060,
+      "transport": "udp",
+      "source_networks": [
+       "3.80.16.0/23"
+      ],
+      "countries": [
+       "US",
+       "CA"
+      ]
+     }
+    ],
+    "lines": {},
+    "entries": [
+     {
+      "key": {
+       "type": "dialed_number",
+       "number": "+19715870050"
+      },
+      "fallback": {
+       "type": "message",
+       "prompt": "away"
+      }
+     }
+    ],
+    "prompts": [
+     {
+      "id": "away",
+      "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+     }
+    ]
+   }
+  }
+ ]
+}

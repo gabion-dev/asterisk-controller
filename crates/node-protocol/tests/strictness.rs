@@ -1,13 +1,17 @@
 // crates/node-protocol/tests/strictness.rs
+
 //! The protocol types refuse what the protocol description does not allow.
 //!
 //! These tests pin the property the rest of the controller relies on: a
 //! message that is not exactly what the description says never becomes a
 //! value. Nothing is skipped and nothing is defaulted.
 
-use node_protocol::messages::{
-    ApplicationMessage, ApplicationServiceMessage, Command, ControllerMessage, Event, NodeMessage,
-    Opening, Origin, Request, Settings,
+use node_protocol::{
+    decode_value,
+    messages::{
+        ApplicationMessage, ApplicationServiceMessage, Command, ControllerMessage, Event,
+        NodeMessage, Opening, Origin, Request, Settings,
+    },
 };
 use serde_json::{Value, json};
 
@@ -30,7 +34,7 @@ fn hello() -> Value {
 
 #[test]
 fn a_well_formed_hello_is_accepted() -> TestResult {
-    let message: ControllerMessage = serde_json::from_value(hello())?;
+    let message: ControllerMessage = decode_value(hello())?;
     let ControllerMessage::Hello {
         opening, protocol, ..
     } = message
@@ -61,11 +65,11 @@ fn object_at<'a>(
 fn a_field_the_description_does_not_name_is_refused() -> TestResult {
     let mut nested = hello();
     object_at(&mut nested, "/opening/first")?.insert("nickname".into(), json!("x"));
-    assert!(serde_json::from_value::<ControllerMessage>(nested).is_err());
+    assert!(decode_value::<ControllerMessage>(nested).is_err());
 
     let mut top_level = hello();
     object_at(&mut top_level, "")?.insert("extra".into(), json!(true));
-    assert!(serde_json::from_value::<ControllerMessage>(top_level).is_err());
+    assert!(decode_value::<ControllerMessage>(top_level).is_err());
     Ok(())
 }
 
@@ -73,33 +77,33 @@ fn a_field_the_description_does_not_name_is_refused() -> TestResult {
 fn a_missing_required_field_is_refused_not_defaulted() -> TestResult {
     let mut message = hello();
     object_at(&mut message, "")?.remove("protocol");
-    assert!(serde_json::from_value::<ControllerMessage>(message).is_err());
+    assert!(decode_value::<ControllerMessage>(message).is_err());
 
     let dial_without_limit = json!({
         "type": "command", "id": 7,
         "command": { "type": "dial", "number": "+15035550100", "line": "main" }
     });
-    assert!(serde_json::from_value::<ApplicationMessage>(dial_without_limit).is_err());
+    assert!(decode_value::<ApplicationMessage>(dial_without_limit).is_err());
     Ok(())
 }
 
 #[test]
 fn an_unknown_kind_is_refused_at_every_level() {
     let unknown_message = json!({ "type": "greetings" });
-    assert!(serde_json::from_value::<ControllerMessage>(unknown_message.clone()).is_err());
-    assert!(serde_json::from_value::<ApplicationMessage>(unknown_message).is_err());
+    assert!(decode_value::<ControllerMessage>(unknown_message.clone()).is_err());
+    assert!(decode_value::<ApplicationMessage>(unknown_message).is_err());
 
     let unknown_command = json!({ "type": "transfer", "participant": "p-1" });
-    assert!(serde_json::from_value::<Command>(unknown_command).is_err());
+    assert!(decode_value::<Command>(unknown_command).is_err());
 
     let unknown_event = json!({ "type": "voicemail_detected", "participant": "p-1" });
-    assert!(serde_json::from_value::<Event>(unknown_event).is_err());
+    assert!(decode_value::<Event>(unknown_event).is_err());
 
     let unknown_departure = json!({
         "type": "participant_left", "participant": "p-1",
         "departure": { "type": "voicemail" }
     });
-    assert!(serde_json::from_value::<Event>(unknown_departure).is_err());
+    assert!(decode_value::<Event>(unknown_departure).is_err());
 }
 
 #[test]
@@ -113,22 +117,22 @@ fn a_value_of_the_wrong_form_is_refused() {
         let dial =
             json!({ "type": "dial", "number": number, "line": "main", "answer_limit_ms": 20000 });
         assert!(
-            serde_json::from_value::<Command>(dial).is_err(),
+            decode_value::<Command>(dial).is_err(),
             "{number} was accepted"
         );
     }
 
     let empty_identifier = json!({ "type": "answer", "participant": "" });
-    assert!(serde_json::from_value::<Command>(empty_identifier).is_err());
+    assert!(decode_value::<Command>(empty_identifier).is_err());
 
     let two_digits = json!({ "type": "digit_received", "participant": "p-1", "digit": "12" });
-    assert!(serde_json::from_value::<Event>(two_digits).is_err());
+    assert!(decode_value::<Event>(two_digits).is_err());
 
     let too_long = json!({ "type": "answer", "participant": "p".repeat(129) });
-    assert!(serde_json::from_value::<Command>(too_long).is_err());
+    assert!(decode_value::<Command>(too_long).is_err());
 
     let negative_limit = json!({ "type": "hold_for", "participant": "p-1", "limit_ms": -1 });
-    assert!(serde_json::from_value::<Command>(negative_limit).is_err());
+    assert!(decode_value::<Command>(negative_limit).is_err());
 }
 
 #[test]
@@ -137,7 +141,7 @@ fn what_is_written_reads_back_the_same() -> TestResult {
         "type": "command", "id": 3,
         "command": { "type": "dial", "number": "+15035550100", "line": "main", "answer_limit_ms": 20000 }
     });
-    let message: ApplicationMessage = serde_json::from_value(original.clone())?;
+    let message: ApplicationMessage = decode_value(original.clone())?;
     assert_eq!(serde_json::to_value(&message)?, original);
 
     let event = json!({
@@ -145,7 +149,7 @@ fn what_is_written_reads_back_the_same() -> TestResult {
         "event": { "type": "participant_left", "participant": "p-2",
                    "departure": { "type": "dial_failed", "medium_code": 486 } }
     });
-    let message: ControllerMessage = serde_json::from_value(event.clone())?;
+    let message: ControllerMessage = decode_value(event.clone())?;
     assert_eq!(serde_json::to_value(&message)?, event);
     Ok(())
 }
@@ -173,7 +177,7 @@ fn settings() -> Value {
 
 #[test]
 fn well_formed_settings_are_accepted() -> TestResult {
-    let parsed: Settings = serde_json::from_value(settings())?;
+    let parsed: Settings = decode_value(settings())?;
     assert_eq!(parsed.operators.len(), 1);
     assert_eq!(parsed.entries.len(), 1);
     Ok(())
@@ -183,12 +187,12 @@ fn well_formed_settings_are_accepted() -> TestResult {
 fn an_entry_cannot_be_given_without_a_fallback() -> TestResult {
     let mut without_fallback = settings();
     object_at(&mut without_fallback, "/entries/0")?.remove("fallback");
-    assert!(serde_json::from_value::<Settings>(without_fallback).is_err());
+    assert!(decode_value::<Settings>(without_fallback).is_err());
 
     let mut unknown_fallback = settings();
     object_at(&mut unknown_fallback, "/entries/0")?
         .insert("fallback".into(), json!({ "type": "queue" }));
-    assert!(serde_json::from_value::<Settings>(unknown_fallback).is_err());
+    assert!(decode_value::<Settings>(unknown_fallback).is_err());
     Ok(())
 }
 
@@ -205,7 +209,7 @@ fn settings_values_of_the_wrong_form_are_refused() -> TestResult {
         let mut changed = settings();
         object_at(&mut changed, pointer)?.insert(field.into(), value);
         assert!(
-            serde_json::from_value::<Settings>(changed).is_err(),
+            decode_value::<Settings>(changed).is_err(),
             "{pointer}/{field} was accepted"
         );
     }
@@ -218,7 +222,7 @@ fn the_service_connection_is_as_strict_as_the_conversation() -> TestResult {
         "type": "hello", "protocol": 1, "node": "node-1",
         "controller_version": "0.1.0", "asterisk_version": "22.11.0"
     });
-    let message: NodeMessage = serde_json::from_value(hello_without_settings)?;
+    let message: NodeMessage = decode_value(hello_without_settings)?;
     let NodeMessage::Hello {
         applied_settings, ..
     } = message
@@ -235,7 +239,7 @@ fn the_service_connection_is_as_strict_as_the_conversation() -> TestResult {
             "offer": "v=0"
         }
     });
-    let message: ApplicationServiceMessage = serde_json::from_value(browser_leg)?;
+    let message: ApplicationServiceMessage = decode_value(browser_leg)?;
     assert!(matches!(
         message,
         ApplicationServiceMessage::Request {
@@ -250,7 +254,7 @@ fn the_service_connection_is_as_strict_as_the_conversation() -> TestResult {
         "origin": { "type": "web_pass", "pass": "pass-1" },
         "offer": "v=0", "number": "+15035550100"
     });
-    assert!(serde_json::from_value::<Request>(leg_with_destination).is_err());
+    assert!(decode_value::<Request>(leg_with_destination).is_err());
 
     // Nor can it claim to be a call from the telephone network.
     let leg_as_dialed_number = json!({
@@ -258,9 +262,9 @@ fn the_service_connection_is_as_strict_as_the_conversation() -> TestResult {
         "origin": { "type": "dialed_number", "dialed": "+19715870050" },
         "offer": "v=0"
     });
-    assert!(serde_json::from_value::<Request>(leg_as_dialed_number).is_err());
+    assert!(decode_value::<Request>(leg_as_dialed_number).is_err());
 
     let unknown_request = json!({ "type": "originate", "number": "+15035550100" });
-    assert!(serde_json::from_value::<Request>(unknown_request).is_err());
+    assert!(decode_value::<Request>(unknown_request).is_err());
     Ok(())
 }
