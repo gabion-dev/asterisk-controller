@@ -38,6 +38,12 @@ jobs:
       - name: Linter (strict)
         run: cargo clippy --all-targets --locked
 
+      # The controller is checked against the Asterisk it is pinned to: the
+      # release is fetched and verified against its pinned checksum, and the
+      # tests start that Asterisk and run real calls through the controller.
+      - name: Asterisk the controller is pinned to
+        run: bash scripts/fetch-asterisk.sh
+
       - name: Tests
         run: cargo test --locked
 

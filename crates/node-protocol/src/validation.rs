@@ -122,6 +122,19 @@ pub fn decode_value<T: Described>(value: Value) -> Result<T, DecodeError> {
     serde_json::from_value(value).map_err(DecodeError::TypeDisagrees)
 }
 
+/// Encode a protocol message as JSON text.
+///
+/// # Errors
+///
+/// A message the description does not allow is refused here as it would be
+/// on arrival: what the other side cannot decode is never sent.
+pub fn encode<T: Described + serde::Serialize>(message: &T) -> Result<String, DecodeError> {
+    let value = serde_json::to_value(message).map_err(DecodeError::TypeDisagrees)?;
+    let description = description()?;
+    description.check(description.definition(T::DEFINITION)?, &value, "")?;
+    Ok(value.to_string())
+}
+
 struct Description {
     definitions: Map<String, Value>,
     patterns: HashMap<String, regress::Regex>,

@@ -25,7 +25,7 @@
 pub mod audio;
 mod validation;
 
-pub use validation::{DecodeError, Described, decode, decode_value};
+pub use validation::{DecodeError, Described, decode, decode_value, encode};
 
 /// Text messages of both connections — conversation and service — and the
 /// settings the application gives the node.

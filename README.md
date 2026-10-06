@@ -42,6 +42,10 @@ place that accepts commands.
 |                                      | same                                                         |
 | `protocol/audio-frames.md`           | The binary audio frames of a conversation connection         |
 | `protocol/audio-frames.vectors.json` | Frames every implementation must decode, or refuse, the same |
+| `crates/asterisk-controller/`        | The controller: accepts Asterisk's control connection for    |
+|                                      | each call, opens a conversation connection to the            |
+|                                      | application, translates between the two                      |
+| `scripts/fetch-asterisk.sh`          | Fetches the Asterisk build the controller is pinned to       |
 | `crates/node-protocol/`              | Rust: message types generated from the description, the      |
 |                                      | checked decoding, the audio frames                           |
 | `crates/protocol-java/`              | Generator of the Java message types                          |
@@ -96,6 +100,16 @@ unsafe code is forbidden, warnings are errors, the linter runs in its pedantic
 mode, and code paths that could panic (`unwrap`, `expect`, indexing) do not
 compile.
 
+The controller is checked **against a real Asterisk** — the build it is pinned
+to (`scripts/fetch-asterisk.sh`, release and checksums pinned there). The test
+starts that Asterisk and the built controller, plays the application's side of
+the conversation connection through the protocol library, and runs real calls:
+a call that rings, is answered and hung up by the caller; a conversation the
+handler ends; an application that declines; an application that breaks the
+protocol. In the last two the test also requires that nobody is left on the
+line. Without an Asterisk tree the test fails and says how to get one — it
+never skips itself.
+
 Every file states its own path from the repository root at its top, with an
 empty line under it, so that a file seen on its own says where it lives. A test holds the repository to it;
 the file types a comment would break (JSON) and the files that must not carry
@@ -106,6 +120,7 @@ and a file of a type the test does not know fails it.
 ```sh
 cargo fmt --all --check
 cargo clippy --all-targets
+scripts/fetch-asterisk.sh      # once: the Asterisk the controller is pinned to
 cargo test
 (cd java && ./gradlew check)   # needs a JDK 21
 ```
@@ -114,9 +129,14 @@ The same four run on every push (`.github/workflows/checks.yml`).
 
 ## Status
 
-Early development: the protocol — its description, the Rust types, the Java
-library and the audio frames — held together by the shared vectors. The
-controller itself is not written yet; no release has been published.
+Early development. Done: the protocol (description, Rust types, Java library,
+audio frames, shared vectors) and the first slice of the controller — a call
+from the telephone network carried from its first ring to its end, with the
+commands answer, reject, remove, send digits and end. Not done yet: adding and
+connecting participants, audio, recording, standing in for an absent
+application, settings, browser calls. A command the controller does not carry
+out yet ends the conversation with an error that names it; none is accepted
+and ignored. No release has been published.
 
 ## License
 
