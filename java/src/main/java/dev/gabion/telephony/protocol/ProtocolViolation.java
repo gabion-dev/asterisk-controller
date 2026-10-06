@@ -1,6 +1,6 @@
-// java/ProtocolViolation.java
+// java/src/main/java/dev/gabion/telephony/protocol/ProtocolViolation.java
 
-package __PACKAGE__;
+package dev.gabion.telephony.protocol;
 
 /**
  * A message is not one the protocol description allows.

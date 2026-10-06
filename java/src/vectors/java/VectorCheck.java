@@ -1,4 +1,4 @@
-// java-check/VectorCheck.java
+// java/src/vectors/java/VectorCheck.java
 
 import java.lang.reflect.Method;
 import java.nio.file.Files;
@@ -14,8 +14,9 @@ import tools.jackson.databind.json.JsonMapper;
  *
  * The same two files — messages and audio frames — are read by the Rust tests of the controller.
  * A message one side accepts and the other refuses, or a frame they decode differently, would be
- * a protocol the two only think they share. This check runs the generated Java, compiled by a
- * real compiler, through every vector.
+ * a protocol the two only think they share. This check runs the library — its generated types
+ * and its hand-written part, compiled by a real compiler — through every vector. The build runs
+ * it as part of {@code check}.
  *
  * The library's package is given on the command line, so the check does not depend on the
  * package the application chooses.

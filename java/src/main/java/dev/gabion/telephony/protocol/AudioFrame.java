@@ -1,6 +1,6 @@
-// java/AudioFrame.java
+// java/src/main/java/dev/gabion/telephony/protocol/AudioFrame.java
 
-package __PACKAGE__;
+package dev.gabion.telephony.protocol;
 
 import java.nio.ByteBuffer;
 import java.nio.CharBuffer;

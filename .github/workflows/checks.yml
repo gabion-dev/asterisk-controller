@@ -47,5 +47,11 @@ jobs:
           distribution: temurin
           java-version: '21'
 
+      # Builds the Java library — generating its types from the protocol
+      # description — with every compiler warning as an error, and runs it
+      # through the vectors it shares with the Rust side. The libraries it
+      # is built against are checked against pinned checksums
+      # (java/gradle/verification-metadata.xml).
       - name: Java side against the shared vectors
-        run: bash java-check/run.sh
+        working-directory: java
+        run: ./gradlew check --console=plain

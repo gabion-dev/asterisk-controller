@@ -2,6 +2,10 @@
 
 # Build output
 /target/
+/java/build/
+/java/.gradle/
+# Classes the editor's Java support compiles for itself when it opens java/
+/java/bin/
 
 # Editor and OS files
 .idea/

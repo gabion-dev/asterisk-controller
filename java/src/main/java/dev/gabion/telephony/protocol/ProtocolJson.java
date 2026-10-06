@@ -1,6 +1,6 @@
-// java/ProtocolJson.java
+// java/src/main/java/dev/gabion/telephony/protocol/ProtocolJson.java
 
-package __PACKAGE__;
+package dev.gabion.telephony.protocol;
 
 import java.io.IOException;
 import java.io.InputStream;

@@ -18,13 +18,27 @@ use std::{
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 /// Directories that are not part of the repository's own content.
-const SKIPPED_DIRECTORIES: &[&str] = &[".git", "target"];
+const SKIPPED_DIRECTORIES: &[&str] = &[".git", "target", "build", ".gradle", "bin"];
 
 /// Files that carry no path line, each for its own reason.
 const EXEMPT_FILES: &[(&str, &str)] = &[
     ("README.md", "the face of the repository: shown as is"),
     ("LICENSE", "a legal text, kept byte for byte"),
     ("Cargo.lock", "written by cargo, never by hand"),
+    ("java/gradlew", "written by Gradle, never by hand"),
+    ("java/gradlew.bat", "written by Gradle, never by hand"),
+    (
+        "java/gradle/wrapper/gradle-wrapper.jar",
+        "a binary of Gradle's own",
+    ),
+    (
+        "java/gradle/wrapper/gradle-wrapper.properties",
+        "written by Gradle, never by hand",
+    ),
+    (
+        "java/gradle/verification-metadata.xml",
+        "written by Gradle, never by hand",
+    ),
 ];
 
 /// How the path line of a file looks, by what the file is.
@@ -42,7 +56,7 @@ enum Marking {
 fn marking_of(file_name: &str) -> Option<Marking> {
     let extension = Path::new(file_name).extension().and_then(|e| e.to_str());
     match (file_name, extension) {
-        (_, Some("rs" | "java")) => Some(Marking::Line {
+        (_, Some("rs" | "java" | "kts")) => Some(Marking::Line {
             prefix: "// ",
             suffix: "",
         }),
