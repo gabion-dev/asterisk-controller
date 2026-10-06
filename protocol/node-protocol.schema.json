@@ -1,7 +1,7 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "title": "Gabion node protocol — conversation connection",
-  "description": "The single source of the message types exchanged between a Gabion application and the Asterisk controller on a conversation connection. Types for both sides are generated from this file; neither side keeps a hand-written copy.",
+  "title": "Gabion node protocol",
+  "description": "The single source of the message types exchanged between a Gabion application and the Asterisk controller: the conversation connection, the service connection, and the settings the application gives the node. Types for both sides are generated from this file; neither side keeps a hand-written copy. Audio does not travel as these messages: its binary frames are described in audio-frames.md.",
   "definitions": {
     "ConversationId": {
       "type": "string",
@@ -1324,6 +1324,962 @@
           "additionalProperties": false
         }
       ]
+    },
+    "HandlerId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "description": "Stable identifier of a conversation handler in the application."
+    },
+    "OperatorId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "description": "Identifier of a telephone operator (a trunk)."
+    },
+    "PromptId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "description": "Identifier of a recorded prompt the node can play by itself."
+    },
+    "LegId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "description": "Identifier of a browser call leg, chosen by the application."
+    },
+    "Sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "A SHA-256 digest in lowercase hexadecimal."
+    },
+    "CountryCode": {
+      "type": "string",
+      "pattern": "^[A-Z]{2}$",
+      "description": "ISO 3166-1 alpha-2 country code."
+    },
+    "Network": {
+      "type": "string",
+      "pattern": "^[0-9a-fA-F:.]+/[0-9]{1,3}$",
+      "description": "An address range in CIDR form."
+    },
+    "SessionDescription": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 65536,
+      "description": "Audio parameters a browser offers or receives (SDP). The only thing of the call a browser ever supplies."
+    },
+    "DeviceFact": {
+      "type": "string",
+      "enum": [
+        "microphone_stopped",
+        "microphone_resumed",
+        "screen_hidden",
+        "screen_visible"
+      ],
+      "description": "A fact a participant's device reports about itself."
+    },
+    "BrowserOrigin": {
+      "description": "Whose browser the leg belongs to. The application has already checked the right to call; a browser never names a destination.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "user_endpoint"
+            },
+            "user": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            }
+          },
+          "required": [
+            "type",
+            "user"
+          ],
+          "additionalProperties": false,
+          "description": "A signed-in user's softphone."
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "web_pass"
+            },
+            "pass": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            }
+          },
+          "required": [
+            "type",
+            "pass"
+          ],
+          "additionalProperties": false,
+          "description": "A visitor admitted by a one-time pass the application issued."
+        }
+      ]
+    },
+    "Request": {
+      "description": "What the application asks of the node outside any conversation.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "start_conversation"
+            },
+            "handler": {
+              "$ref": "#/definitions/HandlerId"
+            },
+            "number": {
+              "$ref": "#/definitions/PhoneNumber"
+            },
+            "line": {
+              "$ref": "#/definitions/LineId"
+            },
+            "answer_limit_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Milliseconds."
+            }
+          },
+          "required": [
+            "type",
+            "handler",
+            "number",
+            "line",
+            "answer_limit_ms"
+          ],
+          "additionalProperties": false,
+          "description": "Start a conversation by dialling its first participant. The instance that receives the conversation connection becomes the owner — not necessarily the one that asked."
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "browser_leg_begin"
+            },
+            "leg": {
+              "$ref": "#/definitions/LegId"
+            },
+            "origin": {
+              "$ref": "#/definitions/BrowserOrigin"
+            },
+            "offer": {
+              "$ref": "#/definitions/SessionDescription"
+            }
+          },
+          "required": [
+            "type",
+            "leg",
+            "origin",
+            "offer"
+          ],
+          "additionalProperties": false,
+          "description": "Create a call leg for a browser. The controller holds the dialogue with Asterisk itself."
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "browser_leg_end"
+            },
+            "leg": {
+              "$ref": "#/definitions/LegId"
+            }
+          },
+          "required": [
+            "type",
+            "leg"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "device_fact"
+            },
+            "leg": {
+              "$ref": "#/definitions/LegId"
+            },
+            "fact": {
+              "$ref": "#/definitions/DeviceFact"
+            }
+          },
+          "required": [
+            "type",
+            "leg",
+            "fact"
+          ],
+          "additionalProperties": false,
+          "description": "A fact from the page; the controller puts it into the conversation's events in order."
+        }
+      ]
+    },
+    "RequestRejection": {
+      "type": "string",
+      "enum": [
+        "node_not_ready",
+        "unknown_line",
+        "destination_not_allowed",
+        "no_operator_for_destination",
+        "outbound_limit_reached",
+        "no_usable_audio_address",
+        "leg_already_exists",
+        "unknown_leg"
+      ]
+    },
+    "RequestOutcome": {
+      "description": "The immediate answer to a request.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "accepted"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "conversation_started"
+            },
+            "conversation": {
+              "$ref": "#/definitions/ConversationId"
+            }
+          },
+          "required": [
+            "type",
+            "conversation"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "browser_leg_answer"
+            },
+            "answer": {
+              "$ref": "#/definitions/SessionDescription"
+            }
+          },
+          "required": [
+            "type",
+            "answer"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "rejected"
+            },
+            "reason": {
+              "$ref": "#/definitions/RequestRejection"
+            }
+          },
+          "required": [
+            "type",
+            "reason"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "FallbackKind": {
+      "type": "string",
+      "enum": [
+        "transfer",
+        "message"
+      ]
+    },
+    "Report": {
+      "description": "What the node did while no instance owned a conversation. Nothing the node does on its own goes unreported.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "holding_without_owner"
+            },
+            "conversation": {
+              "$ref": "#/definitions/ConversationId"
+            },
+            "at_unix_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Milliseconds since the Unix epoch."
+            }
+          },
+          "required": [
+            "type",
+            "conversation",
+            "at_unix_ms"
+          ],
+          "additionalProperties": false,
+          "description": "People connected to each other are being kept together while an owner is looked for."
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "fallback_applied"
+            },
+            "conversation": {
+              "$ref": "#/definitions/ConversationId"
+            },
+            "origin": {
+              "$ref": "#/definitions/Origin"
+            },
+            "fallback": {
+              "$ref": "#/definitions/FallbackKind"
+            },
+            "at_unix_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Milliseconds since the Unix epoch."
+            }
+          },
+          "required": [
+            "type",
+            "conversation",
+            "origin",
+            "fallback",
+            "at_unix_ms"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "ringing_cancelled"
+            },
+            "conversation": {
+              "$ref": "#/definitions/ConversationId"
+            },
+            "participant": {
+              "$ref": "#/definitions/ParticipantId"
+            },
+            "at_unix_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Milliseconds since the Unix epoch."
+            }
+          },
+          "required": [
+            "type",
+            "conversation",
+            "participant",
+            "at_unix_ms"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "participant_hung_up"
+            },
+            "conversation": {
+              "$ref": "#/definitions/ConversationId"
+            },
+            "participant": {
+              "$ref": "#/definitions/ParticipantId"
+            },
+            "at_unix_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Milliseconds since the Unix epoch."
+            }
+          },
+          "required": [
+            "type",
+            "conversation",
+            "participant",
+            "at_unix_ms"
+          ],
+          "additionalProperties": false,
+          "description": "A participant left with nobody to talk to and nobody in charge."
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "settings_unconfirmed"
+            },
+            "fingerprint": {
+              "$ref": "#/definitions/Sha256"
+            },
+            "at_unix_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Milliseconds since the Unix epoch."
+            }
+          },
+          "required": [
+            "type",
+            "fingerprint",
+            "at_unix_ms"
+          ],
+          "additionalProperties": false,
+          "description": "The node started on the settings it had stored, without the application to confirm them."
+        }
+      ]
+    },
+    "ServiceRefusal": {
+      "type": "string",
+      "enum": [
+        "unknown_protocol",
+        "unknown_node",
+        "unsupported_asterisk"
+      ]
+    },
+    "NodeMessage": {
+      "description": "A message the controller sends on the service connection.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "hello"
+            },
+            "protocol": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "node": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "controller_version": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "asterisk_version": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "applied_settings": {
+              "$ref": "#/definitions/Sha256"
+            }
+          },
+          "required": [
+            "type",
+            "protocol",
+            "node",
+            "controller_version",
+            "asterisk_version"
+          ],
+          "additionalProperties": false,
+          "description": "Always the first message. The fingerprint is absent when the node has no settings yet."
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "settings_applied"
+            },
+            "fingerprint": {
+              "$ref": "#/definitions/Sha256"
+            }
+          },
+          "required": [
+            "type",
+            "fingerprint"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "settings_refused"
+            },
+            "fingerprint": {
+              "$ref": "#/definitions/Sha256"
+            },
+            "problem": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 2000
+            }
+          },
+          "required": [
+            "type",
+            "fingerprint",
+            "problem"
+          ],
+          "additionalProperties": false,
+          "description": "The node keeps its previous settings and says what is wrong with the new ones."
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "request_result"
+            },
+            "id": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "outcome": {
+              "$ref": "#/definitions/RequestOutcome"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "outcome"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "report"
+            },
+            "report": {
+              "$ref": "#/definitions/Report"
+            }
+          },
+          "required": [
+            "type",
+            "report"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "ping"
+            },
+            "n": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "type",
+            "n"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "pong"
+            },
+            "n": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "type",
+            "n"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "ApplicationServiceMessage": {
+      "description": "A message the application sends on the service connection.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "welcome"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "additionalProperties": false,
+          "description": "The application knows this node and this protocol."
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "refuse"
+            },
+            "reason": {
+              "$ref": "#/definitions/ServiceRefusal"
+            }
+          },
+          "required": [
+            "type",
+            "reason"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "settings_changed"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "additionalProperties": false,
+          "description": "The node should fetch its settings again."
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "request"
+            },
+            "id": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Chosen by the application, unique on this connection."
+            },
+            "request": {
+              "$ref": "#/definitions/Request"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "request"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "ping"
+            },
+            "n": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "type",
+            "n"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "pong"
+            },
+            "n": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "type",
+            "n"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "SipTransport": {
+      "type": "string",
+      "enum": [
+        "udp",
+        "tcp",
+        "tls"
+      ]
+    },
+    "OperatorCredentials": {
+      "type": "object",
+      "properties": {
+        "username": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "password": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        }
+      },
+      "required": [
+        "username",
+        "password"
+      ],
+      "additionalProperties": false
+    },
+    "Operator": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/OperatorId"
+        },
+        "host": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 253
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Checked to be a valid port when the settings are applied; a wrong one refuses the settings."
+        },
+        "transport": {
+          "$ref": "#/definitions/SipTransport"
+        },
+        "credentials": {
+          "$ref": "#/definitions/OperatorCredentials"
+        },
+        "source_networks": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Network"
+          },
+          "description": "The only networks calls of this operator are accepted from."
+        },
+        "countries": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/CountryCode"
+          },
+          "description": "Countries this operator carries outbound calls to."
+        }
+      },
+      "required": [
+        "id",
+        "host",
+        "port",
+        "transport",
+        "source_networks",
+        "countries"
+      ],
+      "additionalProperties": false,
+      "description": "A telephone operator: where its trunk is and what it serves."
+    },
+    "Line": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/LineId"
+        },
+        "number": {
+          "$ref": "#/definitions/PhoneNumber"
+        },
+        "operator": {
+          "$ref": "#/definitions/OperatorId"
+        },
+        "allowed_countries": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/CountryCode"
+          },
+          "description": "Empty means the line makes no outbound calls at all."
+        },
+        "concurrent_outbound_limit": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "id",
+        "number",
+        "operator",
+        "allowed_countries",
+        "concurrent_outbound_limit"
+      ],
+      "additionalProperties": false,
+      "description": "An outbound line: the number shown, the destinations allowed, the limit of simultaneous calls. The second line of defence — the telephony module has checked the same before asking."
+    },
+    "EntryKey": {
+      "description": "A way conversations arrive.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "dialed_number"
+            },
+            "number": {
+              "$ref": "#/definitions/PhoneNumber"
+            }
+          },
+          "required": [
+            "type",
+            "number"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "user_endpoints"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "additionalProperties": false,
+          "description": "Softphones of signed-in users."
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "web_passes"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "additionalProperties": false,
+          "description": "Calls from web pages admitted by one-time passes."
+        }
+      ]
+    },
+    "Fallback": {
+      "description": "What the node does for a caller who was alone with the application when no instance can own the conversation.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "transfer"
+            },
+            "number": {
+              "$ref": "#/definitions/PhoneNumber"
+            },
+            "line": {
+              "$ref": "#/definitions/LineId"
+            },
+            "answer_limit_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Milliseconds."
+            }
+          },
+          "required": [
+            "type",
+            "number",
+            "line",
+            "answer_limit_ms"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "message"
+            },
+            "prompt": {
+              "$ref": "#/definitions/PromptId"
+            }
+          },
+          "required": [
+            "type",
+            "prompt"
+          ],
+          "additionalProperties": false,
+          "description": "Play the prompt, then hang up."
+        }
+      ]
+    },
+    "Entry": {
+      "type": "object",
+      "properties": {
+        "key": {
+          "$ref": "#/definitions/EntryKey"
+        },
+        "fallback": {
+          "$ref": "#/definitions/Fallback"
+        }
+      },
+      "required": [
+        "key",
+        "fallback"
+      ],
+      "additionalProperties": false,
+      "description": "An entry and its fallback. There is no entry without a fallback."
+    },
+    "Prompt": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/PromptId"
+        },
+        "sha256": {
+          "$ref": "#/definitions/Sha256"
+        }
+      },
+      "required": [
+        "id",
+        "sha256"
+      ],
+      "additionalProperties": false,
+      "description": "A prompt the node fetches by identifier and keeps; the digest tells it when the audio changed."
+    },
+    "Settings": {
+      "type": "object",
+      "properties": {
+        "operators": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Operator"
+          }
+        },
+        "lines": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Line"
+          }
+        },
+        "entries": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Entry"
+          }
+        },
+        "prompts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Prompt"
+          }
+        }
+      },
+      "required": [
+        "operators",
+        "lines",
+        "entries",
+        "prompts"
+      ],
+      "additionalProperties": false,
+      "description": "Everything the node is told in advance. The controller turns it into Asterisk configuration; the application never writes Asterisk's files."
     }
   }
 }

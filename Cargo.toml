@@ -1,6 +1,7 @@
+# Cargo.toml
 [workspace]
 resolver = "3"
-members = ["crates/node-protocol"]
+members = ["crates/node-protocol", "crates/repository-checks"]
 
 [workspace.package]
 edition = "2024"

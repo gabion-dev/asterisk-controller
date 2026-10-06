@@ -1,6 +1,7 @@
+// crates/node-protocol/build.rs
 //! Generates the protocol message types from the protocol description.
 //!
-//! The description — `protocol/conversation.schema.json` at the repository
+//! The description — `protocol/node-protocol.schema.json` at the repository
 //! root — is the single source of these types. Nothing here is written by
 //! hand, so the Rust side cannot drift from the description; the Java side
 //! of the application is generated from the same file.
@@ -11,7 +12,7 @@ use typify::{TypeSpace, TypeSpaceSettings};
 
 fn main() -> Result<(), Box<dyn Error>> {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
-    let schema_path = manifest_dir.join("../../protocol/conversation.schema.json");
+    let schema_path = manifest_dir.join("../../protocol/node-protocol.schema.json");
     println!("cargo::rerun-if-changed={}", schema_path.display());
 
     let text = fs::read_to_string(&schema_path)?;
@@ -24,7 +25,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     type_space.add_root_schema(schema)?;
 
     let file = syn::parse2::<syn::File>(type_space.to_stream())?;
-    let out = PathBuf::from(env::var("OUT_DIR")?).join("conversation.rs");
+    let out = PathBuf::from(env::var("OUT_DIR")?).join("messages.rs");
     fs::write(out, prettyplease::unparse(&file))?;
     Ok(())
 }

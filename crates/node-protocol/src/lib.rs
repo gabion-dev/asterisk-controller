@@ -1,19 +1,25 @@
+// crates/node-protocol/src/lib.rs
 //! Message types of the Gabion node protocol.
 //!
-//! Everything in [`conversation`] is generated at build time from the
-//! protocol description (`protocol/conversation.schema.json`). The
-//! description is strict by construction, and so are these types:
+//! Everything in [`messages`] is generated at build time from the protocol
+//! description (`protocol/node-protocol.schema.json`). The description is
+//! strict by construction, and so are these types:
 //!
 //! - an object with a field the description does not name is refused;
 //! - an object missing a required field is refused;
-//! - a message, command or event of an unknown kind is refused.
+//! - a message, command, event or request of an unknown kind is refused.
 //!
 //! "Refused" means a decoding error. Nothing is skipped and nothing is
 //! filled in with a default.
+//!
+//! Audio does not travel as these messages. Its binary frames are in
+//! [`audio`], written by hand against `protocol/audio-frames.md` and held to
+//! it by the shared vectors in `protocol/audio-frames.vectors.json`.
 
-/// Messages of a conversation connection: the controller's and the
-/// application's text messages, with the commands, events and values they
-/// carry.
+pub mod audio;
+
+/// Text messages of both connections — conversation and service — and the
+/// settings the application gives the node.
 #[allow(
     missing_docs,
     clippy::all,
@@ -25,6 +31,6 @@
     clippy::wildcard_enum_match_arm,
     reason = "generated code: its shape is decided by the generator, its content by the protocol description"
 )]
-pub mod conversation {
-    include!(concat!(env!("OUT_DIR"), "/conversation.rs"));
+pub mod messages {
+    include!(concat!(env!("OUT_DIR"), "/messages.rs"));
 }

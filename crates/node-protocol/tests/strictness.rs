@@ -1,11 +1,13 @@
+// crates/node-protocol/tests/strictness.rs
 //! The protocol types refuse what the protocol description does not allow.
 //!
 //! These tests pin the property the rest of the controller relies on: a
 //! message that is not exactly what the description says never becomes a
 //! value. Nothing is skipped and nothing is defaulted.
 
-use node_protocol::conversation::{
-    ApplicationMessage, Command, ControllerMessage, Event, Opening, Origin,
+use node_protocol::messages::{
+    ApplicationMessage, ApplicationServiceMessage, Command, ControllerMessage, Event, NodeMessage,
+    Opening, Origin, Request, Settings,
 };
 use serde_json::{Value, json};
 
@@ -145,5 +147,120 @@ fn what_is_written_reads_back_the_same() -> TestResult {
     });
     let message: ControllerMessage = serde_json::from_value(event.clone())?;
     assert_eq!(serde_json::to_value(&message)?, event);
+    Ok(())
+}
+
+fn settings() -> Value {
+    json!({
+        "operators": [{
+            "id": "chime", "host": "abc.voiceconnector.chime.aws", "port": 5060, "transport": "udp",
+            "source_networks": ["3.80.16.0/23"], "countries": ["US", "CA"]
+        }],
+        "lines": [{
+            "id": "main", "number": "+19715870050", "operator": "chime",
+            "allowed_countries": ["US"], "concurrent_outbound_limit": 2
+        }],
+        "entries": [{
+            "key": { "type": "dialed_number", "number": "+19715870050" },
+            "fallback": { "type": "message", "prompt": "away" }
+        }],
+        "prompts": [{
+            "id": "away",
+            "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+        }]
+    })
+}
+
+#[test]
+fn well_formed_settings_are_accepted() -> TestResult {
+    let parsed: Settings = serde_json::from_value(settings())?;
+    assert_eq!(parsed.operators.len(), 1);
+    assert_eq!(parsed.entries.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn an_entry_cannot_be_given_without_a_fallback() -> TestResult {
+    let mut without_fallback = settings();
+    object_at(&mut without_fallback, "/entries/0")?.remove("fallback");
+    assert!(serde_json::from_value::<Settings>(without_fallback).is_err());
+
+    let mut unknown_fallback = settings();
+    object_at(&mut unknown_fallback, "/entries/0")?
+        .insert("fallback".into(), json!({ "type": "queue" }));
+    assert!(serde_json::from_value::<Settings>(unknown_fallback).is_err());
+    Ok(())
+}
+
+#[test]
+fn settings_values_of_the_wrong_form_are_refused() -> TestResult {
+    for (pointer, field, value) in [
+        ("/operators/0", "countries", json!(["usa"])),
+        ("/operators/0", "source_networks", json!(["everywhere"])),
+        ("/operators/0", "transport", json!("sctp")),
+        ("/operators/0", "port", json!(0)),
+        ("/lines/0", "number", json!("9715870050")),
+        ("/prompts/0", "sha256", json!("9F86")),
+    ] {
+        let mut changed = settings();
+        object_at(&mut changed, pointer)?.insert(field.into(), value);
+        assert!(
+            serde_json::from_value::<Settings>(changed).is_err(),
+            "{pointer}/{field} was accepted"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn the_service_connection_is_as_strict_as_the_conversation() -> TestResult {
+    let hello_without_settings = json!({
+        "type": "hello", "protocol": 1, "node": "node-1",
+        "controller_version": "0.1.0", "asterisk_version": "22.11.0"
+    });
+    let message: NodeMessage = serde_json::from_value(hello_without_settings)?;
+    let NodeMessage::Hello {
+        applied_settings, ..
+    } = message
+    else {
+        return Err("the hello did not decode as a hello".into());
+    };
+    assert!(applied_settings.is_none());
+
+    let browser_leg = json!({
+        "type": "request", "id": 1,
+        "request": {
+            "type": "browser_leg_begin", "leg": "leg-1",
+            "origin": { "type": "web_pass", "pass": "pass-1" },
+            "offer": "v=0"
+        }
+    });
+    let message: ApplicationServiceMessage = serde_json::from_value(browser_leg)?;
+    assert!(matches!(
+        message,
+        ApplicationServiceMessage::Request {
+            request: Request::BrowserLegBegin { .. },
+            ..
+        }
+    ));
+
+    // A browser leg has no destination to give: the description has no such field.
+    let leg_with_destination = json!({
+        "type": "browser_leg_begin", "leg": "leg-1",
+        "origin": { "type": "web_pass", "pass": "pass-1" },
+        "offer": "v=0", "number": "+15035550100"
+    });
+    assert!(serde_json::from_value::<Request>(leg_with_destination).is_err());
+
+    // Nor can it claim to be a call from the telephone network.
+    let leg_as_dialed_number = json!({
+        "type": "browser_leg_begin", "leg": "leg-1",
+        "origin": { "type": "dialed_number", "dialed": "+19715870050" },
+        "offer": "v=0"
+    });
+    assert!(serde_json::from_value::<Request>(leg_as_dialed_number).is_err());
+
+    let unknown_request = json!({ "type": "originate", "number": "+15035550100" });
+    assert!(serde_json::from_value::<Request>(unknown_request).is_err());
     Ok(())
 }

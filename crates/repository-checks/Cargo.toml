@@ -1,0 +1,13 @@
+# crates/repository-checks/Cargo.toml
+[package]
+name = "repository-checks"
+version = "0.1.0"
+description = "Checks of the repository itself: conventions that no compiler enforces."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
