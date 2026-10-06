@@ -33,6 +33,11 @@ Frames of one participant arrive in order, each twenty milliseconds after the
 previous one. Silence is sent as audio like anything else: deciding what is
 speech is not the node's business.
 
+The position counts the participant's audio from the moment the node began to
+receive it, whether the application was listening or not: after
+`stop_listening` and a later `listen` the positions go on from where the
+participant's audio is, so a pause in listening shows as a gap.
+
 ### Playback — application to controller
 
 Audio of a segment the application queued with the `play` command.
@@ -48,6 +53,19 @@ Audio of a segment the application queued with the `play` command.
 A segment is as long as the application makes it; the node paces it. A frame
 that is not the last one carries at least one sample; the last one may be
 empty.
+
+Segments of one participant are played in the order they were queued, and a
+segment whose last frame has not arrived holds back the ones behind it. The
+node hands audio to the call in pieces of twenty milliseconds: a segment whose
+audio is not a whole number of them is followed by silence up to the next one.
+Segments that must follow each other without a gap are therefore cut at
+multiples of 640 bytes.
+
+A well-formed playback frame for a segment that is not in the participant's
+queue — never queued, already dropped or delivered, or of a participant who
+has left — is left out, not refused. The application may have sent it before
+it could read that the `play` command was rejected, the queue flushed or the
+participant gone.
 
 ## What is refused
 

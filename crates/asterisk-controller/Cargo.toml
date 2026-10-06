@@ -23,4 +23,4 @@ tokio-tungstenite = "0.30.0"
 uuid = { version = "1.27.0", features = ["v4"] }
 
 [dev-dependencies]
-tokio = { version = "1.53.2", features = ["process", "rt-multi-thread", "macros", "net", "time", "io-util"] }
+tokio = { version = "1.53.2", features = ["process", "rt-multi-thread", "macros", "net", "sync", "time", "io-util"] }

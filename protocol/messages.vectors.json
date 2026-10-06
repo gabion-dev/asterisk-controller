@@ -458,6 +458,32 @@
    }
   },
   {
+   "name": "command result: a segment of a name that is still queued",
+   "type": "ControllerMessage",
+   "accept": true,
+   "json": {
+    "type": "command_result",
+    "id": 5,
+    "outcome": {
+     "type": "rejected",
+     "reason": "segment_already_queued"
+    }
+   }
+  },
+  {
+   "name": "command result: rejected for a reason the protocol does not know",
+   "type": "ControllerMessage",
+   "accept": false,
+   "json": {
+    "type": "command_result",
+    "id": 6,
+    "outcome": {
+     "type": "rejected",
+     "reason": "queue_full"
+    }
+   }
+  },
+  {
    "name": "event of an unknown kind",
    "type": "Event",
    "accept": false,

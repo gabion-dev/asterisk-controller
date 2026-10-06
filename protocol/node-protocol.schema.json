@@ -272,7 +272,8 @@
         "no_operator_for_destination",
         "outbound_limit_reached",
         "unknown_recording",
-        "unknown_segment"
+        "unknown_segment",
+        "segment_already_queued"
       ]
     },
     "Retention": {

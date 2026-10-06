@@ -8,6 +8,8 @@
 //! adds fields and events between versions, and the controller reads the
 //! ones it knows and leaves the rest.
 
+use std::fmt::Write as _;
+
 use serde::Deserialize;
 use serde_json::json;
 
@@ -17,6 +19,11 @@ use serde_json::json;
 pub enum Message {
     /// A channel entered the application.
     StasisStart {
+        /// Asterisk's name for the application the channel entered. For a
+        /// call's control connection it is the call's own: channels the
+        /// controller adds to the call are told to enter the same one, and
+        /// so are reported on the same connection.
+        application: String,
         /// Arguments the dialplan gave the application.
         args: Vec<String>,
         /// The channel.
@@ -85,6 +92,22 @@ pub const STATE_UP: &str = "Up";
 )]
 pub fn read(text: &str) -> Result<Message, serde_json::Error> {
     serde_json::from_str(text)
+}
+
+/// A value as it must be written into the query of a request: everything
+/// but letters, digits and `-._~` is escaped, so a channel name with its
+/// slashes and semicolons stays one value.
+pub fn query(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            escaped.push(char::from(byte));
+        } else {
+            // Writing into a `String` cannot fail.
+            let _ = write!(escaped, "%{byte:02X}");
+        }
+    }
+    escaped
 }
 
 /// The text of a request to Asterisk over the call's own connection.

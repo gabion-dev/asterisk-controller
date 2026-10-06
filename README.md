@@ -43,8 +43,8 @@ place that accepts commands.
 | `protocol/audio-frames.md`           | The binary audio frames of a conversation connection         |
 | `protocol/audio-frames.vectors.json` | Frames every implementation must decode, or refuse, the same |
 | `crates/asterisk-controller/`        | The controller: accepts Asterisk's control connection for    |
-|                                      | each call, opens a conversation connection to the            |
-|                                      | application, translates between the two                      |
+|                                      | each call and its media connections, opens a conversation    |
+|                                      | connection to the application, translates between the two    |
 | `scripts/fetch-asterisk.sh`          | Fetches the Asterisk build the controller is pinned to       |
 | `crates/node-protocol/`              | Rust: message types generated from the description, the      |
 |                                      | checked decoding, the audio frames                           |
@@ -99,6 +99,42 @@ live in `java/config/jdt/null-analysis.prefs`, each with its reason. Warnings
 about values that come from libraries without null annotations are off there
 on purpose — no change of this code removes them.
 
+## What Asterisk's behaviour imposes
+
+**The control connection of a call is closed by Asterisk, never by the
+controller.** Asterisk closes it itself, a few seconds after the call's last
+channel has left: it still has events to send about channels being torn down.
+A peer that closes first — properly or not — is to Asterisk a peer that was
+lost: it drops the connection and opens it again for the same call, even when
+the call is over. And while it drops a connection, an event it writes for that
+call can crash it: Asterisk 22.11.0 dies of a segmentation fault in its
+WebSocket write when the peer asks it to hang a channel up and lets go of the
+connection without reading on. So the controller holds every control
+connection until Asterisk closes it, whatever became of the conversation.
+
+A connection Asterisk opens again arrives with no channel entering it. It is
+not a conversation and is not given an identifier.
+
+**A participant's audio path is a media channel joined to the participant's
+channel.** Asterisk opens one more connection to the controller for the media
+channel — to the path `/media`, through the connection its configuration names
+`gabion-media` — and the same rule holds for it: Asterisk closes it, the
+controller ends the channel through the control connection and reads on.
+Asterisk can also tap a channel instead of joining it, but audio put into a
+tap never reaches a participant who is connected to nobody else; both were
+tried against the pinned build.
+
+**Asterisk is handed a few seconds of audio at most.** Its media channel holds
+twenty seconds and silently drops what does not fit. The controller keeps the
+rest of a participant's queue itself and hands over more as Asterisk reports
+what it has played.
+
+**"Started", "delivered" and "dropped after so many milliseconds" are
+Asterisk's words, not a clock's.** The controller puts marks between the
+pieces of audio it hands over, and Asterisk reports each mark when it reaches
+it. On a flush Asterisk is paused, asked how much it still holds, and only
+then told to drop it.
+
 ## Checks
 
 The Gabion development environment does not check this repository, so the
@@ -113,9 +149,16 @@ starts that Asterisk and the built controller, plays the application's side of
 the conversation connection through the protocol library, and runs real calls:
 a call that rings, is answered and hung up by the caller; a conversation the
 handler ends; an application that declines; an application that breaks the
-protocol. In the last two the test also requires that nobody is left on the
-line. Without an Asterisk tree the test fails and says how to get one — it
-never skips itself.
+protocol; an application that hears a caller and plays to them. In the last
+one the caller's telephone is a media channel of the same Asterisk, speaking
+the telephone network's audio format: the test measures the caller's tone in
+what the application receives and the application's tone in what the caller
+receives, flushes a queue in the middle of a segment, and has the caller hang
+up with a segment still queued. After the scenarios that end badly the test
+also requires that nobody is left on the line, and over the whole run — that Asterisk never lost a control connection
+(see the rule below). Without an Asterisk tree the test fails and says how to
+get one — it never skips itself. When it fails, it says whether Asterisk and
+the controller are still alive and shows everything each of them printed.
 
 Every file states its own path from the repository root at its top, with an
 empty line under it, so that a file seen on its own says where it lives. A test holds the repository to it;
@@ -139,9 +182,10 @@ The same four run on every push (`.github/workflows/checks.yml`).
 Early development. Done: the protocol (description, Rust types, Java library,
 audio frames, shared vectors) and the first slice of the controller — a call
 from the telephone network carried from its first ring to its end, with the
-commands answer, reject, remove, send digits and end. Not done yet: adding and
-connecting participants, audio, recording, standing in for an absent
-application, settings, browser calls. A command the controller does not carry
+commands answer, reject, remove, send digits and end, and with audio: the
+application hears a participant, queues segments for them and flushes the
+queue. Not done yet: adding and connecting participants, recording, standing
+in for an absent application, settings, browser calls. A command the controller does not carry
 out yet ends the conversation with an error that names it; none is accepted
 and ignored. No release has been published.
 
