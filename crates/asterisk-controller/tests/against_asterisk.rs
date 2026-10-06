@@ -197,6 +197,10 @@ async fn start(mut process: Process, ready: &str, what: &str) -> TestResult<Chil
 }
 
 /// One request to the test Asterisk's control interface; returns status and body.
+///
+/// The answer is read by its stated length, not until the connection ends:
+/// Asterisk may end the connection with a reset once it has answered, and a
+/// reset after a complete answer is not a failure of the request.
 async fn asterisk_http(port: u16, method: &str, path: &str) -> TestResult<(u16, String)> {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).await?;
     let request = format!(
@@ -204,18 +208,32 @@ async fn asterisk_http(port: u16, method: &str, path: &str) -> TestResult<(u16, 
          Content-Length: 0\r\nConnection: close\r\n\r\n"
     );
     stream.write_all(request.as_bytes()).await?;
-    let mut response = String::new();
-    timeout(STEP, stream.read_to_string(&mut response)).await??;
-    let status = response
+
+    let mut reader = BufReader::new(stream);
+    let mut status_line = String::new();
+    timeout(STEP, reader.read_line(&mut status_line)).await??;
+    let status = status_line
         .split_whitespace()
         .nth(1)
         .ok_or("no status line")?
         .parse()?;
-    let body = response
-        .split_once("\r\n\r\n")
-        .map(|(_, body)| body.to_owned())
-        .unwrap_or_default();
-    Ok((status, body))
+
+    let mut length = 0_usize;
+    loop {
+        let mut header = String::new();
+        timeout(STEP, reader.read_line(&mut header)).await??;
+        if header.trim().is_empty() {
+            break;
+        }
+        if let Some((name, value)) = header.split_once(':')
+            && name.eq_ignore_ascii_case("content-length")
+        {
+            length = value.trim().parse()?;
+        }
+    }
+    let mut body = vec![0_u8; length];
+    timeout(STEP, reader.read_exact(&mut body)).await??;
+    Ok((status, String::from_utf8(body)?))
 }
 
 /// Place a call from the telephone network: a channel enters through `in`,
