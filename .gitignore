@@ -1,0 +1,7 @@
+# Build output
+/target/
+
+# Editor and OS files
+.idea/
+.vscode/
+.DS_Store

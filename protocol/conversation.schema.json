@@ -1,0 +1,1329 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Gabion node protocol — conversation connection",
+  "description": "The single source of the message types exchanged between a Gabion application and the Asterisk controller on a conversation connection. Types for both sides are generated from this file; neither side keeps a hand-written copy.",
+  "definitions": {
+    "ConversationId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "description": "Stable identifier of a conversation; other modules may keep it."
+    },
+    "ParticipantId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "description": "Identifier of a participant within its conversation."
+    },
+    "RecordingId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "description": "Stable identifier of a recording; other modules may keep it."
+    },
+    "SegmentId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "description": "Identifier of a playback segment, chosen by the application."
+    },
+    "LineId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "description": "Identifier of an outbound line."
+    },
+    "PhoneNumber": {
+      "type": "string",
+      "pattern": "^\\+[1-9][0-9]{6,14}$",
+      "description": "A phone number in E.164 form."
+    },
+    "ParticipantMedium": {
+      "type": "string",
+      "enum": [
+        "telephone_network",
+        "browser",
+        "sip_device"
+      ],
+      "description": "What carries the participant's audio."
+    },
+    "ParticipantState": {
+      "type": "string",
+      "enum": [
+        "ringing",
+        "in_conversation",
+        "held"
+      ],
+      "description": "State of a participant who has not left."
+    },
+    "Participant": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/ParticipantId"
+        },
+        "medium": {
+          "$ref": "#/definitions/ParticipantMedium"
+        },
+        "number": {
+          "$ref": "#/definitions/PhoneNumber"
+        }
+      },
+      "required": [
+        "id",
+        "medium"
+      ],
+      "additionalProperties": false,
+      "description": "A party on the line. The number is absent when the medium has none."
+    },
+    "ParticipantSnapshot": {
+      "type": "object",
+      "properties": {
+        "participant": {
+          "$ref": "#/definitions/Participant"
+        },
+        "state": {
+          "$ref": "#/definitions/ParticipantState"
+        }
+      },
+      "required": [
+        "participant",
+        "state"
+      ],
+      "additionalProperties": false
+    },
+    "Origin": {
+      "description": "How the conversation came to exist.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "dialed_number"
+            },
+            "dialed": {
+              "$ref": "#/definitions/PhoneNumber"
+            }
+          },
+          "required": [
+            "type",
+            "dialed"
+          ],
+          "additionalProperties": false,
+          "description": "A call from the telephone network to a number of the installation."
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "user_endpoint"
+            },
+            "user": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            }
+          },
+          "required": [
+            "type",
+            "user"
+          ],
+          "additionalProperties": false,
+          "description": "A signed-in user's softphone."
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "web_pass"
+            },
+            "pass": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            }
+          },
+          "required": [
+            "type",
+            "pass"
+          ],
+          "additionalProperties": false,
+          "description": "A call from a web page, admitted by a one-time pass the application issued."
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "started_by_code"
+            },
+            "request": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "handler": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            }
+          },
+          "required": [
+            "type",
+            "request",
+            "handler"
+          ],
+          "additionalProperties": false,
+          "description": "Started at the application's request; the handler is the one the request named."
+        }
+      ]
+    },
+    "Opening": {
+      "description": "Why this conversation connection was opened.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "started"
+            },
+            "origin": {
+              "$ref": "#/definitions/Origin"
+            },
+            "first": {
+              "$ref": "#/definitions/Participant"
+            }
+          },
+          "required": [
+            "type",
+            "origin",
+            "first"
+          ],
+          "additionalProperties": false,
+          "description": "A new conversation."
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "resumed"
+            },
+            "origin": {
+              "$ref": "#/definitions/Origin"
+            },
+            "participants": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/ParticipantSnapshot"
+              }
+            },
+            "connected": {
+              "type": "array",
+              "items": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/definitions/ParticipantId"
+                }
+              },
+              "description": "Groups of participants who hear each other."
+            },
+            "recordings": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/RecordingId"
+              }
+            }
+          },
+          "required": [
+            "type",
+            "origin",
+            "participants",
+            "connected",
+            "recordings"
+          ],
+          "additionalProperties": false,
+          "description": "The previous owner is gone. Nothing of its state survives: no playback queues, no subscriptions."
+        }
+      ]
+    },
+    "DeclineReason": {
+      "type": "string",
+      "enum": [
+        "no_handler",
+        "draining"
+      ]
+    },
+    "RejectReason": {
+      "type": "string",
+      "enum": [
+        "busy",
+        "declined",
+        "rate_limited"
+      ]
+    },
+    "CommandRejection": {
+      "type": "string",
+      "enum": [
+        "conversation_ended",
+        "unknown_participant",
+        "participant_not_in_required_state",
+        "too_few_participants",
+        "unknown_line",
+        "destination_not_allowed",
+        "no_operator_for_destination",
+        "outbound_limit_reached",
+        "unknown_recording",
+        "unknown_segment"
+      ]
+    },
+    "Retention": {
+      "description": "How long a recording is kept; set by whoever starts it.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "until_released"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "additionalProperties": false,
+          "description": "Kept until the holder of its identifier releases it."
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "for"
+            },
+            "period_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Milliseconds."
+            }
+          },
+          "required": [
+            "type",
+            "period_ms"
+          ],
+          "additionalProperties": false,
+          "description": "Deleted when the period ends."
+        }
+      ]
+    },
+    "Command": {
+      "description": "What the application asks for. Mirrors the telephony contract one to one.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "answer"
+            },
+            "participant": {
+              "$ref": "#/definitions/ParticipantId"
+            }
+          },
+          "required": [
+            "type",
+            "participant"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "reject"
+            },
+            "participant": {
+              "$ref": "#/definitions/ParticipantId"
+            },
+            "reason": {
+              "$ref": "#/definitions/RejectReason"
+            }
+          },
+          "required": [
+            "type",
+            "participant",
+            "reason"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "dial"
+            },
+            "number": {
+              "$ref": "#/definitions/PhoneNumber"
+            },
+            "line": {
+              "$ref": "#/definitions/LineId"
+            },
+            "answer_limit_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Milliseconds."
+            }
+          },
+          "required": [
+            "type",
+            "number",
+            "line",
+            "answer_limit_ms"
+          ],
+          "additionalProperties": false,
+          "description": "Add a participant by dialling. The answer limit is a business rule, not a safeguard."
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "connect"
+            },
+            "participants": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/ParticipantId"
+              }
+            }
+          },
+          "required": [
+            "type",
+            "participants"
+          ],
+          "additionalProperties": false,
+          "description": "Let these participants hear each other. Fewer than two, or the same one twice, is rejected with a reason — a command the conversation cannot carry out, not a malformed message."
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "separate"
+            },
+            "participant": {
+              "$ref": "#/definitions/ParticipantId"
+            }
+          },
+          "required": [
+            "type",
+            "participant"
+          ],
+          "additionalProperties": false,
+          "description": "Take a participant out of whatever group they were connected to."
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "remove"
+            },
+            "participant": {
+              "$ref": "#/definitions/ParticipantId"
+            }
+          },
+          "required": [
+            "type",
+            "participant"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "end"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "hold_for"
+            },
+            "participant": {
+              "$ref": "#/definitions/ParticipantId"
+            },
+            "limit_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Milliseconds."
+            }
+          },
+          "required": [
+            "type",
+            "participant",
+            "limit_ms"
+          ],
+          "additionalProperties": false,
+          "description": "How long a participant whose connection is lost stays held before they are counted as gone. Zero means lost is gone."
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "listen"
+            },
+            "participant": {
+              "$ref": "#/definitions/ParticipantId"
+            }
+          },
+          "required": [
+            "type",
+            "participant"
+          ],
+          "additionalProperties": false,
+          "description": "Start receiving what a participant says, as audio frames on this connection."
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "stop_listening"
+            },
+            "participant": {
+              "$ref": "#/definitions/ParticipantId"
+            }
+          },
+          "required": [
+            "type",
+            "participant"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "play"
+            },
+            "participant": {
+              "$ref": "#/definitions/ParticipantId"
+            },
+            "segment": {
+              "$ref": "#/definitions/SegmentId"
+            }
+          },
+          "required": [
+            "type",
+            "participant",
+            "segment"
+          ],
+          "additionalProperties": false,
+          "description": "Queue a segment for a participant. Its audio follows as playback frames carrying the same segment identifier."
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "flush_playback"
+            },
+            "participant": {
+              "$ref": "#/definitions/ParticipantId"
+            }
+          },
+          "required": [
+            "type",
+            "participant"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "send_digits"
+            },
+            "participant": {
+              "$ref": "#/definitions/ParticipantId"
+            },
+            "digits": {
+              "type": "string",
+              "pattern": "^[0-9A-D*#]+$"
+            }
+          },
+          "required": [
+            "type",
+            "participant",
+            "digits"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "start_recording"
+            },
+            "retention": {
+              "$ref": "#/definitions/Retention"
+            }
+          },
+          "required": [
+            "type",
+            "retention"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "stop_recording"
+            },
+            "recording": {
+              "$ref": "#/definitions/RecordingId"
+            }
+          },
+          "required": [
+            "type",
+            "recording"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "CommandOutcome": {
+      "description": "The immediate answer to a command. What came of an accepted command arrives as events.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "accepted"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "accepted_participant"
+            },
+            "participant": {
+              "$ref": "#/definitions/ParticipantId"
+            }
+          },
+          "required": [
+            "type",
+            "participant"
+          ],
+          "additionalProperties": false,
+          "description": "Accepted; the new participant already exists and is ringing."
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "accepted_recording"
+            },
+            "recording": {
+              "$ref": "#/definitions/RecordingId"
+            }
+          },
+          "required": [
+            "type",
+            "recording"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "rejected"
+            },
+            "reason": {
+              "$ref": "#/definitions/CommandRejection"
+            }
+          },
+          "required": [
+            "type",
+            "reason"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "Departure": {
+      "description": "Why a participant left.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "hung_up"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "removed"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "not_answered"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "busy"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "did_not_return"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "dial_failed"
+            },
+            "medium_code": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "type",
+            "medium_code"
+          ],
+          "additionalProperties": false,
+          "description": "The code is the medium's, kept as it came."
+        }
+      ]
+    },
+    "FactOrigin": {
+      "type": "string",
+      "enum": [
+        "observed_by_telephony",
+        "reported_by_device"
+      ],
+      "description": "Where a fact about a participant comes from."
+    },
+    "EndReason": {
+      "type": "string",
+      "enum": [
+        "ended_by_handler",
+        "last_participant_left",
+        "no_handler_for_entry",
+        "deadline_reached"
+      ]
+    },
+    "Event": {
+      "description": "What happened in the conversation. Mirrors the telephony contract one to one.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "participant_ringing"
+            },
+            "participant": {
+              "$ref": "#/definitions/Participant"
+            }
+          },
+          "required": [
+            "type",
+            "participant"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "participant_answered"
+            },
+            "participant": {
+              "$ref": "#/definitions/ParticipantId"
+            }
+          },
+          "required": [
+            "type",
+            "participant"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "participant_held"
+            },
+            "participant": {
+              "$ref": "#/definitions/ParticipantId"
+            }
+          },
+          "required": [
+            "type",
+            "participant"
+          ],
+          "additionalProperties": false,
+          "description": "The participant's connection is lost; the conversation waits for them."
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "participant_returned"
+            },
+            "participant": {
+              "$ref": "#/definitions/ParticipantId"
+            }
+          },
+          "required": [
+            "type",
+            "participant"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "participant_left"
+            },
+            "participant": {
+              "$ref": "#/definitions/ParticipantId"
+            },
+            "departure": {
+              "$ref": "#/definitions/Departure"
+            }
+          },
+          "required": [
+            "type",
+            "participant",
+            "departure"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "digit_received"
+            },
+            "participant": {
+              "$ref": "#/definitions/ParticipantId"
+            },
+            "digit": {
+              "type": "string",
+              "pattern": "^[0-9A-D*#]$"
+            }
+          },
+          "required": [
+            "type",
+            "participant",
+            "digit"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "playback_started"
+            },
+            "participant": {
+              "$ref": "#/definitions/ParticipantId"
+            },
+            "segment": {
+              "$ref": "#/definitions/SegmentId"
+            }
+          },
+          "required": [
+            "type",
+            "participant",
+            "segment"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "playback_delivered"
+            },
+            "participant": {
+              "$ref": "#/definitions/ParticipantId"
+            },
+            "segment": {
+              "$ref": "#/definitions/SegmentId"
+            }
+          },
+          "required": [
+            "type",
+            "participant",
+            "segment"
+          ],
+          "additionalProperties": false,
+          "description": "Handed to the medium in full. Not 'heard'."
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "playback_dropped"
+            },
+            "participant": {
+              "$ref": "#/definitions/ParticipantId"
+            },
+            "segment": {
+              "$ref": "#/definitions/SegmentId"
+            },
+            "delivered_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Milliseconds."
+            }
+          },
+          "required": [
+            "type",
+            "participant",
+            "segment",
+            "delivered_ms"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "medium_lost"
+            },
+            "participant": {
+              "$ref": "#/definitions/ParticipantId"
+            }
+          },
+          "required": [
+            "type",
+            "participant"
+          ],
+          "additionalProperties": false,
+          "description": "Audio stopped arriving while signalling is alive. A fact, not a diagnosis."
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "microphone_stopped"
+            },
+            "participant": {
+              "$ref": "#/definitions/ParticipantId"
+            },
+            "origin": {
+              "$ref": "#/definitions/FactOrigin"
+            }
+          },
+          "required": [
+            "type",
+            "participant",
+            "origin"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "microphone_resumed"
+            },
+            "participant": {
+              "$ref": "#/definitions/ParticipantId"
+            },
+            "origin": {
+              "$ref": "#/definitions/FactOrigin"
+            }
+          },
+          "required": [
+            "type",
+            "participant",
+            "origin"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "screen_hidden"
+            },
+            "participant": {
+              "$ref": "#/definitions/ParticipantId"
+            },
+            "origin": {
+              "$ref": "#/definitions/FactOrigin"
+            }
+          },
+          "required": [
+            "type",
+            "participant",
+            "origin"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "screen_visible"
+            },
+            "participant": {
+              "$ref": "#/definitions/ParticipantId"
+            },
+            "origin": {
+              "$ref": "#/definitions/FactOrigin"
+            }
+          },
+          "required": [
+            "type",
+            "participant",
+            "origin"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "recording_started"
+            },
+            "recording": {
+              "$ref": "#/definitions/RecordingId"
+            }
+          },
+          "required": [
+            "type",
+            "recording"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "recording_finished"
+            },
+            "recording": {
+              "$ref": "#/definitions/RecordingId"
+            },
+            "length_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Milliseconds."
+            }
+          },
+          "required": [
+            "type",
+            "recording",
+            "length_ms"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "recording_failed"
+            },
+            "recording": {
+              "$ref": "#/definitions/RecordingId"
+            }
+          },
+          "required": [
+            "type",
+            "recording"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "must_end_by"
+            },
+            "deadline_unix_ms": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "type",
+            "deadline_unix_ms"
+          ],
+          "additionalProperties": false,
+          "description": "The owner instance is being taken out of service."
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "conversation_ended"
+            },
+            "reason": {
+              "$ref": "#/definitions/EndReason"
+            }
+          },
+          "required": [
+            "type",
+            "reason"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "ControllerMessage": {
+      "description": "A text message the controller sends on a conversation connection.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "hello"
+            },
+            "protocol": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Protocol version. An unknown version is refused, never guessed at."
+            },
+            "node": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "controller_version": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "conversation": {
+              "$ref": "#/definitions/ConversationId"
+            },
+            "opening": {
+              "$ref": "#/definitions/Opening"
+            }
+          },
+          "required": [
+            "type",
+            "protocol",
+            "node",
+            "controller_version",
+            "conversation",
+            "opening"
+          ],
+          "additionalProperties": false,
+          "description": "Always the first message."
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "command_result"
+            },
+            "id": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "outcome": {
+              "$ref": "#/definitions/CommandOutcome"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "outcome"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "event"
+            },
+            "event": {
+              "$ref": "#/definitions/Event"
+            }
+          },
+          "required": [
+            "type",
+            "event"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "ping"
+            },
+            "n": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "type",
+            "n"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "pong"
+            },
+            "n": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "type",
+            "n"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "ApplicationMessage": {
+      "description": "A text message the application sends on a conversation connection.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "accept"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "additionalProperties": false,
+          "description": "The instance takes the conversation and becomes its owner."
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "decline"
+            },
+            "reason": {
+              "$ref": "#/definitions/DeclineReason"
+            }
+          },
+          "required": [
+            "type",
+            "reason"
+          ],
+          "additionalProperties": false,
+          "description": "The instance does not take it; the controller tries elsewhere."
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "command"
+            },
+            "id": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Chosen by the application, unique on this connection."
+            },
+            "command": {
+              "$ref": "#/definitions/Command"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "command"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "ping"
+            },
+            "n": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "type",
+            "n"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "pong"
+            },
+            "n": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "type",
+            "n"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    }
+  }
+}

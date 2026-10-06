@@ -1,0 +1,26 @@
+[workspace]
+resolver = "3"
+members = ["crates/node-protocol"]
+
+[workspace.package]
+edition = "2024"
+license = "BUSL-1.1"
+repository = "https://github.com/gabion-dev/asterisk-controller"
+rust-version = "1.99"
+
+# The compiler is the one check on this code that always runs: the Gabion
+# development environment does not check it. So the compiler is made strict
+# here, for every crate at once.
+[workspace.lints.rust]
+unsafe_code = "forbid"
+warnings = "deny"
+missing_docs = "deny"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+wildcard_enum_match_arm = "deny"
