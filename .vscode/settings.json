@@ -1,0 +1,9 @@
+{
+  "// NULL-ANALYSIS": "Editor tier of null analysis for the Java library in java/. The annotation names are pinned to the set the sources are annotated with (org.jspecify, declared in java/build.gradle.kts): with the extension's default candidate lists the language server could adopt another set found on the classpath and go silently blind to the code's own markup. Deviations from the analyzer's defaults live in java/config/jdt/null-analysis.prefs, each with its reason.",
+  "java.compile.nullAnalysis.mode": "automatic",
+  "java.compile.nullAnalysis.nonnull": ["org.jspecify.annotations.NonNull"],
+  "java.compile.nullAnalysis.nullable": ["org.jspecify.annotations.Nullable"],
+  "java.compile.nullAnalysis.nonnullbydefault": ["org.jspecify.annotations.NullMarked"],
+  "java.settings.url": "java/config/jdt/null-analysis.prefs",
+  "java.configuration.updateBuildConfiguration": "interactive"
+}

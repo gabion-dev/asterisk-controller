@@ -1,0 +1,24 @@
+# java/config/jdt/null-analysis.prefs
+
+# Editor-tier null-analysis severities for the Java library, applied to the
+# Java language server of an editor through its settings-file channel
+# (.vscode/settings.json, "java.settings.url"). The same model as in the
+# Gabion framework, where this library is compiled into an application: every
+# deviation from the analyzer's defaults is a decision with its reason written
+# here, never a per-machine editor preference.
+#
+# Only deviations are listed. Everything not named here runs at the analyzer's
+# default severity.
+
+# Expressions coming from libraries without null annotations (Jackson, the
+# JDK) have unknown nullness, and this analyzer flags every such conversion in
+# a package marked @NullMarked. The complaint is about the library's missing
+# annotations, not about our expression: no change of our code removes it, and
+# a warning nobody can act on trains the eye to skip the whole class. The
+# boundary is trusted, as it is in the framework.
+org.eclipse.jdt.core.compiler.problem.nullUncheckedConversion=ignore
+
+# Second key of the same boundary: type variables substituted from invocations
+# of libraries without annotations — every stream and collection call of the
+# JDK. Same reason, same decision.
+org.eclipse.jdt.core.compiler.problem.nonnullTypeVariableFromLegacyInvocation=ignore

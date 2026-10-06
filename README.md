@@ -92,6 +92,13 @@ cannot go unnoticed.
 The libraries the Java side is built against are checked against pinned
 checksums (`java/gradle/verification-metadata.xml`).
 
+An editor's null analysis of the Java library is configured the way the
+Gabion framework configures its own: the annotation names are pinned in
+`.vscode/settings.json`, and the few deviations from the analyzer's defaults
+live in `java/config/jdt/null-analysis.prefs`, each with its reason. Warnings
+about values that come from libraries without null annotations are off there
+on purpose — no change of this code removes them.
+
 ## Checks
 
 The Gabion development environment does not check this repository, so the

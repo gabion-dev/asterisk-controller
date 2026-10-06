@@ -95,7 +95,7 @@ public final class VectorCheck {
         Method decode = audioFrame.getMethod("decode", byte[].class);
         Method encode = audioFrame.getMethod("encode", audioFrame);
         Class<?> refused = Class.forName(protocolPackage + ".AudioFrame$Refused");
-        HexFormat hex = HexFormat.of();
+        Frames frames = new Frames(decode, encode, refused, HexFormat.of());
 
         JsonNode vectors = MAPPER.readTree(Files.readString(file)).get("vectors");
         if (vectors.size() < 20) {
@@ -103,42 +103,61 @@ public final class VectorCheck {
         }
         for (JsonNode vector : vectors) {
             String name = vector.get("name").stringValue();
-            byte[] frame = hex.parseHex(vector.get("frame_hex").stringValue());
+            byte[] frame = frames.hex().parseHex(vector.get("frame_hex").stringValue());
             JsonNode expect = vector.get("expect");
             JsonNode refusedAs = vector.get("refused");
-            if ((expect == null) == (refusedAs == null)) {
+            if (expect != null && refusedAs == null) {
+                expectAccepted(name, frame, expect, frames, problems);
+            } else if (expect == null && refusedAs != null) {
+                expectRefused(name, frame, refusedAs.stringValue(), frames, problems);
+            } else {
                 problems.add(name + ": a vector states exactly one of expect and refused");
-                continue;
-            }
-            Object decoded;
-            try {
-                decoded = decode.invoke(null, (Object) frame);
-            } catch (java.lang.reflect.InvocationTargetException e) {
-                if (!refused.isInstance(e.getCause())) {
-                    problems.add(name + ": the library failed: " + e.getCause());
-                } else if (expect != null) {
-                    problems.add(name + ": refused but must be accepted");
-                } else {
-                    String reason = refused.getMethod("refusal").invoke(e.getCause()).toString()
-                            .toLowerCase(java.util.Locale.ROOT);
-                    if (!reason.equals(refusedAs.stringValue())) {
-                        problems.add(name + ": refused as " + reason + " instead of "
-                                + refusedAs.stringValue());
-                    }
-                }
-                continue;
-            }
-            if (expect == null) {
-                problems.add(name + ": accepted but must be refused as " + refusedAs.stringValue());
-                continue;
-            }
-            compare(name, expect, decoded, hex, problems);
-            byte[] encoded = (byte[]) encode.invoke(null, decoded);
-            if (!java.util.Arrays.equals(encoded, frame)) {
-                problems.add(name + ": does not encode back to itself");
             }
         }
         return vectors.size();
+    }
+
+    /** The library's audio frame operations, found by name in the package under check. */
+    private record Frames(Method decode, Method encode, Class<?> refused, HexFormat hex) {}
+
+    /** The frame must decode to what the vector expects and encode back to the same bytes. */
+    private static void expectAccepted(String name, byte[] frame, JsonNode expect, Frames frames,
+            List<String> problems) throws Exception {
+        Object decoded;
+        try {
+            decoded = frames.decode().invoke(null, (Object) frame);
+        } catch (java.lang.reflect.InvocationTargetException e) {
+            problems.add(frames.refused().isInstance(e.getCause())
+                    ? name + ": refused but must be accepted"
+                    : name + ": the library failed: " + e.getCause());
+            return;
+        }
+        compare(name, expect, decoded, frames.hex(), problems);
+        byte[] encoded = (byte[]) frames.encode().invoke(null, decoded);
+        if (!java.util.Arrays.equals(encoded, frame)) {
+            problems.add(name + ": does not encode back to itself");
+        }
+    }
+
+    /** The frame must be refused, and for the reason the vector names. */
+    private static void expectRefused(String name, byte[] frame, String refusedAs, Frames frames,
+            List<String> problems) throws Exception {
+        try {
+            frames.decode().invoke(null, (Object) frame);
+        } catch (java.lang.reflect.InvocationTargetException e) {
+            if (!frames.refused().isInstance(e.getCause())) {
+                // A fault of the library itself must fail the check, not count as a refusal.
+                problems.add(name + ": the library failed: " + e.getCause());
+                return;
+            }
+            String reason = frames.refused().getMethod("refusal").invoke(e.getCause()).toString()
+                    .toLowerCase(java.util.Locale.ROOT);
+            if (!reason.equals(refusedAs)) {
+                problems.add(name + ": refused as " + reason + " instead of " + refusedAs);
+            }
+            return;
+        }
+        problems.add(name + ": accepted but must be refused as " + refusedAs);
     }
 
     /** Compare a decoded frame with what the vector expects, field by field. */

@@ -9,5 +9,8 @@
 
 # Editor and OS files
 .idea/
-.vscode/
+# The editor settings are tracked — they carry the null-analysis configuration
+# of the Java library — and nothing else of the editor's is.
+.vscode/*
+!.vscode/settings.json
 .DS_Store

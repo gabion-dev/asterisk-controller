@@ -60,10 +60,12 @@ fn marking_of(file_name: &str) -> Option<Marking> {
             prefix: "// ",
             suffix: "",
         }),
-        (".gitignore", _) | (_, Some("toml" | "yml" | "yaml" | "sh")) => Some(Marking::Line {
-            prefix: "# ",
-            suffix: "",
-        }),
+        (".gitignore", _) | (_, Some("toml" | "yml" | "yaml" | "sh" | "prefs")) => {
+            Some(Marking::Line {
+                prefix: "# ",
+                suffix: "",
+            })
+        }
         (_, Some("md")) => Some(Marking::Line {
             prefix: "<!-- ",
             suffix: " -->",
