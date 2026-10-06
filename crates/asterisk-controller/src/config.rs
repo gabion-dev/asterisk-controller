@@ -147,12 +147,50 @@ fn port_range(value: &str) -> Result<(u16, u16), String> {
     }
     // Asterisk gives a call an even port for its audio and the odd one after
     // it for the reports about that audio. Given an odd first port it moves
-    // the range up by one and says so on every start.
+    // the range up by one and says so on every start. Given an even last port
+    // it can hand that port out, and the reports of that call then go to the
+    // port after it — one that is not this node's.
     if !first.is_multiple_of(2) {
         return Err(format!(
             "--audio-ports {value}: the first port must be even; Asterisk uses ports in pairs \
              that begin on an even one"
         ));
     }
+    if last.is_multiple_of(2) {
+        return Err(format!(
+            "--audio-ports {value}: the last port must be odd; Asterisk uses ports in pairs \
+             that end on an odd one, and would take the port after an even last one"
+        ));
+    }
     Ok((first, last))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::port_range;
+
+    #[test]
+    fn a_range_of_whole_pairs_is_accepted() {
+        assert_eq!(port_range("4100-4199"), Ok((4100, 4199)));
+        assert_eq!(port_range("4100-4101"), Ok((4100, 4101)));
+    }
+
+    #[test]
+    fn an_odd_first_port_is_refused() {
+        assert!(port_range("4101-4199").is_err());
+    }
+
+    #[test]
+    fn an_even_last_port_is_refused() {
+        assert!(port_range("4100-4198").is_err());
+        assert!(port_range("4100-4100").is_err());
+    }
+
+    #[test]
+    fn what_is_not_a_range_is_refused() {
+        assert!(port_range("4100").is_err());
+        assert!(port_range("4199-4100").is_err());
+        assert!(port_range("0-4199").is_err());
+        assert!(port_range("first-last").is_err());
+    }
 }

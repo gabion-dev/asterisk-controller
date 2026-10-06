@@ -16,9 +16,13 @@ files, and the rules its behaviour imposes.
 The controller also stands in for the application while the application is
 away — during a deployment or a restart:
 
-- people who are already talking to each other stay connected;
+- people who are already talking to each other stay connected, and the
+  application is looked for while they do; when an instance is there again
+  it is handed the conversation as it is;
 - a caller who was alone with the application gets the fallback the
-  application configured for that entry;
+  application configured for that entry — a transfer, which the controller
+  carries out by calling the fallback's number and connecting the two, or a
+  message, which until the node has prompts is a hang-up;
 - a participant left with nobody to talk to and nobody in charge is hung up.
 
 It chooses no policy of its own: it carries out what the telephony module
@@ -131,6 +135,53 @@ own check was wrong:
 How the call ended is told truthfully: answered, busy, not answered in the
 time the command allowed, or failed with the telephone network's own code.
 
+## When the application is away
+
+A conversation outlives its connection to the application. When the instance
+that owns a conversation is lost — or none takes a conversation to begin
+with — the controller looks once for another instance, through the same
+address, and then does for the participants what their state calls for:
+
+- people connected to each other are kept together, and an instance is
+  looked for every second while they are; one that is there is handed the
+  conversation as it is now — its participants, their states, who is
+  connected to whom — and nothing of what the lost instance had asked for:
+  no audio paths, no playback queues, no answers to its commands;
+- a caller who was alone with the application is given the fallback of their
+  entry, once: a transfer has the controller call the fallback's number on
+  the fallback's line, showing the line's number and judging the number as
+  it judges any, and connect the caller to whoever answers — a caller who
+  still rings is answered at that moment, as a transfer answers them; the two
+  are then people connected to each other, kept and handed over as above. A
+  message is a hang-up until the node has prompts;
+- whoever is left with nobody to talk to and nobody in charge is hung up:
+  one being called by the lost instance, one it had added beside the
+  caller, one of two connected by a fallback when the other leaves.
+
+An instance that declines the conversation counts as none: a declining
+instance is leaving, or has no handler for the entry, and the next look may
+reach another one.
+
+## Connecting participants
+
+The application connects participants so that they hear each other, and takes
+a participant out of the connection again. What the two commands mean:
+
+- connecting needs two participants or more, each named once, and each of
+  them in the conversation — one who still rings is not connected yet;
+- whoever of them is connected to others already stays so: connecting a
+  participant to one of a group connects them to the whole group, and
+  connecting participants of two groups makes the groups one. Nothing but
+  the command that takes a participant out separates anyone;
+- one who is left alone in a group — the other was taken out, was removed or
+  hung up — is connected to nobody;
+- taking out a participant who is connected to nobody is accepted: they are
+  already where the command wants them.
+
+The application's own audio to and from a participant is not part of the
+connection. It hears a connected participant by themselves, and what it plays
+to one of them the others do not hear.
+
 ## Layout
 
 | Path                                 | Contents                                                     |
@@ -230,10 +281,23 @@ into it". Requests of different conversations do not wait for each other.
 The answer to a request and the event about the same channel come in no
 particular order, and nothing here relies on one.
 
-**What is in the node's application when the controller connects is
-removed.** While nobody is connected nothing can enter the application, so
-what is in it then is left from before: a controller that was restarted. This
-build does not resume such calls; nobody is left on a line no one controls.
+**What is in the node's application when the controller connects is from
+before: a controller that was restarted.** While nobody is connected nothing
+can enter the application, so what is in it then is exactly what the
+controller before left. Its conversations carry on: what only a controller
+knows of a participant — which conversation they are in, who they are in it,
+where it came from, their number, the line they were called on — the
+controller writes on the participant's channel in Asterisk as variables,
+when a call arrives and, for one the node places, in the request that
+places it (a channel the node is calling cannot be written on until it
+answers). The next controller reads them back, with the channel's state and
+the bridges it is in, and offers the conversation to the application as it
+is, as it offers any it has lost the owner of. Media channels died with the
+controller — Asterisk ends one when its connection goes, and does not open
+it again — and the taps and bridges of audio paths are of no use to anyone:
+they are removed, and audio paths are built again when asked for. Tried
+against the pinned build: thirty-three media connections cut under audio did
+not harm Asterisk.
 
 **A participant's audio path is a media channel joined to the participant's
 channel.** Asterisk opens one more connection to the controller for the media
@@ -243,6 +307,41 @@ request and reads the media connection to its end.
 Asterisk can also tap a channel instead of joining it, but audio put into a
 tap never reaches a participant who is connected to nobody else; both were
 tried against the pinned build.
+
+**A participant connected to others is tapped; their audio path stays where it
+is.** Participants the application connects to each other are put into a
+bridge of their own, a group. The media channel does not follow a participant
+there: everyone in the group would hear what the application says to one of
+them, and the application would hear them all at once. A tap on the
+participant's channel takes their place beside the media channel instead —
+Asterisk's snoop channel, hearing what comes in from the participant and
+whispering out to them. Tried against the pinned build: what is put into the
+tap reaches a participant who is in a bridge with others at full level, also
+when the others send no audio at all; nobody else hears it; what comes out of
+the tap is the participant alone. The media channel, its connection and its
+marks are untouched by the move there and back, so the application sees no
+change.
+
+**A participant changes bridges with a gap, not an overlap.** Moving them
+takes two requests, and between the two the media channel is either alone for
+a moment or has two sources at once. Measured over twenty moves on the pinned
+build, the first order costs about one frame of twenty milliseconds in each
+direction, and the second doubles the audio for as long. The controller takes
+the participant out first and puts the tap in second, and the other way round
+on the way back.
+
+**A refusal from Asterisk about a participant decides nothing by itself.** A
+participant can hang up while the controller is arranging them. Asterisk then
+refuses the request, and its refusal may arrive before its word that the
+participant left. So the controller asks Asterisk about the channel: one that
+is gone, or is no longer in the node's application, is a participant who is
+leaving, and the word of it puts everything right. Only a step refused for a
+participant who stays ends the conversation with an error — they would be
+left where they should not be, and nobody would know. The refusal for one who
+is leaving has not been seen on the pinned build: seventy calls ended at the
+very moment of a connect never caught Asterisk between the two. What tells
+the two cases apart is checked by itself, and the refusal for one who stays
+is checked against Asterisk.
 
 **Asterisk is handed a few seconds of audio at most.** Its media channel holds
 twenty seconds and silently drops what does not fit. The controller keeps the
@@ -280,11 +379,34 @@ the conversation connection through the protocol library, and runs real calls:
   and seen the line's number — a line at its limit, calls that end busy,
   unanswered and failed, and a caller who hangs up before the one who was
   dialled;
-- a node without its controller: the controller is killed in the middle of a
-  call; calls that arrive then are given their fallbacks by Asterisk alone —
-  one transferred through the operator, one hung up on; a call still waiting
-  when a controller is started again is served, and the call from before is
-  removed.
+- an application that connects participants: two who then hear each other
+  while the application goes on hearing each by themselves, and what it says
+  to one the other does not hear; a third who, connected to one of them, is
+  connected to both; one taken out of the three; one left alone because the
+  other was removed, and because the other hung up — reached by the
+  application as before; and one whose channel ends at the very moment they
+  are being connected, which must take nobody else down;
+- a step Asterisk refuses for a participant who stays — the test removes the
+  bridge of their audio path behind the controller's back: the conversation
+  ends with an error that names the step, and nobody is left on the line;
+- the application lost while two are connected: they hear each other all
+  along, and the instance that is there is handed the conversation with the
+  two of them, connected, and nothing the lost instance had asked for; the
+  application lost while the caller is alone, with the one instance there
+  declining: the caller is hung up;
+- the node without the application: a caller of the entry whose fallback is
+  a transfer is called for and connected by the controller, the network
+  seeing the line's number; the two are kept and, when the application is
+  back, handed to it; a caller who still rings is transferred the same way,
+  and when they hang up the one called for them is not kept;
+- a node without its controller: the controller is killed with two people
+  connected, each with an audio path; calls that arrive then are given their
+  fallbacks by Asterisk alone — one transferred through the operator, one
+  hung up on; a call still waiting when a controller is started again is
+  served, and the conversation from before is found, handed to the
+  application with its two people connected — they heard each other all
+  along — and controlled by it, while what the old controller had built for
+  audio is removed.
 
 Asterisk runs on the configuration the controller wrote out of the test's
 settings, and must load it without a single warning; what Asterisk then says
@@ -328,10 +450,11 @@ from the telephone network carried from its first ring to its end, with the
 commands answer, reject, remove, send digits and end, and with audio: the
 application hears a participant, queues segments for them and flushes the
 queue. The controller writes Asterisk's configuration out of the node's stored
-settings, and adds participants by dialling. Not done yet: connecting
-participants to each other, recording, holding a participant whose connection
-is lost, standing in for an absent application, settings fetched from the
-application, browser calls. A command the controller does not carry
+settings, adds participants by dialling, connects participants to each
+other, stands in for an application that is away, and carries on the
+conversations it finds in Asterisk when it is started beside it. Not done
+yet: recording, holding a participant whose connection is lost, settings
+fetched from the application, browser calls. A command the controller does not carry
 out yet ends the conversation with an error that names it; none is accepted
 and ignored. No release has been published.
 

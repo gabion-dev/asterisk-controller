@@ -31,6 +31,18 @@ pub struct Node {
 pub struct Lines(Arc<Mutex<HashMap<String, u64>>>);
 
 impl Lines {
+    /// A place on a line for an outbound call that is already being
+    /// carried — found in Asterisk when the controller started. The line's
+    /// limit was judged when the call was placed; it is not judged again.
+    pub fn resume(&self, line: &str) -> Place {
+        let mut busy = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        *busy.entry(line.to_owned()).or_insert(0) += 1;
+        Place {
+            lines: Arc::clone(&self.0),
+            line: line.to_owned(),
+        }
+    }
+
     /// Take a place on a line for one more outbound call.
     ///
     /// `None` when the line already carries as many as its settings allow.

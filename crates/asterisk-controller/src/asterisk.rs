@@ -39,12 +39,12 @@ use std::{
 
 use data_encoding::BASE64;
 use futures_util::StreamExt;
-use http_body_util::{BodyExt, Empty};
+use http_body_util::{BodyExt, Full};
 use hyper::{
     Request,
     body::Bytes,
     client::conn::http1,
-    header::{AUTHORIZATION, CONNECTION, CONTENT_LENGTH, HOST},
+    header::{AUTHORIZATION, CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, HOST},
 };
 use hyper_util::rt::TokioIo;
 use tokio::{net::TcpStream, sync::mpsc};
@@ -72,6 +72,8 @@ pub enum FromAsterisk {
         request: String,
         /// The status of the answer; zero when Asterisk could not be asked.
         status: u16,
+        /// What Asterisk answered with; empty when it could not be asked.
+        body: String,
     },
     /// The connection to Asterisk is lost. Asterisk has stopped, or is no
     /// longer the Asterisk the conversation's channels were in.
@@ -96,8 +98,8 @@ pub struct Asterisk {
     routes: Mutex<Routes>,
 }
 
-/// A request waiting for its turn: its name, method and address.
-type Asked = (String, String, String);
+/// A request waiting for its turn: its name, method, address and body.
+type Asked = (String, String, String, Option<String>);
 
 impl Asterisk {
     /// The control interface at `address`, used as the control user with
@@ -124,6 +126,21 @@ impl Asterisk {
     ///
     /// Asterisk could not be reached, or did not answer as an HTTP server.
     async fn request(&self, method: &str, uri: &str) -> Result<(u16, String), String> {
+        self.request_with(method, uri, None).await
+    }
+
+    /// The same with a body: what the request says beyond its address, as
+    /// JSON.
+    ///
+    /// # Errors
+    ///
+    /// Asterisk could not be reached, or did not answer as an HTTP server.
+    async fn request_with(
+        &self,
+        method: &str,
+        uri: &str,
+        body: Option<&str>,
+    ) -> Result<(u16, String), String> {
         let failed = |error: &dyn std::fmt::Display| format!("{method} {uri}: {error}");
         let stream = TcpStream::connect(self.address)
             .await
@@ -134,14 +151,16 @@ impl Asterisk {
         // The connection is driven beside the request and ends with it.
         tokio::spawn(connection);
 
+        let body = Bytes::from(body.unwrap_or_default().to_owned());
         let request = Request::builder()
             .method(method)
             .uri(format!("/ari/{uri}"))
             .header(HOST, self.address.to_string())
             .header(AUTHORIZATION, &self.authorization)
-            .header(CONTENT_LENGTH, 0)
+            .header(CONTENT_LENGTH, body.len())
+            .header(CONTENT_TYPE, "application/json")
             .header(CONNECTION, "close")
-            .body(Empty::<Bytes>::new())
+            .body(Full::new(body))
             .map_err(|error| failed(&error))?;
         let response = sender
             .send_request(request)
@@ -157,8 +176,8 @@ impl Asterisk {
         Ok((status, String::from_utf8_lossy(&body).into_owned()))
     }
 
-    /// Give a new conversation its line to Asterisk, with its first channel.
-    fn open_line(self: &Arc<Self>, conversation: &str, channel: &str) -> Line {
+    /// Give a conversation its line to Asterisk, with the channels it has.
+    fn open_line(self: &Arc<Self>, conversation: &str, channels: &[&str]) -> Line {
         let (to_conversation, inbox) = mpsc::unbounded_channel();
         let (requests, mut asked) = mpsc::unbounded_channel::<Asked>();
         {
@@ -166,25 +185,34 @@ impl Asterisk {
             routes
                 .conversations
                 .insert(conversation.to_owned(), to_conversation.clone());
-            routes
-                .channels
-                .insert(channel.to_owned(), conversation.to_owned());
+            for channel in channels {
+                routes
+                    .channels
+                    .insert((*channel).to_owned(), conversation.to_owned());
+            }
         }
         // The conversation's requests, one after another. This outlives the
         // conversation by as long as it takes to make what it left behind:
         // its last requests are the ones that take its channels down.
         let asterisk = Arc::clone(self);
         tokio::spawn(async move {
-            while let Some((request, method, uri)) = asked.recv().await {
-                let status = match asterisk.request(&method, &uri).await {
-                    Ok((status, _body)) => status,
+            while let Some((request, method, uri, body)) = asked.recv().await {
+                let (status, body) = match asterisk
+                    .request_with(&method, &uri, body.as_deref())
+                    .await
+                {
+                    Ok(answer) => answer,
                     Err(problem) => {
                         eprintln!("asterisk-controller: Asterisk could not be asked — {problem}");
-                        0
+                        (0, String::new())
                     }
                 };
                 // A conversation that has ended no longer listens.
-                let _ = to_conversation.send(FromAsterisk::Answered { request, status });
+                let _ = to_conversation.send(FromAsterisk::Answered {
+                    request,
+                    status,
+                    body,
+                });
             }
         });
         Line {
@@ -210,10 +238,15 @@ impl Line {
     /// Ask Asterisk for something. Requests are made in the order they are
     /// asked for; the answer to each comes back under the name given here.
     pub fn ask(&self, request: &str, method: &str, uri: &str) {
+        self.ask_with(request, method, uri, None);
+    }
+
+    /// The same with a body.
+    pub fn ask_with(&self, request: &str, method: &str, uri: &str, body: Option<String>) {
         // The other end lives until every request has been made.
         let _ = self
             .requests
-            .send((request.to_owned(), method.to_owned(), uri.to_owned()));
+            .send((request.to_owned(), method.to_owned(), uri.to_owned(), body));
     }
 
     /// From now on what Asterisk says about `channel` is for this
@@ -277,10 +310,6 @@ pub async fn run(node: Arc<Node>, asterisk: Arc<Asterisk>) {
 /// Asterisk could not be found or would not let the controller in; nothing
 /// was begun.
 async fn connected(node: &Arc<Node>, asterisk: &Arc<Asterisk>) -> Result<(), String> {
-    // First, before the application exists again and a new call can enter
-    // it, whatever is in it is removed.
-    clear_leftovers(asterisk).await?;
-
     let address = format!(
         "ws://{}/ari/events?app={APPLICATION}&api_key={}",
         asterisk.address,
@@ -290,6 +319,24 @@ async fn connected(node: &Arc<Node>, asterisk: &Arc<Asterisk>) -> Result<(), Str
         .await
         .map_err(|error| format!("the event connection: {error}"))?;
     eprintln!("asterisk-controller: connected to Asterisk");
+
+    // What is in the application is from before this connection: the
+    // conversations of a controller that was restarted, carried on from
+    // here, and the pieces of the audio paths it had built, removed.
+    for found in take_over(asterisk).await? {
+        let channels: Vec<&str> = found
+            .members
+            .iter()
+            .map(|member| member.channel.as_str())
+            .collect();
+        let line = asterisk.open_line(&found.id, &channels);
+        eprintln!(
+            "asterisk-controller: carrying on conversation {}, found with {} participants",
+            found.id,
+            found.members.len()
+        );
+        tokio::spawn(conversation::carry_on(found, line, Arc::clone(node)));
+    }
 
     while let Some(Ok(frame)) = events.next().await {
         if let Frame::Text(text) = frame {
@@ -304,39 +351,91 @@ async fn connected(node: &Arc<Node>, asterisk: &Arc<Asterisk>) -> Result<(), Str
     Ok(())
 }
 
-/// Remove every channel and bridge of the node's application.
+/// Read what is in the node's application and sort it: the channels of
+/// participants, by the conversation each belongs to, with the groups
+/// their bridges make — and everything else, which is removed.
 ///
-/// Called while the controller is not connected, and then they belong to no
-/// conversation: they are left from a controller that was restarted or a
-/// connection that broke. This build does not resume such calls, and nobody
-/// may be left on a line that no one controls. Nothing new can enter the
-/// application meanwhile — to Asterisk it does not exist while nobody is
-/// connected for it — so what is removed is exactly what was left.
-async fn clear_leftovers(asterisk: &Asterisk) -> Result<(), String> {
+/// Nothing new can enter the application before this connection —
+/// to Asterisk it does not exist while nobody is connected for it — so what
+/// is found is exactly what a controller before this one left: its
+/// conversations, which carry on, and the media channels, taps and bridges
+/// of the audio paths it had built, which died with it or are of no use to
+/// anyone, and nobody may be left on a line that no one controls.
+async fn take_over(asterisk: &Asterisk) -> Result<Vec<conversation::Found>, String> {
     let (status, body) = asterisk
         .request("GET", &format!("applications/{APPLICATION}"))
         .await?;
     match status {
         200 => {}
         // Nobody has ever connected for the application: nothing is in it.
-        404 => return Ok(()),
+        404 => return Ok(Vec::new()),
         other => return Err(format!("it answered {other} about its application: {body}")),
     }
     let application = ari::read_application(&body)
         .map_err(|error| format!("it described its application unreadably: {error}"))?;
-    let channels = application
-        .channel_ids
-        .iter()
-        .map(|channel| format!("channels/{channel}"));
-    let bridges = application
-        .bridge_ids
-        .iter()
-        .map(|bridge| format!("bridges/{bridge}"));
-    for leftover in channels.chain(bridges) {
+
+    let mut found: HashMap<String, conversation::Found> = HashMap::new();
+    let mut leftovers = Vec::new();
+    for channel in &application.channel_ids {
+        let path = format!("channels/{}", ari::query(channel));
+        let (status, body) = asterisk.request("GET", &path).await?;
+        if status != 200 {
+            // Gone meanwhile.
+            continue;
+        }
+        let described = ari::read_channel(&body)
+            .map_err(|error| format!("it described channel {channel} unreadably: {error}"))?;
+        let mut notes = HashMap::new();
+        for name in conversation::NOTES {
+            let (status, body) = asterisk
+                .request("GET", &format!("{path}/variable?variable={name}"))
+                .await?;
+            if status == 200
+                && let Ok(value) = ari::read_variable(&body)
+                && !value.is_empty()
+            {
+                notes.insert(*name, value);
+            }
+        }
+        match conversation::found(&described, &notes) {
+            Some((conversation, origin, member)) => {
+                found
+                    .entry(conversation.clone())
+                    .or_insert_with(|| conversation::Found::new(conversation, origin))
+                    .members
+                    .push(member);
+            }
+            None => leftovers.push(path),
+        }
+    }
+    for bridge in &application.bridge_ids {
+        let path = format!("bridges/{}", ari::query(bridge));
+        let Some((conversation, group)) = conversation::group_of(bridge) else {
+            leftovers.push(path);
+            continue;
+        };
+        let Some(found) = found.get_mut(&conversation) else {
+            leftovers.push(path);
+            continue;
+        };
+        let (status, body) = asterisk.request("GET", &path).await?;
+        if status != 200 {
+            continue;
+        }
+        let described = ari::read_bridge(&body)
+            .map_err(|error| format!("it described bridge {bridge} unreadably: {error}"))?;
+        found.groups_made = found.groups_made.max(group);
+        for member in &mut found.members {
+            if described.channels.contains(&member.channel) {
+                member.group = Some(group);
+            }
+        }
+    }
+    for leftover in leftovers {
         eprintln!("asterisk-controller: removing {leftover}, left from before this connection");
         asterisk.request("DELETE", &leftover).await?;
     }
-    Ok(())
+    Ok(found.into_values().collect())
 }
 
 /// Pass what Asterisk said to whom it is for.
@@ -366,7 +465,7 @@ fn arrived(
             // A conversation exists from the moment it has a participant,
             // and is named then.
             let id = uuid::Uuid::new_v4().to_string();
-            let line = asterisk.open_line(&id, &channel.id);
+            let line = asterisk.open_line(&id, &[channel.id.as_str()]);
             tokio::spawn(conversation::carry(
                 id,
                 line,
