@@ -176,6 +176,25 @@ impl Asterisk {
         Ok((status, String::from_utf8_lossy(&body).into_owned()))
     }
 
+    /// Have Asterisk read the configuration of one of its modules again —
+    /// how changed settings are taken in without dropping a call.
+    ///
+    /// # Errors
+    ///
+    /// Asterisk could not be asked, or refused; the reason, in words.
+    pub async fn reload(&self, module: &str) -> Result<(), String> {
+        let (status, body) = self
+            .request("PUT", &format!("asterisk/modules/{}", ari::query(module)))
+            .await?;
+        if (200..=299).contains(&status) {
+            Ok(())
+        } else {
+            Err(format!(
+                "Asterisk answered {status} when asked to reload {module}: {body}"
+            ))
+        }
+    }
+
     /// Give a conversation its line to Asterisk, with the channels it has.
     fn open_line(self: &Arc<Self>, conversation: &str, channels: &[&str]) -> Line {
         let (to_conversation, inbox) = mpsc::unbounded_channel();
@@ -410,7 +429,7 @@ async fn take_over(asterisk: &Asterisk) -> Result<Vec<conversation::Found>, Stri
     }
     for bridge in &application.bridge_ids {
         let path = format!("bridges/{}", ari::query(bridge));
-        let Some((conversation, group)) = conversation::group_of(bridge) else {
+        let Some(conversation) = conversation::group_of(bridge) else {
             leftovers.push(path);
             continue;
         };
@@ -424,10 +443,9 @@ async fn take_over(asterisk: &Asterisk) -> Result<Vec<conversation::Found>, Stri
         }
         let described = ari::read_bridge(&body)
             .map_err(|error| format!("it described bridge {bridge} unreadably: {error}"))?;
-        found.groups_made = found.groups_made.max(group);
         for member in &mut found.members {
             if described.channels.contains(&member.channel) {
-                member.group = Some(group);
+                member.group = Some(bridge.clone());
             }
         }
     }

@@ -14,10 +14,9 @@
 //! that fail either are refused whole, with the reason — the node never
 //! applies a part of them.
 
-use std::{collections::HashSet, fmt::Write as _, fs, io::ErrorKind, net::IpAddr, path::Path};
+use std::{collections::HashSet, fs, io::ErrorKind, net::IpAddr, path::Path};
 
 use node_protocol::messages::{EntryKey, Fallback, Operator, Settings, SipTransport};
-use sha2::{Digest, Sha256};
 
 use crate::destination;
 
@@ -28,9 +27,10 @@ pub const FILE: &str = "settings.json";
 pub struct Applied {
     /// The settings themselves; empty when the node has none yet.
     pub settings: Settings,
-    /// SHA-256 of the settings exactly as they were given, in lowercase
-    /// hexadecimal: what the application compares with what it expects.
-    /// `None` when the node has no settings yet.
+    /// The fingerprint of the settings — the SHA-256 of their canonical
+    /// text, which does not depend on how the file is written: what the
+    /// application compares with what it expects. `None` when the node has
+    /// no settings yet.
     pub fingerprint: Option<String>,
 }
 
@@ -66,16 +66,31 @@ pub fn stored(state: &Path) -> Result<Applied, String> {
     let settings: Settings =
         node_protocol::decode(text).map_err(|error| format!("{}: {error}", path.display()))?;
     check(&settings).map_err(|problem| format!("{}: {problem}", path.display()))?;
-
-    let mut fingerprint = String::with_capacity(64);
-    for byte in Sha256::digest(&bytes) {
-        // Writing into a `String` cannot fail.
-        let _ = write!(fingerprint, "{byte:02x}");
-    }
+    let fingerprint = node_protocol::fingerprint(&settings)
+        .map_err(|error| format!("{}: {error}", path.display()))?;
     Ok(Applied {
         settings,
         fingerprint: Some(fingerprint),
     })
+}
+
+/// Keep settings as the ones the node runs on: their canonical text, so the
+/// file says exactly what their fingerprint is of, written whole or not at
+/// all.
+///
+/// # Errors
+///
+/// The settings are not what the description allows, or the file cannot
+/// be written.
+pub fn store(state: &Path, settings: &Settings) -> Result<(), String> {
+    let path = state.join(FILE);
+    let failed = |problem: &dyn std::fmt::Display| format!("{}: {problem}", path.display());
+    // Encoding holds the settings to the description.
+    node_protocol::encode(settings).map_err(|error| failed(&error))?;
+    let value = serde_json::to_value(settings).map_err(|error| failed(&error))?;
+    let written = state.join(format!(".{FILE}.new"));
+    fs::write(&written, node_protocol::canonical(&value)).map_err(|error| failed(&error))?;
+    fs::rename(&written, &path).map_err(|error| failed(&error))
 }
 
 /// Judge what the protocol description cannot.

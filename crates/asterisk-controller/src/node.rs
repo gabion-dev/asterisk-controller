@@ -4,23 +4,50 @@
 
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex, PoisonError},
+    sync::{Arc, Mutex, PoisonError, RwLock},
 };
 
-use node_protocol::messages::{Line, Settings};
+use node_protocol::messages::Line;
 
-use crate::{config::Config, media};
+use crate::{application::Application, config::Config, media, reports::Journal, settings::Applied};
 
 /// The node, as its conversations see it.
 pub struct Node {
     /// What the controller was told at start.
     pub config: Config,
-    /// The settings the node runs on.
-    pub settings: Settings,
+    /// The way to the application.
+    pub application: Application,
+    /// The version of the Asterisk the controller drives.
+    pub asterisk_version: String,
+    /// What sets this run of the controller apart from every other: part
+    /// of every name it gives in Asterisk and of every participant's
+    /// identifier. Asterisk keeps a bridge's name taken for as long as
+    /// anything still holds the bridge — after it was removed, too — so a
+    /// controller started again never reuses a name the one before it gave.
+    pub run: String,
+    /// The settings the node runs on. They change while the node runs; a
+    /// conversation takes the ones in force at each decision.
+    pub applied: RwLock<Arc<Applied>>,
+    /// What the node did on its own and the application has not received.
+    pub reports: Journal,
     /// Where media connections meet the conversations that asked for them.
     pub door: media::Door,
     /// How busy each outbound line is.
     pub lines: Lines,
+}
+
+impl Node {
+    /// The settings in force now.
+    pub fn applied(&self) -> Arc<Applied> {
+        // Settings are only ever replaced whole: a holder that panicked
+        // cannot have left them half-changed.
+        Arc::clone(&self.applied.read().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    /// From now on the node runs on these settings.
+    pub fn apply(&self, applied: Applied) {
+        *self.applied.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(applied);
+    }
 }
 
 /// How many calls each outbound line is carrying now, over the whole node.

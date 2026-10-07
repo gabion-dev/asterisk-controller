@@ -21,10 +21,15 @@
 //! Audio does not travel as these messages. Its binary frames are in
 //! [`audio`], written by hand against `protocol/audio-frames.md` and held to
 //! it by the shared vectors in `protocol/audio-frames.vectors.json`.
+//!
+//! Settings are compared by their fingerprint, the SHA-256 of their
+//! canonical text: [`fingerprint`].
 
 pub mod audio;
+mod canonical;
 mod validation;
 
+pub use canonical::{canonical, fingerprint, sha256_hex};
 pub use validation::{DecodeError, Described, decode, decode_value, encode};
 
 /// Text messages of both connections — conversation and service — and the

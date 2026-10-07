@@ -13,6 +13,7 @@
 //! loopback address only, and every connection to the application is opened
 //! from here.
 
+mod application;
 mod ari;
 mod asterisk;
 mod asterisk_files;
@@ -22,11 +23,14 @@ mod destination;
 mod media;
 mod node;
 mod playout;
+mod reports;
+mod service;
 mod settings;
 
-use std::{process::ExitCode, sync::Arc};
-
-use node_protocol::messages::Settings;
+use std::{
+    process::ExitCode,
+    sync::{Arc, RwLock},
+};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::{
     accept_hdr_async,
@@ -50,8 +54,18 @@ async fn main() -> ExitCode {
 
     // Asterisk is started on what is written here, so it is written before
     // the controller says it is ready.
-    let (settings, secret) = match prepare_asterisk(&config) {
+    let (applied, secret, asterisk_version) = match prepare_asterisk(&config) {
         Ok(prepared) => prepared,
+        Err(problem) => {
+            eprintln!("asterisk-controller: {problem}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // A node that cannot prove itself to the application, or judge who
+    // answers for it, does not start.
+    let application = match application::Application::new(&config) {
+        Ok(application) => application,
         Err(problem) => {
             eprintln!("asterisk-controller: {problem}");
             return ExitCode::FAILURE;
@@ -74,13 +88,24 @@ async fn main() -> ExitCode {
     println!("asterisk-controller ready on {}", config.listen);
 
     let asterisk = asterisk::Asterisk::new(config.asterisk_http, &secret);
+    let reports = reports::Journal::of(&config.state);
     let node = Arc::new(Node {
         config,
-        settings,
+        application,
+        asterisk_version,
+        run: uuid::Uuid::new_v4()
+            .simple()
+            .to_string()
+            .chars()
+            .take(12)
+            .collect(),
+        applied: RwLock::new(Arc::new(applied)),
+        reports,
         door: media::Door::default(),
         lines: node::Lines::default(),
     });
-    tokio::spawn(asterisk::run(Arc::clone(&node), asterisk));
+    tokio::spawn(asterisk::run(Arc::clone(&node), Arc::clone(&asterisk)));
+    tokio::spawn(service::run(Arc::clone(&node), asterisk));
 
     loop {
         tokio::select! {
@@ -96,8 +121,9 @@ async fn main() -> ExitCode {
 }
 
 /// Read the node's settings and write Asterisk's configuration from them.
-/// Returns the settings and the secret of the control user.
-fn prepare_asterisk(config: &Config) -> Result<(Settings, String), String> {
+/// Returns the settings, the secret of the control user and the version of
+/// Asterisk.
+fn prepare_asterisk(config: &Config) -> Result<(settings::Applied, String, String), String> {
     let tree = asterisk_files::Tree::read(&config.asterisk_tree)?;
     let applied = settings::stored(&config.state)?;
     let secret = asterisk_files::control_secret(&config.state)?;
@@ -120,7 +146,7 @@ fn prepare_asterisk(config: &Config) -> Result<(Settings, String), String> {
         tree.version,
         main_file.display()
     );
-    Ok((applied.settings, secret))
+    Ok((applied, secret, tree.version))
 }
 
 /// Complete the WebSocket handshake of a media connection of Asterisk and

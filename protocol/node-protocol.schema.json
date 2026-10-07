@@ -1214,7 +1214,8 @@
             "type",
             "n"
           ],
-          "additionalProperties": false
+          "additionalProperties": false,
+          "description": "Each side sends a ping at least every 10 seconds and answers every ping with a pong of the same n. A side that has received nothing at all for 30 seconds counts the connection lost and closes it."
         },
         {
           "type": "object",
@@ -1305,7 +1306,8 @@
             "type",
             "n"
           ],
-          "additionalProperties": false
+          "additionalProperties": false,
+          "description": "Each side sends a ping at least every 10 seconds and answers every ping with a pong of the same n. A side that has received nothing at all for 30 seconds counts the connection lost and closes it."
         },
         {
           "type": "object",
@@ -1354,6 +1356,12 @@
       "type": "string",
       "pattern": "^[0-9a-f]{64}$",
       "description": "A SHA-256 digest in lowercase hexadecimal."
+    },
+    "ReportId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "description": "Identifier of a report, chosen by the node. A report sent again after a lost connection keeps its identifier."
     },
     "CountryCode": {
       "type": "string",
@@ -1715,29 +1723,6 @@
           ],
           "additionalProperties": false,
           "description": "A participant left with nobody to talk to and nobody in charge."
-        },
-        {
-          "type": "object",
-          "properties": {
-            "type": {
-              "const": "settings_unconfirmed"
-            },
-            "fingerprint": {
-              "$ref": "#/definitions/Sha256"
-            },
-            "at_unix_ms": {
-              "type": "integer",
-              "minimum": 0,
-              "description": "Milliseconds since the Unix epoch."
-            }
-          },
-          "required": [
-            "type",
-            "fingerprint",
-            "at_unix_ms"
-          ],
-          "additionalProperties": false,
-          "description": "The node started on the settings it had stored, without the application to confirm them."
         }
       ]
     },
@@ -1789,7 +1774,7 @@
             "asterisk_version"
           ],
           "additionalProperties": false,
-          "description": "Always the first message. The fingerprint is absent when the node has no settings yet."
+          "description": "Always the first message. The fingerprint is that of the settings the node runs on — stored ones too, which nobody may have confirmed since the node started — and is absent when the node has no settings yet."
         },
         {
           "type": "object",
@@ -1857,15 +1842,20 @@
             "type": {
               "const": "report"
             },
+            "id": {
+              "$ref": "#/definitions/ReportId"
+            },
             "report": {
               "$ref": "#/definitions/Report"
             }
           },
           "required": [
             "type",
+            "id",
             "report"
           ],
-          "additionalProperties": false
+          "additionalProperties": false,
+          "description": "The node keeps a report until the application says it has it. After a lost connection the same report may come again, under the same identifier."
         },
         {
           "type": "object",
@@ -1882,7 +1872,8 @@
             "type",
             "n"
           ],
-          "additionalProperties": false
+          "additionalProperties": false,
+          "description": "Each side sends a ping at least every 10 seconds and answers every ping with a pong of the same n. A side that has received nothing at all for 30 seconds counts the connection lost and closes it."
         },
         {
           "type": "object",
@@ -1939,14 +1930,35 @@
           "type": "object",
           "properties": {
             "type": {
-              "const": "settings_changed"
+              "const": "settings"
+            },
+            "settings": {
+              "$ref": "#/definitions/Settings"
             }
           },
           "required": [
-            "type"
+            "type",
+            "settings"
           ],
           "additionalProperties": false,
-          "description": "The node should fetch its settings again."
+          "description": "The settings the node is to run on, whole: sent when the fingerprint in the node's hello is not the one the application expects, and whenever the settings change. The node answers settings_applied or settings_refused with their fingerprint."
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "report_received"
+            },
+            "id": {
+              "$ref": "#/definitions/ReportId"
+            }
+          },
+          "required": [
+            "type",
+            "id"
+          ],
+          "additionalProperties": false,
+          "description": "The application has the report and keeps it; the node forgets it."
         },
         {
           "type": "object",
@@ -1985,7 +1997,8 @@
             "type",
             "n"
           ],
-          "additionalProperties": false
+          "additionalProperties": false,
+          "description": "Each side sends a ping at least every 10 seconds and answers every ping with a pong of the same n. A side that has received nothing at all for 30 seconds counts the connection lost and closes it."
         },
         {
           "type": "object",
@@ -2280,7 +2293,7 @@
         "prompts"
       ],
       "additionalProperties": false,
-      "description": "Everything the node is told in advance. The controller turns it into Asterisk configuration; the application never writes Asterisk's files."
+      "description": "Everything the node is told in advance. The controller turns it into Asterisk configuration; the application never writes Asterisk's files. The fingerprint of settings is the SHA-256 of their canonical text, in lowercase hexadecimal; protocol/settings-fingerprint.md says what the canonical text is."
     }
   }
 }

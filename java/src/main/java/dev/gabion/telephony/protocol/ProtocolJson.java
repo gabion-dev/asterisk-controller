@@ -4,7 +4,15 @@ package dev.gabion.telephony.protocol;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.HexFormat;
+import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.regex.Pattern;
 import tools.jackson.core.JacksonException;
@@ -88,6 +96,108 @@ public final class ProtocolJson {
      */
     public static String encode(Object message) {
         return MAPPER.writeValueAsString(message);
+    }
+
+    /**
+     * The fingerprint of settings: the SHA-256 of their canonical text, in lowercase hexadecimal.
+     *
+     * <p>The node reports the fingerprint of the settings it runs on; the application compares it
+     * with the fingerprint of the settings it expects. It depends on what the settings say and on
+     * nothing else — not on how a mapper orders their fields.</p>
+     *
+     * @param settings settings of the generated type {@code Settings}
+     * @return the fingerprint
+     * @throws ProtocolViolation when the settings are not what the description allows
+     */
+    public static String fingerprint(Object settings) throws ProtocolViolation {
+        JsonNode value = MAPPER.valueToTree(settings);
+        check(definition(REFERENCE_PREFIX + "Settings"), value, "");
+        try {
+            byte[] digest = MessageDigest.getInstance("SHA-256")
+                    .digest(canonical(value).getBytes(StandardCharsets.UTF_8));
+            return HexFormat.of().formatHex(digest);
+        } catch (NoSuchAlgorithmException e) {
+            // Every Java platform is required to provide SHA-256.
+            throw new IllegalStateException(e);
+        }
+    }
+
+    /**
+     * The canonical text of a JSON value, as {@code settings-fingerprint.md} of the protocol
+     * defines it: RFC 8785 for values without fractional numbers.
+     *
+     * <p>Written rule by rule rather than taken from the mapper: its own output orders members
+     * by the type's declaration and escapes control characters in capital hexadecimal.</p>
+     *
+     * @param value the value
+     * @return its canonical text
+     */
+    public static String canonical(JsonNode value) {
+        StringBuilder text = new StringBuilder();
+        writeCanonical(text, value);
+        return text.toString();
+    }
+
+    private static void writeCanonical(StringBuilder text, JsonNode value) {
+        if (value.isObject()) {
+            List<String> names = new ArrayList<>(value.propertyNames());
+            // String order is the order of UTF-16 code units, which is the order the text requires.
+            Collections.sort(names);
+            text.append('{');
+            for (int index = 0; index < names.size(); index++) {
+                if (index > 0) {
+                    text.append(',');
+                }
+                writeCanonicalString(text, names.get(index));
+                text.append(':');
+                writeCanonical(text, value.get(names.get(index)));
+            }
+            text.append('}');
+        } else if (value.isArray()) {
+            text.append('[');
+            for (int index = 0; index < value.size(); index++) {
+                if (index > 0) {
+                    text.append(',');
+                }
+                writeCanonical(text, value.get(index));
+            }
+            text.append(']');
+        } else if (value.isString()) {
+            writeCanonicalString(text, value.stringValue());
+        } else if (value.isIntegralNumber()) {
+            text.append(value.bigIntegerValue());
+        } else if (value.isBoolean()) {
+            text.append(value.booleanValue());
+        } else if (value.isNull()) {
+            text.append("null");
+        } else {
+            throw new IllegalArgumentException(
+                    "the protocol has no value like " + value + " and it has no canonical text");
+        }
+    }
+
+    private static void writeCanonicalString(StringBuilder text, String string) {
+        text.append('"');
+        for (int index = 0; index < string.length(); index++) {
+            char character = string.charAt(index);
+            switch (character) {
+                case '"' -> text.append("\\\"");
+                case '\\' -> text.append("\\\\");
+                case '\b' -> text.append("\\b");
+                case '\t' -> text.append("\\t");
+                case '\n' -> text.append("\\n");
+                case '\f' -> text.append("\\f");
+                case '\r' -> text.append("\\r");
+                default -> {
+                    if (character < 0x20) {
+                        text.append(String.format(Locale.ROOT, "\\u%04x", (int) character));
+                    } else {
+                        text.append(character);
+                    }
+                }
+            }
+        }
+        text.append('"');
     }
 
     private static JsonNode loadDefinitions() {

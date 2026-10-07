@@ -41,14 +41,15 @@ Whoever runs a node starts two processes, the controller first:
 
 ```sh
 asterisk-controller --node <name> --listen 127.0.0.1:<port> \
-    --application <ws://host:port/path> \
+    --application <wss://host[:port][/path]> \
     --asterisk-tree <directory> --state <directory> \
     --asterisk-http 127.0.0.1:<port> --audio-ports <first>-<last> \
     [--sip <address:port>] [--sip-public <address>]
 ```
 
 These are facts of the machine and of the launch: where the Asterisk tree and
-the node's state directory are, and which ports are this node's. Before it
+the node's state directory are, which ports are this node's, and where the
+application is. Before it
 prints `asterisk-controller ready`, the controller has written Asterisk's
 whole configuration into `<state>/etc`; Asterisk is then started on
 `<state>/etc/asterisk.conf` and on nothing else. The configuration directory
@@ -76,6 +77,62 @@ when the settings name an operator; without operators Asterisk listens for
 none. It cannot be changed while Asterisk runs — unlike everything the
 settings say, which Asterisk takes in without dropping a call.
 
+## The way to the application
+
+Every connection between the node and the application is opened by the
+controller, to the one address `--application` gives: one for each
+conversation to `<address>/conversation`, and the node's one service
+connection to `<address>/service`. Each of them proves the node by its name
+and secret, as HTTP Basic authentication — the scheme every web stack checks
+by itself, once per connection.
+
+The secret is the node's alone. Whoever runs the node puts it into
+`<state>/node-secret`, readable by its owner alone, and gives the application
+the same one for the node's name; a controller without it, or with one others
+may read, does not start. Across a network the secret travels only inside
+TLS: an address other than the loopback one must be `wss://`, and the
+controller refuses to start with any other. TLS is rustls with the ring
+provider, compiled in — the same on every platform, with no TLS library of the
+machine involved; the application's certificate is judged against the roots
+the machine trusts. The node's name may hold letters, digits, `.`, `_` and
+`-`: a colon would end it inside Basic authentication.
+
+Both kinds of connection are kept alive the same way: each side sends a ping
+at least every ten seconds, and thirty seconds with nothing from the other
+side is a connection lost. Opening a connection is held to the same limit, so
+an instance that takes a connection and never answers is as good as none.
+
+## The service connection
+
+On it the node says who it is — its name, its versions, and the fingerprint
+of the settings it runs on — and is welcomed or refused. The application
+gives the node its settings on it, whole, inside the message: when the
+fingerprint in the hello is not the one it expects, and whenever the settings
+change. A signal to fetch them elsewhere would make it possible for "the
+settings changed" to arrive without the settings.
+
+The node applies settings while calls go on. Of Asterisk's configuration only
+two files follow from settings — the dialplan and the operators — and each is
+read by one module. A file that changes is replaced whole, never half
+written, and its module is reloaded; if Asterisk refuses, everything replaced
+is put back and reloaded again, and the node answers that it refused the
+settings, with the reason, and keeps the ones it had. Only settings Asterisk
+took in are stored for the next start and used by conversations from then
+on.
+
+What the node does on its own, with no application to decide — keeps people
+connected while it looks for an instance, carries out a fallback's transfer,
+hangs up on someone or stops calling them — it reports. A report is written
+to the journal in the state directory first (`<state>/reports.jsonl`) and
+sent after, at once if the service connection is there and as soon as it is
+otherwise; the application's word that it has the report is what removes it.
+A controller that dies between doing something and telling it leaves the
+report behind, and the next one sends it, under the same identifier.
+
+The service connection is lost — it is opened again, a second later, to
+whichever instance the address leads to. A request of the application that
+this build cannot carry out ends the connection with the request's name.
+
 ## The node's settings
 
 What the node does with calls — its operators, outbound lines, entries with
@@ -90,7 +147,10 @@ description, and then for what the description cannot say — that an operator,
 line or prompt named in one place exists in another, and that every value can
 be written into Asterisk's configuration and be read back as itself. Settings
 that fail are refused whole, with the reason. The fingerprint of applied
-settings is the SHA-256 of the file exactly as given.
+settings is the SHA-256 of their canonical text
+(`protocol/settings-fingerprint.md`): it depends on what the settings say,
+not on how a file or a message happens to write them, so the application can
+compare it with the fingerprint of the settings it expects.
 
 Out of the settings the controller makes Asterisk's side of them:
 
@@ -108,8 +168,7 @@ Out of the settings the controller makes Asterisk's side of them:
 - the operator's identifier, which may be any text, never appears in
   Asterisk's configuration; the name used there is derived from it.
 
-Not made yet: fetching settings from the application and applying a change
-while running; prompts — until then a fallback that is a message is only a
+Not made yet: prompts — until then a fallback that is a message is only a
 hang-up; TLS towards an operator (settings carry no certificate
 — such an operator is refused); operators that require registration.
 
@@ -184,28 +243,32 @@ to one of them the others do not hear.
 
 ## Layout
 
-| Path                                 | Contents                                                     |
-|--------------------------------------|--------------------------------------------------------------|
-| `protocol/node-protocol.schema.json` | The protocol description: messages of the conversation and   |
-|                                      | service connections and the settings the application gives   |
-|                                      | the node — the single source of the types of both sides      |
-| `protocol/messages.vectors.json`     | Messages every implementation must accept, or refuse, the    |
-|                                      | same                                                         |
-| `protocol/audio-frames.md`           | The binary audio frames of a conversation connection         |
-| `protocol/audio-frames.vectors.json` | Frames every implementation must decode, or refuse, the same |
-| `crates/asterisk-controller/`        | The controller: writes Asterisk's configuration, connects to |
-|                                      | its control interface, accepts its media connections, opens  |
-|                                      | a conversation connection to the application for each call,  |
-|                                      | translates between the two                                   |
-| `scripts/fetch-asterisk.sh`          | Fetches the Asterisk build the controller is pinned to       |
-| `crates/node-protocol/`              | Rust: message types generated from the description, the      |
-|                                      | checked decoding, the audio frames                           |
-| `crates/protocol-java/`              | Generator of the Java message types                          |
-| `java/`                              | The Java library of the application side, a Gradle project:  |
-|                                      | the checked decoding and the audio frames written by hand,   |
-|                                      | the message types generated by its build, and the program    |
-|                                      | that runs the library through the vectors                    |
-| `crates/repository-checks/`          | Checks of the repository itself, run by `cargo test`         |
+| Path                                         | Contents                                                     |
+|----------------------------------------------|--------------------------------------------------------------|
+| `protocol/node-protocol.schema.json`         | The protocol description: messages of the conversation and   |
+|                                              | service connections and the settings the application gives   |
+|                                              | the node — the single source of the types of both sides      |
+| `protocol/messages.vectors.json`             | Messages every implementation must accept, or refuse, the    |
+|                                              | same                                                         |
+| `protocol/audio-frames.md`                   | The binary audio frames of a conversation connection         |
+| `protocol/audio-frames.vectors.json`         | Frames every implementation must decode, or refuse, the same |
+| `protocol/settings-fingerprint.md`           | The canonical text of settings, whose SHA-256 is their       |
+|                                              | fingerprint                                                  |
+| `protocol/settings-fingerprint.vectors.json` | Values with the canonical text and digest every              |
+|                                              | implementation must reproduce                                |
+| `crates/asterisk-controller/`                | The controller: writes Asterisk's configuration, connects to |
+|                                              | its control interface, accepts its media connections, opens  |
+|                                              | a conversation connection to the application for each call,  |
+|                                              | translates between the two                                   |
+| `scripts/fetch-asterisk.sh`                  | Fetches the Asterisk build the controller is pinned to       |
+| `crates/node-protocol/`                      | Rust: message types generated from the description, the      |
+|                                              | checked decoding, the audio frames                           |
+| `crates/protocol-java/`                      | Generator of the Java message types                          |
+| `java/`                                      | The Java library of the application side, a Gradle project:  |
+|                                              | the checked decoding and the audio frames written by hand,   |
+|                                              | the message types generated by its build, and the program    |
+|                                              | that runs the library through the vectors                    |
+| `crates/repository-checks/`                  | Checks of the repository itself, run by `cargo test`         |
 
 ## The protocol description is the judge
 
@@ -234,7 +297,10 @@ with a reason at the point where it is checked, never a line nobody enforces.
 
 `protocol/messages.vectors.json` and `protocol/audio-frames.vectors.json` list
 messages and frames together with what must happen to each: accepted — and
-then encoded back to the same thing — or refused. The Rust tests read them.
+then encoded back to the same thing — or refused.
+`protocol/settings-fingerprint.vectors.json` lists values with their canonical
+text and its digest; the vectors were made by a third implementation, so
+neither side can agree with itself by mistake. The Rust tests read them.
 The build of the Java library (`java/`) generates its types from the
 description, compiles everything with a real compiler, warnings as errors,
 against the Jackson version the Gabion framework uses, and runs the library
@@ -322,6 +388,16 @@ the tap is the participant alone. The media channel, its connection and its
 marks are untouched by the move there and back, so the application sees no
 change.
 
+**A name the controller gives in Asterisk is never given again.** Asterisk
+keeps a bridge's name taken for as long as anything still holds the bridge —
+also after the bridge was removed — and refuses a new bridge of that name.
+So every name the controller gives — of a media channel, a tap, a bridge, a
+group, a channel it dials — carries the controller's run, as does the
+identifier of every participant it adds: a controller started again beside
+a running Asterisk never meets a name the one before it gave, and a
+participant is never given an identifier someone before them had in the
+same conversation.
+
 **A participant changes bridges with a gap, not an overlap.** Moving them
 takes two requests, and between the two the media channel is either alone for
 a moment or has two sources at once. Measured over twenty moves on the pinned
@@ -399,6 +475,21 @@ the conversation connection through the protocol library, and runs real calls:
   seeing the line's number; the two are kept and, when the application is
   back, handed to it; a caller who still rings is transferred the same way,
   and when they hang up the one called for them is not kept;
+- the application's side admits a connection only with the node's name and
+  secret, and tells the conversation connections from the service
+  connection by their paths;
+- the application gives the node settings on the service connection: the
+  node says which settings it stored and is welcomed; the same settings again
+  change nothing; settings whose parts disagree are refused whole with the
+  reason; settings with one more entry are taken in while Asterisk runs —
+  Asterisk reloads without a warning, a call to the new number arrives as a
+  conversation, and the settings are stored as their canonical text;
+- an instance that takes a conversation connection and then says nothing at
+  all is pinged at ten and twenty seconds, given up at thirty, and the caller
+  is given the fallback;
+- what the node does on its own is reported on the service connection, scenario
+  by scenario — hang-ups, a fallback's transfer, two kept connected — and
+  confirmed;
 - a node without its controller: the controller is killed with two people
   connected, each with an audio path; calls that arrive then are given their
   fallbacks by Asterisk alone — one transferred through the operator, one
@@ -406,7 +497,15 @@ the conversation connection through the protocol library, and runs real calls:
   served, and the conversation from before is found, handed to the
   application with its two people connected — they heard each other all
   along — and controlled by it, while what the old controller had built for
-  audio is removed.
+  audio is removed and built anew under names the old one never gave; the
+  new controller says it runs on the settings the application gave the old
+  one, and sends again the report the old one sent and nobody confirmed.
+
+A second, smaller test needs no Asterisk: it has the controller reach an
+application over TLS that serves a certificate made for the test, given to the
+controller as `SSL_CERT_FILE` the way any program on the machine is told of
+roots other than the system's. With that root the controller connects,
+proves the node and says hello; with another it refuses the certificate.
 
 Asterisk runs on the configuration the controller wrote out of the test's
 settings, and must load it without a single warning; what Asterisk then says
@@ -452,9 +551,12 @@ application hears a participant, queues segments for them and flushes the
 queue. The controller writes Asterisk's configuration out of the node's stored
 settings, adds participants by dialling, connects participants to each
 other, stands in for an application that is away, and carries on the
-conversations it finds in Asterisk when it is started beside it. Not done
-yet: recording, holding a participant whose connection is lost, settings
-fetched from the application, browser calls. A command the controller does not carry
+conversations it finds in Asterisk when it is started beside it. It keeps a
+service connection to the application, over TLS with the node's secret,
+applies the settings it is given there while calls go on, and reports what it
+does on its own. Not done yet: recording, holding a participant whose
+connection is lost, prompts, requests of the application on the service
+connection (starting a conversation, browser calls). A command the controller does not carry
 out yet ends the conversation with an error that names it; none is accepted
 and ignored. No release has been published.
 

@@ -50,21 +50,19 @@ use node_protocol::{
     audio::{AudioFrame, AudioFrameError},
     messages::{
         ApplicationMessage, Command, CommandOutcome, CommandRejection, ControllerMessage,
-        Departure, EndReason, EntryKey, Event, Fallback, LineId, Opening, Origin, Participant,
-        ParticipantId, ParticipantMedium, ParticipantSnapshot, ParticipantState as StateTold,
-        PhoneNumber, RejectReason, SegmentId,
+        ConversationId, Departure, EndReason, EntryKey, Event, Fallback, FallbackKind, LineId,
+        Opening, Origin, Participant, ParticipantId, ParticipantMedium, ParticipantSnapshot,
+        ParticipantState as StateTold, PhoneNumber, RejectReason, Report, SegmentId,
     },
 };
-use tokio::{net::TcpStream, sync::mpsc, time::Instant};
-use tokio_tungstenite::{
-    MaybeTlsStream, WebSocketStream, connect_async,
-    tungstenite::{
-        Message as Frame,
-        protocol::{CloseFrame, frame::coding::CloseCode},
-    },
+use tokio::{sync::mpsc, time::Instant};
+use tokio_tungstenite::tungstenite::{
+    Message as Frame,
+    protocol::{CloseFrame, frame::coding::CloseCode},
 };
 
 use crate::{
+    application::{Endpoint, PING_EVERY, SILENCE_LIMIT, Socket as ApplicationSocket},
     ari,
     asterisk::{FromAsterisk, Line},
     asterisk_files::{APPLICATION, operator_name},
@@ -73,9 +71,8 @@ use crate::{
     media::{self, FromMedia},
     node::{Node, Place},
     playout::{FRAME_BYTES, Outcome, Playout, ToMedium},
+    reports,
 };
-
-type ApplicationSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 /// Milliseconds of audio in one heard frame.
 const HEARD_FRAME_MS: u64 = 20;
@@ -289,8 +286,6 @@ pub struct Found {
     pub origin: Origin,
     /// Its participants.
     pub members: Vec<FoundMember>,
-    /// The highest number of a group of it.
-    pub groups_made: u64,
 }
 
 impl Found {
@@ -300,7 +295,6 @@ impl Found {
             id,
             origin,
             members: Vec::new(),
-            groups_made: 0,
         }
     }
 }
@@ -319,8 +313,8 @@ pub struct FoundMember {
     pub awaiting_answer: bool,
     /// The line they were called on.
     pub line: Option<String>,
-    /// The group they are in.
-    pub group: Option<u64>,
+    /// The bridge of the group they are in.
+    pub group: Option<String>,
 }
 
 /// A channel of the node's application, as a participant of a conversation
@@ -353,27 +347,22 @@ pub fn found(
     Some((conversation, origin, member))
 }
 
-/// The conversation and the number of a group, from the identifier of the
-/// group's bridge.
-pub fn group_of(bridge: &str) -> Option<(String, u64)> {
-    let (conversation, number) = bridge.rsplit_once(".group-")?;
-    Some((conversation.to_owned(), number.parse().ok()?))
+/// The conversation a group's bridge belongs to, from the bridge's
+/// identifier; `None` for a bridge that is no group's.
+pub fn group_of(bridge: &str) -> Option<String> {
+    let (conversation, _) = bridge.split_once('.')?;
+    bridge.contains(".group-").then(|| conversation.to_owned())
 }
 
 /// Carry on a conversation found in Asterisk by a controller that started
 /// beside it.
 pub async fn carry_on(found: Found, asterisk: Line, node: Arc<Node>) {
     let id = found.id.clone();
-    let outcome = match Conversation::resume(found, asterisk, node) {
-        Ok(mut conversation) => {
-            let result = conversation.live(None).await;
-            if let Err(fault) = &result {
-                conversation.abandon(fault).await;
-            }
-            result
-        }
-        Err(fault) => Err(fault),
-    };
+    let mut conversation = Conversation::resume(found, asterisk, node);
+    let outcome = conversation.live(None).await;
+    if let Err(fault) = &outcome {
+        conversation.abandon(fault).await;
+    }
     match outcome {
         Ok(()) => eprintln!("conversation {id}: ended"),
         Err(fault) => eprintln!("conversation {id}: FAILED — {fault}"),
@@ -440,6 +429,12 @@ struct Conversation {
     /// The connection of the instance that owns the conversation; `None`
     /// while no instance does.
     application: Option<ApplicationSocket>,
+    /// When the application was last heard on its connection.
+    heard_at: Instant,
+    /// When the next ping is due on the application's connection.
+    ping_at: Instant,
+    /// How many pings have been sent: numbers the next one.
+    pings: u64,
     /// How the conversation came to exist.
     origin: Origin,
     fallback: FallbackProgress,
@@ -457,10 +452,19 @@ struct Conversation {
     sounds_opened: u64,
     /// How many taps have been made: names the next one.
     taps_made: u64,
-    /// How many groups have been made: names the next one.
+    /// How many groups this controller has made: numbers the next one.
     groups_made: u64,
-    /// How many participants the conversation has had: names the next one.
+    /// The bridge of each group, by its number. Groups found at a restart
+    /// keep the bridges the controller before made for them.
+    group_bridges: HashMap<u64, String>,
+    /// How many participants this controller has added: numbers the next.
     participants: u64,
+    /// The one who came through the entry — the one the entry's fallback is
+    /// for; `None` once they are gone, or when nobody did.
+    caller: Option<ParticipantId>,
+    /// What every name this controller gives in Asterisk for the
+    /// conversation begins with: the conversation and the controller's run.
+    names: String,
     /// Participants being called whom the application does not know yet,
     /// with what has happened to them meanwhile. The application learns of
     /// such a participant from the answer to its `dial` command, and that
@@ -523,7 +527,7 @@ fn begin(
 ) -> Result<(Conversation, Opening), Fault> {
     let Arrival { channel, origin } = arrival;
     let first = Member {
-        id: participant_id(1)?,
+        id: participant_id(&node, 1)?,
         number: channel.caller.number.parse().ok(),
         channel: channel.id,
         state: if channel.state == ari::STATE_UP {
@@ -543,12 +547,17 @@ fn begin(
         first: first.known(),
     };
 
+    let caller = first.id.clone();
+    let names = format!("{id}.{}", node.run);
     let (media_inbox, from_media) = mpsc::channel(MEDIA_BACKLOG);
     let conversation = Conversation {
         id: id.to_owned(),
         node,
         asterisk,
         application: None,
+        heard_at: Instant::now(),
+        ping_at: Instant::now(),
+        pings: 0,
         origin,
         fallback: FallbackProgress::NotBegun,
         members: vec![first],
@@ -560,7 +569,10 @@ fn begin(
         sounds_opened: 0,
         taps_made: 0,
         groups_made: 0,
+        group_bridges: HashMap::new(),
         participants: 1,
+        caller: Some(caller),
+        names,
         unannounced: HashMap::new(),
     };
     Ok((conversation, opening))
@@ -589,27 +601,33 @@ async fn next_frame(
 impl Conversation {
     /// A conversation as a controller that started beside a running Asterisk
     /// found it there.
-    fn resume(found: Found, asterisk: Line, node: Arc<Node>) -> Result<Self, Fault> {
-        let mut participants = 0;
-        let mut groups = Vec::new();
-        let members = found
+    fn resume(found: Found, asterisk: Line, node: Arc<Node>) -> Self {
+        // The groups keep the bridges they have; this controller numbers
+        // them its own way.
+        let mut group_bridges: HashMap<u64, String> = HashMap::new();
+        let mut number_of = |bridge: String| {
+            let known = group_bridges
+                .iter()
+                .find_map(|(number, known)| (*known == bridge).then_some(*number));
+            known.unwrap_or_else(|| {
+                let number = u64::try_from(group_bridges.len()).unwrap_or(u64::MAX) + 1;
+                group_bridges.insert(number, bridge);
+                number
+            })
+        };
+        // The caller is the one who came through the entry: the one the node
+        // did not call, so the one with no line.
+        let caller = found
+            .members
+            .iter()
+            .find(|member| member.line.is_none())
+            .map(|member| member.participant.clone());
+        let members: Vec<Member> = found
             .members
             .into_iter()
             .map(|member| {
-                let number: u64 = member
-                    .participant
-                    .as_str()
-                    .strip_prefix("p-")
-                    .and_then(|number| number.parse().ok())
-                    .ok_or_else(|| {
-                        Fault::Asterisk(format!(
-                            "a channel is marked as participant {}, which is no participant of ours",
-                            member.participant.as_str()
-                        ))
-                    })?;
-                participants = participants.max(number);
-                groups.extend(member.group);
-                Ok(Member {
+                let group = member.group.map(&mut number_of);
+                Member {
                     id: member.participant,
                     number: member.number,
                     channel: member.channel,
@@ -622,17 +640,22 @@ impl Conversation {
                     sound: None,
                     awaiting_answer: member.awaiting_answer,
                     _place: member.line.map(|line| node.lines.resume(&line)),
-                    group: member.group,
-                    put: member.group.map_or(Put::Nowhere, Put::InGroup),
-                })
+                    group,
+                    put: group.map_or(Put::Nowhere, Put::InGroup),
+                }
             })
-            .collect::<Result<Vec<Member>, Fault>>()?;
+            .collect();
+        let groups: Vec<u64> = group_bridges.keys().copied().collect();
+        let names = format!("{}.{}", found.id, node.run);
         let (media_inbox, from_media) = mpsc::channel(MEDIA_BACKLOG);
         let mut conversation = Self {
             id: found.id,
             node,
             asterisk,
             application: None,
+            heard_at: Instant::now(),
+            ping_at: Instant::now(),
+            pings: 0,
             origin: found.origin,
             fallback: FallbackProgress::NotBegun,
             members,
@@ -643,13 +666,14 @@ impl Conversation {
             media_inbox,
             sounds_opened: 0,
             taps_made: 0,
-            groups_made: found.groups_made,
-            participants,
+            groups_made: u64::try_from(group_bridges.len()).unwrap_or(u64::MAX),
+            group_bridges,
+            participants: 0,
+            caller,
+            names,
             unannounced: HashMap::new(),
         };
         // A group that has lost all but one of its people is no group.
-        groups.sort_unstable();
-        groups.dedup();
         for group in groups {
             conversation.settle_group(group);
         }
@@ -667,7 +691,7 @@ impl Conversation {
                 &format!("channels/{}", ari::query(&channel)),
             );
         }
-        Ok(conversation)
+        conversation
     }
 
     /// Write on the channel of a participant what only the controller
@@ -706,8 +730,9 @@ impl Conversation {
     async fn live(&mut self, opening: Option<Opening>) -> Result<(), Fault> {
         let (mut owned, mut look_first) = match opening {
             Some(opening) => {
-                let first = participant_id(1)?;
-                self.note(&first);
+                if let Some(first) = self.caller.clone() {
+                    self.note(&first);
+                }
                 // A conversation nobody took has just had its one look.
                 (self.find_owner(opening).await, false)
             }
@@ -751,13 +776,15 @@ impl Conversation {
     /// [`Fault::Owner`] when no instance took it: none could be reached, or
     /// the one that was reached declined or went away.
     async fn find_owner(&mut self, opening: Opening) -> Result<(), Fault> {
-        let url = self.node.config.application_url.clone();
-        let (socket, _response) = connect_async(url.as_str()).await.map_err(|error| {
-            Fault::Owner(format!(
-                "cannot open a conversation connection to {url}: {error}"
-            ))
-        })?;
+        let socket = self
+            .node
+            .application
+            .open(Endpoint::Conversation)
+            .await
+            .map_err(Fault::Owner)?;
         self.application = Some(socket);
+        self.heard_at = Instant::now();
+        self.ping_at = self.heard_at + PING_EVERY;
         let offered = async {
             let hello = self.hello(opening)?;
             self.tell(&hello).await?;
@@ -833,7 +860,16 @@ impl Conversation {
     /// Wait for the application to take the conversation.
     async fn await_acceptance(&mut self) -> Result<(), Fault> {
         loop {
-            let said = match next_frame(&mut self.application).await {
+            let due = self.liveness_due();
+            let frame = tokio::select! {
+                frame = next_frame(&mut self.application) => frame,
+                () = tokio::time::sleep_until(due) => {
+                    self.keep_alive().await?;
+                    continue;
+                }
+            };
+            self.heard_at = Instant::now();
+            let said = match frame {
                 Some(Ok(Frame::Text(text))) => text,
                 Some(Ok(Frame::Close(_))) | None => {
                     return Err(Fault::Owner(
@@ -874,21 +910,31 @@ impl Conversation {
         // owed Asterisk's word about one it tried to call: the application
         // has a `dial` command waiting for its answer.
         while !(self.members.is_empty() && self.unannounced.is_empty()) {
+            let due = self.liveness_due();
             tokio::select! {
                 said = self.asterisk.next() => self.asterisk_said(said).await?,
                 said = next_frame(&mut self.application) => match said {
                     Some(Ok(Frame::Text(text))) => {
+                        self.heard_at = Instant::now();
                         let message = node_protocol::decode(text.as_str()).map_err(Fault::Protocol)?;
                         self.on_application(message).await?;
                     }
-                    Some(Ok(Frame::Binary(bytes))) => self.on_audio(&bytes).await?,
-                    Some(Ok(Frame::Ping(_) | Frame::Pong(_) | Frame::Frame(_))) => {}
+                    Some(Ok(Frame::Binary(bytes))) => {
+                        self.heard_at = Instant::now();
+                        self.on_audio(&bytes).await?;
+                    }
+                    Some(Ok(Frame::Ping(_) | Frame::Pong(_) | Frame::Frame(_))) => {
+                        self.heard_at = Instant::now();
+                    }
                     Some(Ok(Frame::Close(_))) | None => {
                         return Err(Fault::Owner("lost the conversation connection".into()));
                     }
                     Some(Err(error)) => return Err(Fault::Owner(error.to_string())),
                 },
                 Some(said) = self.from_media.recv() => self.on_media(said).await?,
+                () = tokio::time::sleep_until(due), if self.application.is_some() => {
+                    self.keep_alive().await?;
+                }
             }
         }
 
@@ -900,6 +946,37 @@ impl Conversation {
         self.event(Event::ConversationEnded { reason }).await?;
         if let Some(application) = &mut self.application {
             let _ = application.close(None).await;
+        }
+        Ok(())
+    }
+
+    /// When the liveness of the application's connection is next to be
+    /// looked after: a ping is due, or the silence reaches its limit.
+    fn liveness_due(&self) -> Instant {
+        self.ping_at.min(self.heard_at + SILENCE_LIMIT)
+    }
+
+    /// Look after the liveness of the application's connection, as the
+    /// protocol has it: a ping at least every [`PING_EVERY`], and an owner
+    /// silent for [`SILENCE_LIMIT`] is an owner lost — also one that took
+    /// the connection and never answered.
+    ///
+    /// # Errors
+    ///
+    /// [`Fault::Owner`] when the silence has reached its limit.
+    async fn keep_alive(&mut self) -> Result<(), Fault> {
+        let now = Instant::now();
+        if now >= self.heard_at + SILENCE_LIMIT {
+            return Err(Fault::Owner(format!(
+                "heard nothing from the application for {} seconds",
+                SILENCE_LIMIT.as_secs()
+            )));
+        }
+        if now >= self.ping_at {
+            self.pings += 1;
+            self.ping_at = now + PING_EVERY;
+            let n = self.pings;
+            self.tell(&ControllerMessage::Ping { n }).await?;
         }
         Ok(())
     }
@@ -964,6 +1041,7 @@ impl Conversation {
     async fn stand_in(&mut self, mut look: bool) -> Result<bool, Fault> {
         let mut look_at = Instant::now() + LOOK_FOR_OWNER;
         let mut said_why = String::new();
+        let mut holding_reported = false;
         loop {
             if self.members.is_empty() {
                 return Ok(false);
@@ -983,6 +1061,13 @@ impl Conversation {
                 look_at = Instant::now() + LOOK_FOR_OWNER;
             }
             self.keep_without_owner().await?;
+            if !holding_reported && self.someone_is_connected() {
+                holding_reported = true;
+                self.keep_report(|conversation, at_unix_ms| Report::HoldingWithoutOwner {
+                    conversation,
+                    at_unix_ms,
+                });
+            }
             tokio::select! {
                 said = self.asterisk.next() => self.asterisk_said(said).await?,
                 Some(said) = self.from_media.recv() => self.on_media(said).await?,
@@ -1005,7 +1090,11 @@ impl Conversation {
             self.hang_up(|member| member.group.is_none());
             return Ok(());
         }
-        let caller = participant_id(1)?;
+        let Some(caller) = self.caller.clone() else {
+            // The one the fallback is for is gone: nobody is kept.
+            self.give_up();
+            return Ok(());
+        };
         let state_of = |members: &[Member], who: &ParticipantId| {
             members
                 .iter()
@@ -1073,9 +1162,10 @@ impl Conversation {
             .members
             .iter()
             .any(|member| member.id == *caller && !member.removed_by_us);
-        let node = Arc::clone(&self.node);
+        let applied = self.node.applied();
         let fallback =
-            node.settings
+            applied
+                .settings
                 .entries
                 .iter()
                 .find_map(|entry| match (&entry.key, &self.origin) {
@@ -1101,7 +1191,8 @@ impl Conversation {
                         self.id,
                         number.as_str()
                     );
-                    self.fallback = FallbackProgress::Calling(participant_id(self.participants)?);
+                    self.fallback =
+                        FallbackProgress::Calling(participant_id(&self.node, self.participants)?);
                 } else {
                     eprintln!(
                         "conversation {}: the fallback of the entry — a transfer to {} — cannot be carried out; the caller is hung up",
@@ -1130,6 +1221,13 @@ impl Conversation {
     fn transferred(&mut self, caller: &ParticipantId, dialled: &ParticipantId) {
         self.fallback = FallbackProgress::Done;
         self.gather(&[caller.clone(), dialled.clone()]);
+        let origin = self.origin.clone();
+        self.keep_report(|conversation, at_unix_ms| Report::FallbackApplied {
+            conversation,
+            origin,
+            fallback: FallbackKind::Transfer,
+            at_unix_ms,
+        });
     }
 
     /// The fallback could not be carried through: nobody is kept.
@@ -1140,18 +1238,56 @@ impl Conversation {
 
     /// Have Asterisk drop the channels of the participants `whom` picks.
     /// One who is already being dropped is not asked about again.
+    ///
+    /// The node does this only on its own, with no application to decide:
+    /// each one is reported — as a call that was cancelled for one still
+    /// being called, as a hang-up for anyone else.
     fn hang_up(&mut self, whom: impl Fn(&Member) -> bool) {
-        let channels: Vec<String> = self
+        let gone: Vec<(String, ParticipantId, bool)> = self
             .members
             .iter_mut()
             .filter(|member| !member.removed_by_us && whom(member))
             .map(|member| {
                 member.removed_by_us = true;
-                member.channel.clone()
+                (
+                    member.channel.clone(),
+                    member.id.clone(),
+                    member.awaiting_answer,
+                )
             })
             .collect();
-        for channel in channels {
+        for (channel, participant, being_called) in gone {
             self.ask(Pending::Internal, "DELETE", &format!("channels/{channel}"));
+            self.keep_report(|conversation, at_unix_ms| {
+                if being_called {
+                    Report::RingingCancelled {
+                        conversation,
+                        participant,
+                        at_unix_ms,
+                    }
+                } else {
+                    Report::ParticipantHungUp {
+                        conversation,
+                        participant,
+                        at_unix_ms,
+                    }
+                }
+            });
+        }
+    }
+
+    /// Keep a report of what the node did on its own in this conversation,
+    /// until the application has it.
+    fn keep_report(&self, report: impl FnOnce(ConversationId, u64) -> Report) {
+        match self.id.parse() {
+            Ok(conversation) => self
+                .node
+                .reports
+                .keep(report(conversation, reports::now_unix_ms())),
+            Err(_) => eprintln!(
+                "conversation {}: a REPORT IS LOST — the conversation's identifier is not valid",
+                self.id
+            ),
         }
     }
 
@@ -1603,10 +1739,10 @@ impl Conversation {
         }
 
         self.sounds_opened += 1;
-        let channel = format!("{}.media-{}", self.id, self.sounds_opened);
+        let channel = format!("{}.media-{}", self.names, self.sounds_opened);
         member.sound = Some(Sound {
             channel: channel.clone(),
-            bridge: format!("{}.bridge-{}", self.id, self.sounds_opened),
+            bridge: format!("{}.bridge-{}", self.names, self.sounds_opened),
             sink: None,
             built: Built::Asked,
             beside: Beside::Nobody,
@@ -1686,8 +1822,9 @@ impl Conversation {
     /// tried against the pinned Asterisk, the first loses at most one frame
     /// of twenty milliseconds, and the second doubles the audio.
     fn arrange(&mut self, participant: &ParticipantId) {
-        let conversation = self.id.clone();
         let next_tap = self.taps_made + 1;
+        let bridges = &self.group_bridges;
+        let names = &self.names;
         let Some(member) = self
             .members
             .iter_mut()
@@ -1703,16 +1840,19 @@ impl Conversation {
         let mut tap_made = None;
         match member.group {
             Some(group) => {
+                let Some(bridge) = bridges.get(&group) else {
+                    return;
+                };
                 arrange_in_group(
                     member,
-                    group,
-                    &conversation,
+                    (group, bridge),
+                    names,
                     next_tap,
                     &mut requests,
                     &mut tap_made,
                 );
             }
-            None => arrange_alone(member, &conversation, &mut requests),
+            None => arrange_alone(member, bridges, &mut requests),
         }
         if let Some(tap) = tap_made {
             self.taps_made = next_tap;
@@ -1850,7 +1990,8 @@ impl Conversation {
             *group
         } else {
             self.groups_made += 1;
-            let bridge = group_bridge(&self.id, self.groups_made);
+            let bridge = format!("{}.group-{}", self.names, self.groups_made);
+            self.group_bridges.insert(self.groups_made, bridge.clone());
             self.ask(
                 Pending::Group,
                 "POST",
@@ -1912,8 +2053,9 @@ impl Conversation {
         if let Some(participant) = alone {
             self.arrange(&participant);
         }
-        let bridge = group_bridge(&self.id, group);
-        self.ask(Pending::Internal, "DELETE", &format!("bridges/{bridge}"));
+        if let Some(bridge) = self.group_bridges.remove(&group) {
+            self.ask(Pending::Internal, "DELETE", &format!("bridges/{bridge}"));
+        }
     }
 
     /// End a participant's audio path in Asterisk. Asterisk then closes the
@@ -1948,9 +2090,9 @@ impl Conversation {
         line: &LineId,
         answer_limit_ms: u64,
     ) -> Result<(), Fault> {
-        let node = Arc::clone(&self.node);
-        let refused = match destination::judge(&node.settings, line, number) {
-            Ok(route) => match node.lines.take(route.line) {
+        let applied = self.node.applied();
+        let refused = match destination::judge(&applied.settings, line, number) {
+            Ok(route) => match self.node.lines.take(route.line) {
                 Some(place) => Ok((route, place)),
                 None => Err(CommandRejection::OutboundLimitReached),
             },
@@ -1968,11 +2110,11 @@ impl Conversation {
 
         self.participants += 1;
         let participant = Participant {
-            id: participant_id(self.participants)?,
+            id: participant_id(&self.node, self.participants)?,
             medium: ParticipantMedium::TelephoneNetwork,
             number: Some(number.clone()),
         };
-        let channel = format!("{}.participant-{}", self.id, self.participants);
+        let channel = format!("{}.participant-{}", self.names, self.participants);
         // Written on the channel as it is made: until they answer, nothing
         // can be written on it.
         let mut notes = serde_json::Map::new();
@@ -2258,9 +2400,10 @@ impl Conversation {
         groups.sort_unstable();
         groups.dedup();
         for group in groups {
-            let bridge = group_bridge(&self.id, group);
-            self.asterisk
-                .ask("abandon", "DELETE", &format!("bridges/{bridge}"));
+            if let Some(bridge) = self.group_bridges.get(&group) {
+                self.asterisk
+                    .ask("abandon", "DELETE", &format!("bridges/{bridge}"));
+            }
         }
         let close = CloseFrame {
             code: CloseCode::Error,
@@ -2277,18 +2420,13 @@ impl Conversation {
     }
 }
 
-/// Asterisk's identifier of the bridge of a group.
-fn group_bridge(conversation: &str, group: u64) -> String {
-    format!("{conversation}.group-{group}")
-}
-
 /// What is still to be asked of Asterisk for a participant who is in a
 /// group: their channel in the group's bridge and, if they have an audio
 /// path, a tap on them beside its media channel.
 fn arrange_in_group(
     member: &mut Member,
-    group: u64,
-    conversation: &str,
+    (group, bridge): (u64, &str),
+    names: &str,
     next_tap: u64,
     requests: &mut Vec<Request>,
     tap_made: &mut Option<String>,
@@ -2300,8 +2438,7 @@ fn arrange_in_group(
                 Pending::Step(member.id.clone(), Step::EnterGroup),
                 "POST",
                 format!(
-                    "bridges/{}/addChannel?channel={}",
-                    group_bridge(conversation, group),
+                    "bridges/{bridge}/addChannel?channel={}",
                     ari::query(&member.channel),
                 ),
             ));
@@ -2315,7 +2452,7 @@ fn arrange_in_group(
         return enter_group(member, requests);
     }
     let Some(tap) = &sound.tap else {
-        let tap = format!("{conversation}.tap-{next_tap}");
+        let tap = format!("{names}.tap-{next_tap}");
         requests.push((
             Pending::Step(member.id.clone(), Step::Tap),
             "POST",
@@ -2350,19 +2487,20 @@ fn arrange_in_group(
 /// What is still to be asked of Asterisk for a participant who is connected
 /// to nobody: no tap on them, their channel beside the media channel of
 /// their audio path if they have one, and in no bridge if they have none.
-fn arrange_alone(member: &mut Member, conversation: &str, requests: &mut Vec<Request>) {
+fn arrange_alone(member: &mut Member, bridges: &HashMap<u64, String>, requests: &mut Vec<Request>) {
     let leave_group = |member: &mut Member, requests: &mut Vec<Request>| {
         if let Put::InGroup(group) = member.put {
             member.put = Put::Nowhere;
-            requests.push((
-                Pending::Step(member.id.clone(), Step::LeaveGroup),
-                "POST",
-                format!(
-                    "bridges/{}/removeChannel?channel={}",
-                    group_bridge(conversation, group),
-                    ari::query(&member.channel),
-                ),
-            ));
+            if let Some(bridge) = bridges.get(&group) {
+                requests.push((
+                    Pending::Step(member.id.clone(), Step::LeaveGroup),
+                    "POST",
+                    format!(
+                        "bridges/{bridge}/removeChannel?channel={}",
+                        ari::query(&member.channel),
+                    ),
+                ));
+            }
         }
     };
     let Some(sound) = &mut member.sound else {
@@ -2437,8 +2575,12 @@ fn unanswered(cause: Option<i64>) -> Departure {
     }
 }
 
-fn participant_id(number: u64) -> Result<ParticipantId, Fault> {
-    format!("p-{number}")
+/// The identifier of the `number`th participant this controller adds to a
+/// conversation. It carries the controller's run: a participant is never
+/// given an identifier that one before them had, also when a controller
+/// that is started again carries the conversation on.
+fn participant_id(node: &Node, number: u64) -> Result<ParticipantId, Fault> {
+    format!("p-{}-{number}", node.run)
         .parse()
         .map_err(|_| Fault::Asterisk("participant identifier is not valid".into()))
 }

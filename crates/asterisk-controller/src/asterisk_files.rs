@@ -199,6 +199,55 @@ pub fn write(
     Ok(etc.join("asterisk.conf"))
 }
 
+/// The files that follow from the node's settings, and the module of
+/// Asterisk that reads each. These are what changes when the settings do,
+/// and Asterisk takes them in without dropping a call when the module is
+/// reloaded. Everything else follows from the launch alone.
+pub const FROM_SETTINGS: &[(&str, &str)] = &[
+    ("extensions.conf", "pbx_config.so"),
+    ("pjsip.conf", "res_pjsip.so"),
+];
+
+/// The content of the files that follow from settings ([`FROM_SETTINGS`]),
+/// in the same order.
+///
+/// # Errors
+///
+/// Settings that need something the launch did not give.
+pub fn from_settings(config: &Config, settings: &Settings) -> Result<Vec<String>, String> {
+    Ok(vec![dialplan(settings), operators(config, settings)?])
+}
+
+/// The current content of a file of the configuration; empty when there is
+/// none.
+///
+/// # Errors
+///
+/// The file exists and cannot be read.
+pub fn current(config: &Config, name: &str) -> Result<String, String> {
+    let path = config.state.join("etc").join(name);
+    match fs::read_to_string(&path) {
+        Ok(content) => Ok(content),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(error) => Err(format!("{}: {error}", path.display())),
+    }
+}
+
+/// Replace one file of the configuration, whole or not at all: Asterisk
+/// may read it at any moment, and never finds it half written.
+///
+/// # Errors
+///
+/// The file cannot be written.
+pub fn replace(config: &Config, name: &str, content: &str) -> Result<(), String> {
+    let etc = config.state.join("etc");
+    let path = etc.join(name);
+    let written = etc.join(format!(".{name}.new"));
+    let failed = |error: std::io::Error| format!("{}: {error}", path.display());
+    fs::write(&written, content).map_err(failed)?;
+    fs::rename(&written, &path).map_err(failed)
+}
+
 /// Every configuration file, by name.
 fn files(
     config: &Config,

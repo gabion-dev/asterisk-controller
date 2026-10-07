@@ -12,9 +12,10 @@ import tools.jackson.databind.json.JsonMapper;
 /**
  * The Java protocol library against the shared vectors.
  *
- * The same two files — messages and audio frames — are read by the Rust tests of the controller.
- * A message one side accepts and the other refuses, or a frame they decode differently, would be
- * a protocol the two only think they share. This check runs the library — its generated types
+ * The same three files — messages, audio frames and settings fingerprints — are read by the Rust
+ * tests of the controller. A message one side accepts and the other refuses, a frame they decode
+ * differently, or settings they fingerprint differently, would be a protocol the two only think
+ * they share. This check runs the library — its generated types
  * and its hand-written part, compiled by a real compiler — through every vector. The build runs
  * it as part of {@code check}.
  *
@@ -22,6 +23,7 @@ import tools.jackson.databind.json.JsonMapper;
  * package the application chooses.
  *
  * Usage: java VectorCheck <package> <messages.vectors.json> <audio-frames.vectors.json>
+ *        <settings-fingerprint.vectors.json>
  */
 public final class VectorCheck {
 
@@ -30,23 +32,77 @@ public final class VectorCheck {
     private VectorCheck() {}
 
     public static void main(String[] arguments) throws Exception {
-        if (arguments.length != 3) {
-            System.err.println(
-                    "usage: java VectorCheck <package> <messages.vectors.json> <audio-frames.vectors.json>");
+        if (arguments.length != 4) {
+            System.err.println("usage: java VectorCheck <package> <messages.vectors.json> "
+                    + "<audio-frames.vectors.json> <settings-fingerprint.vectors.json>");
             System.exit(2);
         }
         String protocolPackage = arguments[0];
         List<String> problems = new ArrayList<>();
         int messages = checkMessages(protocolPackage, Path.of(arguments[1]), problems);
         int frames = checkFrames(protocolPackage, Path.of(arguments[2]), problems);
+        int fingerprints = checkFingerprints(protocolPackage, Path.of(arguments[3]), problems);
 
         if (!problems.isEmpty()) {
             problems.forEach(System.err::println);
             System.err.println(problems.size() + " problem(s)");
             System.exit(1);
         }
-        System.out.println("Java: " + messages + " message vectors and " + frames
-                + " audio frame vectors hold");
+        System.out.println("Java: " + messages + " message vectors, " + frames
+                + " audio frame vectors and " + fingerprints + " fingerprint vectors hold");
+    }
+
+    /**
+     * Every value must have the canonical text the vector states, the text its digest, and a
+     * value that is settings that digest as its fingerprint.
+     */
+    private static int checkFingerprints(String protocolPackage, Path file, List<String> problems)
+            throws Exception {
+        Class<?> json = Class.forName(protocolPackage + ".ProtocolJson");
+        Method canonical = json.getMethod("canonical", JsonNode.class);
+        Method fingerprint = json.getMethod("fingerprint", Object.class);
+        Method decode = json.getMethod("decode", JsonNode.class, Class.class);
+        Class<?> settingsType = Class.forName(protocolPackage + ".Settings");
+        Class<?> violation = Class.forName(protocolPackage + ".ProtocolViolation");
+        java.security.MessageDigest sha256 = java.security.MessageDigest.getInstance("SHA-256");
+
+        JsonNode vectors = MAPPER.readTree(Files.readString(file)).get("vectors");
+        if (vectors.size() < 5) {
+            problems.add("the fingerprint vector file lost its vectors");
+        }
+        int settingsSeen = 0;
+        for (JsonNode vector : vectors) {
+            String name = vector.get("name").stringValue();
+            JsonNode value = vector.get("value");
+            String expectedText = vector.get("canonical").stringValue();
+            String expectedDigest = vector.get("sha256").stringValue();
+            String written = (String) canonical.invoke(null, value);
+            if (!written.equals(expectedText)) {
+                problems.add(name + ": canonical text is " + written + " instead of " + expectedText);
+            }
+            String digest = HexFormat.of().formatHex(
+                    sha256.digest(expectedText.getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+            if (!digest.equals(expectedDigest)) {
+                problems.add(name + ": the digest of the text differs");
+            }
+            Object settings;
+            try {
+                settings = decode.invoke(null, value, settingsType);
+            } catch (java.lang.reflect.InvocationTargetException e) {
+                if (!violation.isInstance(e.getCause())) {
+                    problems.add(name + ": the library failed: " + e.getCause());
+                }
+                continue;
+            }
+            settingsSeen++;
+            if (!expectedDigest.equals(fingerprint.invoke(null, settings))) {
+                problems.add(name + ": the fingerprint differs");
+            }
+        }
+        if (settingsSeen < 2) {
+            problems.add("the fingerprint vectors lost their settings");
+        }
+        return vectors.size();
     }
 
     private static int checkMessages(String protocolPackage, Path file, List<String> problems)

@@ -1,0 +1,123 @@
+{
+  "description": "Values with their canonical text and its SHA-256, as settings-fingerprint.md defines them. Every implementation must produce exactly this text from the value, and this digest from the text.",
+  "vectors": [
+    {
+      "name": "empty settings",
+      "value": {
+        "operators": [],
+        "lines": [],
+        "entries": [],
+        "prompts": []
+      },
+      "canonical": "{\"entries\":[],\"lines\":[],\"operators\":[],\"prompts\":[]}",
+      "sha256": "7d6c304f8738bd49aa3f28409faea558185c7a799421933f713ded4362bcb52d"
+    },
+    {
+      "name": "settings",
+      "value": {
+        "prompts": [
+          {
+            "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+            "id": "closed"
+          }
+        ],
+        "entries": [
+          {
+            "key": {
+              "type": "dialed_number",
+              "number": "+19715870050"
+            },
+            "fallback": {
+              "type": "message",
+              "prompt": "closed"
+            }
+          },
+          {
+            "fallback": {
+              "answer_limit_ms": 20000,
+              "line": "main",
+              "number": "+15035550101",
+              "type": "transfer"
+            },
+            "key": {
+              "type": "web_passes"
+            }
+          }
+        ],
+        "lines": [
+          {
+            "id": "main",
+            "number": "+19715870050",
+            "operator": "carrier",
+            "allowed_countries": [
+              "US",
+              "CA"
+            ],
+            "concurrent_outbound_limit": 2
+          }
+        ],
+        "operators": [
+          {
+            "id": "carrier",
+            "host": "sip.example.net",
+            "port": 5060,
+            "transport": "udp",
+            "credentials": {
+              "username": "node",
+              "password": "p;a\"s\\s w/o#rd é"
+            },
+            "source_networks": [
+              "192.0.2.0/24",
+              "2001:db8::/32"
+            ],
+            "countries": [
+              "US",
+              "CA"
+            ]
+          }
+        ]
+      },
+      "canonical": "{\"entries\":[{\"fallback\":{\"prompt\":\"closed\",\"type\":\"message\"},\"key\":{\"number\":\"+19715870050\",\"type\":\"dialed_number\"}},{\"fallback\":{\"answer_limit_ms\":20000,\"line\":\"main\",\"number\":\"+15035550101\",\"type\":\"transfer\"},\"key\":{\"type\":\"web_passes\"}}],\"lines\":[{\"allowed_countries\":[\"US\",\"CA\"],\"concurrent_outbound_limit\":2,\"id\":\"main\",\"number\":\"+19715870050\",\"operator\":\"carrier\"}],\"operators\":[{\"countries\":[\"US\",\"CA\"],\"credentials\":{\"password\":\"p;a\\\"s\\\\s w/o#rd é\",\"username\":\"node\"},\"host\":\"sip.example.net\",\"id\":\"carrier\",\"port\":5060,\"source_networks\":[\"192.0.2.0/24\",\"2001:db8::/32\"],\"transport\":\"udp\"}],\"prompts\":[{\"id\":\"closed\",\"sha256\":\"9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08\"}]}",
+      "sha256": "de972ff8bfba80f4ac2ce518eaf45ba4cc1dd3311e3b9bc39ba4ba4eff47a65b"
+    },
+    {
+      "name": "escapes in a string",
+      "value": {
+        "text": "quote \" backslash \\ slash / tab \t newline \n return \r feed \f back \b nul \u0000 unit \u001f delete  é ✓ 😀 separator  "
+      },
+      "canonical": "{\"text\":\"quote \\\" backslash \\\\ slash / tab \\t newline \\n return \\r feed \\f back \\b nul \\u0000 unit \\u001f delete  é ✓ 😀 separator  \"}",
+      "sha256": "48953950848d3790215caa9b4e20fa2620b6335c35f0ae383070719e87802ccc"
+    },
+    {
+      "name": "members ordered by UTF-16 code units",
+      "value": {
+        "": 1,
+        "😀": 2,
+        "b": 3,
+        "a": [
+          3,
+          1,
+          2
+        ],
+        "": 0,
+        "aa": {
+          "z": 0,
+          "y": 1
+        },
+        "A": 4
+      },
+      "canonical": "{\"\":0,\"A\":4,\"a\":[3,1,2],\"aa\":{\"y\":1,\"z\":0},\"b\":3,\"😀\":2,\"\":1}",
+      "sha256": "2a59f2c27b5fba0f0f114e92a0f12bb6114954b2ccc997890c4ef7d1f06daaf5"
+    },
+    {
+      "name": "integers",
+      "value": {
+        "zero": 0,
+        "port": 5060,
+        "largest exact": 9007199254740991
+      },
+      "canonical": "{\"largest exact\":9007199254740991,\"port\":5060,\"zero\":0}",
+      "sha256": "7deaba6940f1342f0dfade9e3e83e78a5260310bc92fdf7282cc1d731e9e7154"
+    }
+  ]
+}

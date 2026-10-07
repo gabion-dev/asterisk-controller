@@ -98,11 +98,12 @@ val vectorCheck by tasks.registering(JavaExec::class) {
 
     val messages = repositoryRoot.file("protocol/messages.vectors.json")
     val audioFrames = repositoryRoot.file("protocol/audio-frames.vectors.json")
-    inputs.files(messages, audioFrames)
+    val fingerprints = repositoryRoot.file("protocol/settings-fingerprint.vectors.json")
+    inputs.files(messages, audioFrames, fingerprints)
 
     classpath = vectors.runtimeClasspath
     mainClass = "VectorCheck"
-    args(protocolPackage, messages.asFile.path, audioFrames.asFile.path)
+    args(protocolPackage, messages.asFile.path, audioFrames.asFile.path, fingerprints.asFile.path)
 }
 
 tasks.check {

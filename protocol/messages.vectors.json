@@ -798,6 +798,7 @@
    "accept": true,
    "json": {
     "type": "report",
+    "id": "7f1c2a8e-3b4d-4e5f-9a6b-1c2d3e4f5a6b",
     "report": {
      "type": "fallback_applied",
      "conversation": "c-1",
@@ -808,6 +809,155 @@
      "fallback": "message",
      "at_unix_ms": 1791226292824
     }
+   }
+  },
+  {
+   "name": "report without an identifier",
+   "type": "NodeMessage",
+   "accept": false,
+   "json": {
+    "type": "report",
+    "report": {
+     "type": "participant_hung_up",
+     "conversation": "c-1",
+     "participant": "p-2",
+     "at_unix_ms": 1791226292824
+    }
+   }
+  },
+  {
+   "name": "settings applied",
+   "type": "NodeMessage",
+   "accept": true,
+   "json": {
+    "type": "settings_applied",
+    "fingerprint": "7d6c304f8738bd49aa3f28409faea558185c7a799421933f713ded4362bcb52d"
+   }
+  },
+  {
+   "name": "settings refused",
+   "type": "NodeMessage",
+   "accept": true,
+   "json": {
+    "type": "settings_refused",
+    "fingerprint": "7d6c304f8738bd49aa3f28409faea558185c7a799421933f713ded4362bcb52d",
+    "problem": "line \"main\" goes through operator \"carrier\", which is not among the operators"
+   }
+  },
+  {
+   "name": "request result: conversation started",
+   "type": "NodeMessage",
+   "accept": true,
+   "json": {
+    "type": "request_result",
+    "id": 3,
+    "outcome": {
+     "type": "conversation_started",
+     "conversation": "c-9"
+    }
+   }
+  },
+  {
+   "name": "welcome",
+   "type": "ApplicationServiceMessage",
+   "accept": true,
+   "json": {
+    "type": "welcome"
+   }
+  },
+  {
+   "name": "refuse: unknown node",
+   "type": "ApplicationServiceMessage",
+   "accept": true,
+   "json": {
+    "type": "refuse",
+    "reason": "unknown_node"
+   }
+  },
+  {
+   "name": "settings for the node",
+   "type": "ApplicationServiceMessage",
+   "accept": true,
+   "json": {
+    "type": "settings",
+    "settings": {
+     "operators": [],
+     "lines": [],
+     "entries": [],
+     "prompts": []
+    }
+   }
+  },
+  {
+   "name": "settings without settings",
+   "type": "ApplicationServiceMessage",
+   "accept": false,
+   "json": {
+    "type": "settings"
+   }
+  },
+  {
+   "name": "settings with settings that break the description",
+   "type": "ApplicationServiceMessage",
+   "accept": false,
+   "json": {
+    "type": "settings",
+    "settings": {
+     "operators": [],
+     "lines": [],
+     "entries": []
+    }
+   }
+  },
+  {
+   "name": "the old signal that settings changed",
+   "type": "ApplicationServiceMessage",
+   "accept": false,
+   "json": {
+    "type": "settings_changed"
+   }
+  },
+  {
+   "name": "report received",
+   "type": "ApplicationServiceMessage",
+   "accept": true,
+   "json": {
+    "type": "report_received",
+    "id": "7f1c2a8e-3b4d-4e5f-9a6b-1c2d3e4f5a6b"
+   }
+  },
+  {
+   "name": "report received without an identifier",
+   "type": "ApplicationServiceMessage",
+   "accept": false,
+   "json": {
+    "type": "report_received"
+   }
+  },
+  {
+   "name": "report that the node started on unconfirmed settings",
+   "type": "NodeMessage",
+   "accept": false,
+   "json": {
+    "type": "report",
+    "id": "r-1",
+    "report": {
+     "type": "settings_unconfirmed",
+     "fingerprint": "7d6c304f8738bd49aa3f28409faea558185c7a799421933f713ded4362bcb52d",
+     "at_unix_ms": 1791226292824
+    }
+   }
+  },
+  {
+   "name": "request: start a conversation",
+   "type": "Request",
+   "accept": true,
+   "json": {
+    "type": "start_conversation",
+    "handler": "secretary",
+    "number": "+15035550101",
+    "line": "main",
+    "answer_limit_ms": 20000
    }
   },
   {
