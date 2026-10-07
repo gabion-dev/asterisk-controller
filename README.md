@@ -22,7 +22,7 @@ away — during a deployment or a restart:
 - a caller who was alone with the application gets the fallback the
   application configured for that entry — a transfer, which the controller
   carries out by calling the fallback's number and connecting the two, or a
-  message, which until the node has prompts is a hang-up;
+  message: a prompt is played to the caller, and the call ends;
 - a participant left with nobody to talk to and nobody in charge is hung up.
 
 It chooses no policy of its own: it carries out what the telephony module
@@ -162,15 +162,26 @@ Out of the settings the controller makes Asterisk's side of them:
   cannot enter while the controller is not connected; it then tries again
   every second, five times, and after that Asterisk carries out the entry's
   fallback by itself: a transfer to the fallback's number on its line, showing
-  the line's number, or a hang-up. The transfer's number is judged when the
+  the line's number, or the prompt of a message, played from its file, and
+  the end of the call. The transfer's number is judged when the
   settings are checked, like any call the node places. It is the only thing
   in the dialplan that dials, and nothing a caller sends chooses it;
 - the operator's identifier, which may be any text, never appears in
   Asterisk's configuration; the name used there is derived from it.
 
-Not made yet: prompts — until then a fallback that is a message is only a
-hang-up; TLS towards an operator (settings carry no certificate
-— such an operator is refused); operators that require registration.
+Prompts — the audio of a message fallback — are named in the settings by
+identifier and by the SHA-256 of their audio. The node fetches each from
+`<address>/prompts/<identifier>` with its credentials while it applies the
+settings, checks the digest, and keeps the file under the digest in
+`<state>/prompts`; settings whose prompts cannot be fetched are refused. The
+audio is the protocol's one format — signed 16-bit PCM, little-endian, mono,
+16 kHz — which Asterisk plays as `sln16` from the file's full path. That is why
+the state directory's path may not hold characters a dialplan step would read
+as something else (a comma, `&`, `$`, brackets, a semicolon): the controller
+refuses to start with one.
+
+Not made yet: TLS towards an operator (settings carry no certificate — such
+an operator is refused); operators that require registration.
 
 ## Outbound calls
 
@@ -212,7 +223,10 @@ address, and then does for the participants what their state calls for:
   it judges any, and connect the caller to whoever answers — a caller who
   still rings is answered at that moment, as a transfer answers them; the two
   are then people connected to each other, kept and handed over as above. A
-  message is a hang-up until the node has prompts;
+  message is played by the dialplan, not by the controller: the caller is
+  sent to the step of their entry where the fallback begins — the steps
+  Asterisk carries out alone when the controller is away — so how a message
+  is played is said in one place;
 - whoever is left with nobody to talk to and nobody in charge is hung up:
   one being called by the lost instance, one it had added beside the
   caller, one of two connected by a fallback when the other leaves.
@@ -445,7 +459,8 @@ the conversation connection through the protocol library, and runs real calls:
 
 - a call that rings, is answered and hung up by the caller;
 - a conversation the handler ends;
-- an application that declines, and one that breaks the protocol;
+- an application that declines — the caller then hears the prompt of their
+  entry's message fallback — and one that breaks the protocol;
 - an application that hears a caller and plays to them;
 - a call that arrives from the operator over SIP, with audio through the trunk;
 - a call from an address that is no operator's, which Asterisk must refuse;
@@ -481,7 +496,8 @@ the conversation connection through the protocol library, and runs real calls:
 - the application gives the node settings on the service connection: the
   node says which settings it stored and is welcomed; the same settings again
   change nothing; settings whose parts disagree are refused whole with the
-  reason; settings with one more entry are taken in while Asterisk runs —
+  reason, and so are settings naming a prompt the application does not
+  serve; settings with one more entry are taken in while Asterisk runs —
   Asterisk reloads without a warning, a call to the new number arrives as a
   conversation, and the settings are stored as their canonical text;
 - an instance that takes a conversation connection and then says nothing at
@@ -554,9 +570,11 @@ other, stands in for an application that is away, and carries on the
 conversations it finds in Asterisk when it is started beside it. It keeps a
 service connection to the application, over TLS with the node's secret,
 applies the settings it is given there while calls go on, and reports what it
-does on its own. Not done yet: recording, holding a participant whose
-connection is lost, prompts, requests of the application on the service
-connection (starting a conversation, browser calls). A command the controller does not carry
+does on its own; a message fallback plays the entry's prompt. Not done yet:
+recording, holding a participant whose connection is lost (decided: the
+controller watches every participant's packet counter in Asterisk), requests
+of the application on the service connection (starting a conversation,
+browser calls). A command the controller does not carry
 out yet ends the conversation with an error that names it; none is accepted
 and ignored. No release has been published.
 
