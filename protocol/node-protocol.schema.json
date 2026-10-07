@@ -2256,7 +2256,7 @@
         "sha256"
       ],
       "additionalProperties": false,
-      "description": "A prompt the node fetches by identifier and keeps; the digest tells it when the audio changed."
+      "description": "A prompt the node fetches by identifier and keeps; the digest tells it when the audio changed. The node fetches it from <application>/prompts/<identifier> (the identifier percent-encoded), with the same credentials as its connections, while it applies the settings; settings whose prompts cannot be fetched, or whose audio does not have the digest, are refused. The audio is the protocol's one format, as raw samples without a header: signed 16-bit linear PCM, little-endian, mono, 16 kHz; the digest is the SHA-256 of those bytes."
     },
     "Settings": {
       "type": "object",

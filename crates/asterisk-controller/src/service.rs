@@ -34,6 +34,7 @@ use crate::{
     asterisk_files::{self, FROM_SETTINGS},
     config::PROTOCOL_VERSION,
     node::Node,
+    prompts,
     settings::{self, Applied},
 };
 
@@ -101,6 +102,18 @@ impl<'a> Service<'a> {
             match service.hear().await? {
                 ApplicationServiceMessage::Welcome => {
                     eprintln!("asterisk-controller: the application welcomed this node");
+                    // Prompts the node should have and has not — its state
+                    // directory lost them — are fetched while it can be.
+                    let applied = node.applied();
+                    if let Err(problem) = prompts::fetch_missing(
+                        &node.config.state,
+                        &node.application,
+                        &applied.settings,
+                    )
+                    .await
+                    {
+                        eprintln!("asterisk-controller: {problem}");
+                    }
                     return Ok(service);
                 }
                 ApplicationServiceMessage::Refuse { reason } => {
@@ -316,6 +329,7 @@ async fn apply(
         settings.lines.len(),
         settings.entries.len(),
     );
+    prompts::forget_unnamed(&node.config.state, &settings);
     node.apply(Applied {
         settings,
         fingerprint: Some(fingerprint),
@@ -334,6 +348,8 @@ async fn apply(
 async fn take_in(node: &Node, asterisk: &Asterisk, settings: &Settings) -> Result<(), String> {
     settings::check(settings)?;
     let config = &node.config;
+    // Settings are not applied until every prompt they name is here.
+    prompts::fetch_missing(&config.state, &node.application, settings).await?;
     let new = asterisk_files::from_settings(config, settings)?;
     let mut changed = Vec::new();
     for ((name, module), content) in FROM_SETTINGS.iter().zip(new) {

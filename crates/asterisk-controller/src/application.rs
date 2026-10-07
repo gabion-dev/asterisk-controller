@@ -17,6 +17,10 @@
 //! platform, with no TLS library of the machine involved. The application's
 //! certificate is judged against the roots the machine trusts.
 //!
+//! The same address and credentials serve the node's plain requests: the
+//! audio of a prompt is fetched from `<address>/prompts/<identifier>`, over
+//! HTTPS when the address is `wss://`.
+//!
 //! Liveness is the protocol's: each side sends a ping at least every
 //! [`PING_EVERY`] and counts a connection lost after [`SILENCE_LIMIT`] with
 //! nothing from the other side. Opening a connection is held to the same
@@ -26,7 +30,20 @@
 use std::{fs, io::ErrorKind, os::unix::fs::PermissionsExt, path::Path, sync::Arc, time::Duration};
 
 use data_encoding::BASE64;
-use tokio::net::TcpStream;
+use http_body_util::{BodyExt, Empty, Limited};
+use hyper::{
+    Request, Uri,
+    body::Bytes,
+    client::conn::http1,
+    header::{CONNECTION, HOST},
+};
+use hyper_util::rt::TokioIo;
+use rustls::pki_types::ServerName;
+use tokio::{
+    io::{AsyncRead, AsyncWrite},
+    net::TcpStream,
+};
+use tokio_rustls::TlsConnector;
 use tokio_tungstenite::{
     Connector, MaybeTlsStream, WebSocketStream, connect_async_tls_with_config,
     tungstenite::{
@@ -71,7 +88,8 @@ impl Endpoint {
 pub struct Application {
     address: String,
     authorization: HeaderValue,
-    connector: Connector,
+    /// TLS towards the application; `None` on the loopback address.
+    tls: Option<Arc<rustls::ClientConfig>>,
 }
 
 impl Application {
@@ -90,15 +108,15 @@ impl Application {
         let mut authorization = HeaderValue::from_str(&format!("Basic {credentials}"))
             .map_err(|error| format!("the node's credentials cannot be sent: {error}"))?;
         authorization.set_sensitive(true);
-        let connector = if config.application_url.starts_with("wss://") {
-            Connector::Rustls(Arc::new(tls()?))
+        let tls = if config.application_url.starts_with("wss://") {
+            Some(Arc::new(tls()?))
         } else {
-            Connector::Plain
+            None
         };
         Ok(Self {
             address: config.application_url.clone(),
             authorization,
-            connector,
+            tls,
         })
     }
 
@@ -117,8 +135,11 @@ impl Application {
         request
             .headers_mut()
             .insert(AUTHORIZATION, self.authorization.clone());
-        let opening =
-            connect_async_tls_with_config(request, None, false, Some(self.connector.clone()));
+        let connector = self
+            .tls
+            .as_ref()
+            .map_or(Connector::Plain, |tls| Connector::Rustls(Arc::clone(tls)));
+        let opening = connect_async_tls_with_config(request, None, false, Some(connector));
         match tokio::time::timeout(SILENCE_LIMIT, opening).await {
             Ok(Ok((socket, _response))) => Ok(socket),
             Ok(Err(error)) => Err(format!("cannot open a connection to {url}: {error}")),
@@ -127,6 +148,89 @@ impl Application {
                 SILENCE_LIMIT.as_secs()
             )),
         }
+    }
+
+    /// Fetch what the application serves at `<address>/<path>`: at most
+    /// `largest` bytes, and within [`SILENCE_LIMIT`].
+    ///
+    /// # Errors
+    ///
+    /// The application cannot be reached, does not answer 200, sends more
+    /// than `largest` bytes, or takes too long; the reason, in words.
+    pub async fn fetch(&self, path: &str, largest: usize) -> Result<Vec<u8>, String> {
+        let url = format!("{}/{path}", self.address);
+        let failed = |problem: &dyn std::fmt::Display| format!("{url}: {problem}");
+        let address: Uri = self.address.parse().map_err(|error| failed(&error))?;
+        let host = address.host().ok_or_else(|| failed(&"no host"))?.to_owned();
+        let port = address
+            .port_u16()
+            .unwrap_or(if self.tls.is_some() { 443 } else { 80 });
+        let target = format!("{}/{path}", address.path().trim_end_matches('/'));
+        let fetching = async {
+            let host_only = host.trim_start_matches('[').trim_end_matches(']');
+            let stream = TcpStream::connect((host_only, port))
+                .await
+                .map_err(|error| failed(&error))?;
+            match &self.tls {
+                Some(tls) => {
+                    let name = ServerName::try_from(host_only.to_owned())
+                        .map_err(|error| failed(&error))?;
+                    let stream = TlsConnector::from(Arc::clone(tls))
+                        .connect(name, stream)
+                        .await
+                        .map_err(|error| failed(&error))?;
+                    self.get(stream, &host, &target, largest).await
+                }
+                None => self.get(stream, &host, &target, largest).await,
+            }
+            .map_err(|problem| failed(&problem))
+        };
+        match tokio::time::timeout(SILENCE_LIMIT, fetching).await {
+            Ok(fetched) => fetched,
+            Err(_) => Err(failed(&format!(
+                "no answer within {} seconds",
+                SILENCE_LIMIT.as_secs()
+            ))),
+        }
+    }
+
+    /// One GET request on an open stream.
+    async fn get<S>(
+        &self,
+        stream: S,
+        host: &str,
+        target: &str,
+        largest: usize,
+    ) -> Result<Vec<u8>, String>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let (mut sender, connection) = http1::handshake(TokioIo::new(stream))
+            .await
+            .map_err(|error| error.to_string())?;
+        // The connection is driven beside the request and ends with it.
+        tokio::spawn(connection);
+        let request = Request::builder()
+            .method("GET")
+            .uri(target)
+            .header(HOST, host)
+            .header(AUTHORIZATION, self.authorization.clone())
+            .header(CONNECTION, "close")
+            .body(Empty::<Bytes>::new())
+            .map_err(|error| error.to_string())?;
+        let response = sender
+            .send_request(request)
+            .await
+            .map_err(|error| error.to_string())?;
+        let status = response.status();
+        if status != hyper::StatusCode::OK {
+            return Err(format!("the application answered {status}"));
+        }
+        let body = Limited::new(response.into_body(), largest)
+            .collect()
+            .await
+            .map_err(|error| format!("{error} (more than {largest} bytes?)"))?;
+        Ok(body.to_bytes().to_vec())
     }
 }
 

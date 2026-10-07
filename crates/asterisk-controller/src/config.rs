@@ -84,7 +84,7 @@ impl Config {
                 "--listen" => listen = Some(loopback(&name, &value)?),
                 "--application" => application_url = Some(application(&value)?),
                 "--asterisk-tree" => asterisk_tree = Some(PathBuf::from(value)),
-                "--state" => state = Some(PathBuf::from(value)),
+                "--state" => state = Some(state_directory(&value)?),
                 "--asterisk-http" => asterisk_http = Some(loopback(&name, &value)?),
                 "--audio-ports" => audio_ports = Some(port_range(&value)?),
                 "--sip" => {
@@ -170,6 +170,23 @@ fn application(value: &str) -> Result<String, String> {
     Ok(value.trim_end_matches('/').to_owned())
 }
 
+/// The state directory. Asterisk plays prompts from files in it, and the
+/// path of a file is written into a dialplan step, where a comma ends an
+/// argument, `&` separates files, `$` and brackets begin an expression and
+/// a semicolon a comment: a path with any of them would be read as
+/// something else.
+fn state_directory(value: &str) -> Result<PathBuf, String> {
+    if value
+        .chars()
+        .any(|character| character.is_control() || ",&;$()[]{}\\\"'|".contains(character))
+    {
+        return Err(format!(
+            "--state {value:?}: the path may not hold control characters or any of              , & ; $ ( ) [ ] {{ }} \\ \" ' | — Asterisk plays prompts from it, and would read              such a path as something else"
+        ));
+    }
+    Ok(PathBuf::from(value))
+}
+
 /// An address that must be on the loopback interface.
 fn loopback(name: &str, value: &str) -> Result<SocketAddr, String> {
     let address: SocketAddr = value
@@ -216,7 +233,15 @@ fn port_range(value: &str) -> Result<(u16, u16), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{application, node_name, port_range};
+    use super::{application, node_name, port_range, state_directory};
+
+    #[test]
+    fn a_state_directory_asterisk_would_misread_is_refused() {
+        assert!(state_directory("/home/user/My Project/.gabion/telephony").is_ok());
+        for path in ["/a,b", "/a&b", "/a$b", "/a;b", "/a(b)", "/a\nb"] {
+            assert!(state_directory(path).is_err(), "{path:?}");
+        }
+    }
 
     #[test]
     fn the_application_is_reached_by_wss_except_on_the_loopback_address() {

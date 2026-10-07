@@ -23,6 +23,7 @@ mod destination;
 mod media;
 mod node;
 mod playout;
+mod prompts;
 mod reports;
 mod service;
 mod settings;
@@ -140,6 +141,13 @@ fn prepare_asterisk(config: &Config) -> Result<(settings::Applied, String, Strin
         None => eprintln!(
             "asterisk-controller: the node has no settings yet: no call enters or leaves it"
         ),
+    }
+    for prompt in prompts::missing(&config.state, &applied.settings) {
+        eprintln!(
+            "asterisk-controller: prompt {:?} is not here; it is fetched when the application \
+             welcomes the node, and until then a message fallback plays nothing",
+            prompt.id.as_str()
+        );
     }
     eprintln!(
         "asterisk-controller: Asterisk {} is to be started with {}",

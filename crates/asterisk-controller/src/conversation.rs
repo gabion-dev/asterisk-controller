@@ -65,7 +65,7 @@ use crate::{
     application::{Endpoint, PING_EVERY, SILENCE_LIMIT, Socket as ApplicationSocket},
     ari,
     asterisk::{FromAsterisk, Line},
-    asterisk_files::{APPLICATION, operator_name},
+    asterisk_files::{APPLICATION, FALLBACK_LABEL, NETWORK_CONTEXT, operator_name},
     config::PROTOCOL_VERSION,
     destination,
     media::{self, FromMedia},
@@ -414,6 +414,8 @@ enum Pending {
     Group,
     /// Whether a participant found at a restart is still there.
     Exists(ParticipantId),
+    /// A caller sent to the message of their entry's fallback: the channel.
+    Message(String),
     /// Housekeeping of the controller; nobody waits for the answer.
     Internal,
 }
@@ -1202,8 +1204,7 @@ impl Conversation {
                     self.hang_up(|_| true);
                 }
             }
-            // The node has no prompts yet: a fallback that is a message is
-            // only a hang-up.
+            Some(Fallback::Message { .. }) if is_here => self.play_message(caller),
             Some(Fallback::Transfer { .. } | Fallback::Message { .. }) | None => {
                 eprintln!(
                     "conversation {}: nobody is connected and there is no application; everyone is hung up",
@@ -1213,6 +1214,49 @@ impl Conversation {
             }
         }
         Ok(())
+    }
+
+    /// Give the caller the message of their entry's fallback: the controller
+    /// sends them to the step of the dialplan where the fallback begins —
+    /// the same steps Asterisk carries out alone when the controller is
+    /// away — and the message is played and the call ended there. Anyone
+    /// else the application had called is hung up: the fallback is the
+    /// caller's.
+    fn play_message(&mut self, caller: &ParticipantId) {
+        let Origin::DialedNumber { dialed } = &self.origin else {
+            self.hang_up(|_| true);
+            return;
+        };
+        let dialed = dialed.as_str().to_owned();
+        self.hang_up(|member| member.id != *caller);
+        let Some(member) = self.member(caller) else {
+            return;
+        };
+        // From here on the call is the dialplan's, not the conversation's.
+        member.removed_by_us = true;
+        let channel = member.channel.clone();
+        self.ask(
+            Pending::Message(channel.clone()),
+            "POST",
+            &format!(
+                "channels/{}/continue?context={}&extension={}&label={}",
+                ari::query(&channel),
+                ari::query(NETWORK_CONTEXT),
+                ari::query(&dialed),
+                ari::query(FALLBACK_LABEL),
+            ),
+        );
+        eprintln!(
+            "conversation {}: the caller is given the message of their entry's fallback",
+            self.id
+        );
+        let origin = self.origin.clone();
+        self.keep_report(|conversation, at_unix_ms| Report::FallbackApplied {
+            conversation,
+            origin,
+            fallback: FallbackKind::Message,
+            at_unix_ms,
+        });
     }
 
     /// The fallback's transfer is done: the caller and the one who was
@@ -1373,7 +1417,18 @@ impl Conversation {
                     participant.as_str()
                 ))),
             },
-            Some(Pending::Group | Pending::Internal) | None => Ok(()),
+            // A caller Asterisk would not send to the message is not left on
+            // a line nobody controls.
+            Some(Pending::Message(channel)) if !(200..=299).contains(&status_code) => {
+                eprintln!(
+                    "conversation {}: Asterisk answered {status_code} when asked to play the \
+                     message of the fallback ({body}); the caller is hung up",
+                    self.id
+                );
+                self.ask(Pending::Internal, "DELETE", &format!("channels/{channel}"));
+                Ok(())
+            }
+            Some(Pending::Group | Pending::Internal | Pending::Message(_)) | None => Ok(()),
         }
     }
 

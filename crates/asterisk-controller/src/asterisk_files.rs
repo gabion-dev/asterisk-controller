@@ -21,7 +21,7 @@ use std::{
 use node_protocol::messages::{EntryKey, Fallback, Operator, Settings, SipTransport};
 use sha2::{Digest, Sha256};
 
-use crate::{config::Config, destination, media};
+use crate::{config::Config, destination, media, prompts};
 
 /// The Asterisk versions this controller knows how to drive. What Asterisk
 /// says about its channels, what its media channel does and how its
@@ -44,6 +44,9 @@ const ENTRY_TRIES: u32 = 5;
 /// The dialplan context calls from telephone operators arrive in. Nothing
 /// in it leads back out to the network.
 pub const NETWORK_CONTEXT: &str = "gabion-from-network";
+/// The label of the step of an entry where its fallback begins.
+pub const FALLBACK_LABEL: &str = "fallback";
+const FALLBACK_STEP: &str = "(fallback)";
 
 /// Files Asterisk looks for and the node has nothing to say in. They exist
 /// so that Asterisk finds them: a missing optional file is reported as an
@@ -215,7 +218,10 @@ pub const FROM_SETTINGS: &[(&str, &str)] = &[
 ///
 /// Settings that need something the launch did not give.
 pub fn from_settings(config: &Config, settings: &Settings) -> Result<Vec<String>, String> {
-    Ok(vec![dialplan(settings), operators(config, settings)?])
+    Ok(vec![
+        dialplan(config, settings),
+        operators(config, settings)?,
+    ])
 }
 
 /// The current content of a file of the configuration; empty when there is
@@ -292,7 +298,7 @@ fn files(
         ),
         ("ari.conf", control_interface(secret)),
         ("websocket_client.conf", connections(config)),
-        ("extensions.conf", dialplan(settings)),
+        ("extensions.conf", dialplan(config, settings)),
         ("pjsip.conf", operators(config, settings)?),
     ];
     files.extend(EMPTY_FILES.iter().map(|name| (*name, String::new())));
@@ -370,7 +376,7 @@ fn connections(config: &Config) -> String {
 /// The only rule here that dials is a fallback's transfer, to the one
 /// number the settings give it, on the line they give it. Nothing a caller
 /// sends chooses where a call goes.
-fn dialplan(settings: &Settings) -> String {
+fn dialplan(config: &Config, settings: &Settings) -> String {
     let mut text = format!("[{NETWORK_CONTEXT}]\n");
     for entry in &settings.entries {
         match &entry.key {
@@ -383,9 +389,9 @@ fn dialplan(settings: &Settings) -> String {
                     format!("GotoIf($[${{GABION_TRIES}} >= {ENTRY_TRIES}]?fallback)"),
                     "Wait(1)".to_owned(),
                     "Goto(enter)".to_owned(),
-                    "NoOp(no controller: the fallback of the entry)".to_owned(),
+                    "NoOp(the fallback of the entry)".to_owned(),
                 ];
-                steps.extend(fallback(settings, &entry.fallback));
+                steps.extend(fallback(config, settings, &entry.fallback));
                 steps.push("Hangup()".to_owned());
 
                 let _ = writeln!(text, "exten = {number},1,Set(GABION_TRIES=0)");
@@ -394,7 +400,7 @@ fn dialplan(settings: &Settings) -> String {
                     // The steps the others jump to are the ones with names.
                     let name = match position {
                         0 => "(enter)",
-                        6 => "(fallback)",
+                        6 => FALLBACK_STEP,
                         _ if position == last => "(done)",
                         _ => "",
                     };
@@ -408,8 +414,11 @@ fn dialplan(settings: &Settings) -> String {
     text
 }
 
-/// The dialplan steps that carry out a fallback without the controller.
-fn fallback(settings: &Settings, fallback: &Fallback) -> Vec<String> {
+/// The dialplan steps that carry out a fallback — by Asterisk alone when
+/// the controller is away, and for the controller when the application is:
+/// it sends a caller here rather than play the message itself, so how a
+/// message is played is said in one place.
+fn fallback(config: &Config, settings: &Settings, fallback: &Fallback) -> Vec<String> {
     match fallback {
         Fallback::Transfer {
             number,
@@ -431,9 +440,19 @@ fn fallback(settings: &Settings, fallback: &Fallback) -> Vec<String> {
             // through is not dialled.
             Err(_) => Vec::new(),
         },
-        // The prompt is played when the node has prompts; until it can
-        // fetch them the caller is only hung up on.
-        Fallback::Message { .. } => Vec::new(),
+        // The prompt is played from its file; playing answers the caller.
+        Fallback::Message { prompt } => settings
+            .prompts
+            .iter()
+            .find(|named| named.id == *prompt)
+            .map(|named| {
+                vec![format!(
+                    "Playback({})",
+                    prompts::playable(&config.state, named).display()
+                )]
+            })
+            // Checked settings name only prompts they have.
+            .unwrap_or_default(),
     }
 }
 
@@ -681,6 +700,7 @@ mod tests {
 
     #[test]
     fn an_entry_tries_the_application_and_falls_back_when_it_cannot_enter() -> TestResult {
+        let playback = format!(" same = n,Playback(/state/prompts/{})", "0".repeat(64));
         let files = files(
             &config(Some("203.0.113.5:5060"))?,
             &tree(),
@@ -698,7 +718,8 @@ mod tests {
                 " same = n,GotoIf($[${GABION_TRIES} >= 5]?fallback)",
                 " same = n,Wait(1)",
                 " same = n,Goto(enter)",
-                " same = n(fallback),NoOp(no controller: the fallback of the entry)",
+                " same = n(fallback),NoOp(the fallback of the entry)",
+                playback.as_str(),
                 " same = n(done),Hangup()",
                 "",
             ]
@@ -734,7 +755,7 @@ mod tests {
         )?;
         let dialplan = file(&files, "extensions.conf");
         let expected = format!(
-            " same = n(fallback),NoOp(no controller: the fallback of the entry)\n \
+            " same = n(fallback),NoOp(the fallback of the entry)\n \
              same = n,Set(CALLERID(num)=+19715870050)\n \
              same = n,Dial(PJSIP/+15035550100@{},21)\n \
              same = n(done),Hangup()\n",

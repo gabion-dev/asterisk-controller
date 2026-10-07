@@ -84,6 +84,9 @@ const NODE_SECRET: &str = "the secret of the test node";
 /// controller counts it lost — the protocol's rule.
 const SILENCE_LIMIT: Duration = Duration::from_secs(30);
 
+/// The tone of the test's prompt, Hz.
+const PROMPT_SAYS: u32 = 600;
+
 /// The number of the node's one entry.
 const DIALED: &str = "+19715870050";
 /// The same, as it is written inside an address.
@@ -163,8 +166,7 @@ fn settings(operator_port: u16) -> serde_json::Value {
             "allowed_countries": ["US"],
             "concurrent_outbound_limit": 2
         }],
-        // Two entries, for the two things a fallback can be. The node has
-        // no prompts yet, so a message is only a hang-up.
+        // Two entries, for the two things a fallback can be.
         "entries": [
             {
                 "key": { "type": "dialed_number", "number": DIALED },
@@ -178,7 +180,7 @@ fn settings(operator_port: u16) -> serde_json::Value {
                 }
             }
         ],
-        "prompts": [{ "id": "closed", "sha256": "0".repeat(64) }]
+        "prompts": [{ "id": "closed", "sha256": node_protocol::sha256_hex(&prompt_audio()) }]
     })
 }
 
@@ -925,6 +927,15 @@ async fn accept_connections(listener: TcpListener, queues: Queues) {
         let queues = queues.clone();
         let expected = expected.clone();
         tokio::spawn(async move {
+            // A request that is not an upgrade to WebSocket is the node
+            // fetching a prompt.
+            let Some(head) = request_head(&stream).await else {
+                return;
+            };
+            if !head.to_ascii_lowercase().contains("upgrade: websocket") {
+                serve_plain(stream, &head, &expected).await;
+                return;
+            }
             let path = Arc::new(std::sync::Mutex::new(String::new()));
             let seen = Arc::clone(&path);
             #[expect(
@@ -965,6 +976,54 @@ async fn accept_connections(listener: TcpListener, queues: Queues) {
             let _ = queue.send(connection);
         });
     }
+}
+
+/// The head of the request on a connection, looked at without taking it off.
+async fn request_head(stream: &TcpStream) -> Option<String> {
+    let mut seen = vec![0_u8; 8192];
+    loop {
+        let length = timeout(STEP, stream.peek(&mut seen)).await.ok()?.ok()?;
+        let text = String::from_utf8_lossy(seen.get(..length)?).into_owned();
+        if let Some(end) = text.find("\r\n\r\n") {
+            return text.get(..end + 4).map(str::to_owned);
+        }
+        if length == seen.len() {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// Answer a plain request: the audio of the test's prompt to the node that
+/// proves itself, nothing to anyone else.
+async fn serve_plain(mut stream: TcpStream, head: &str, expected: &str) {
+    let mut taken = vec![0_u8; head.len()];
+    if stream.read_exact(&mut taken).await.is_err() {
+        return;
+    }
+    let proved = head.lines().any(|line| {
+        line.split_once(':').is_some_and(|(name, value)| {
+            name.eq_ignore_ascii_case("authorization") && value.trim() == expected
+        })
+    });
+    let path = head.split_whitespace().nth(1).unwrap_or_default();
+    let (status, body) = match (proved, path) {
+        (false, _) => ("401 Unauthorized", Vec::new()),
+        (true, "/prompts/closed") => ("200 OK", prompt_audio()),
+        (true, _) => ("404 Not Found", Vec::new()),
+    };
+    let answer = format!(
+        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let _ = stream.write_all(answer.as_bytes()).await;
+    let _ = stream.write_all(&body).await;
+}
+
+/// The audio of the test's one prompt: a second of a steady tone, in the
+/// protocol's format.
+fn prompt_audio() -> Vec<u8> {
+    to_bytes(&tone(PROMPT_SAYS, 16_000, 0, 16_000))
 }
 
 /// What arrives on a conversation connection, as the test reads it.
@@ -1266,6 +1325,16 @@ impl ServiceEnd {
 
 fn is_hang_up(report: &Report) -> bool {
     matches!(report, Report::ParticipantHungUp { .. })
+}
+
+fn is_message(report: &Report) -> bool {
+    matches!(
+        report,
+        Report::FallbackApplied {
+            fallback: node_protocol::messages::FallbackKind::Message,
+            ..
+        }
+    )
 }
 
 /// The telephone network of the test: a second Asterisk.
@@ -1765,15 +1834,16 @@ async fn ended_by_the_handler(stand: &Stand) -> TestResult {
 
 /// The application declines the conversation: nobody is left on the line.
 async fn declined(stand: &Stand) -> TestResult {
-    let (_caller, mut owner) = stand.call().await?;
+    let (_caller, mut phone, mut owner) = stand.call_from_a_phone().await?;
     owner.next().await?;
     owner.send(&ApplicationMessage::Decline {
         reason: DeclineReason::NoHandler,
     })?;
     owner.closed().await?;
-    // The entry's fallback is a message the node cannot say yet: the node
-    // hung up on the caller by itself, and says so.
-    stand.reported("a declined call", true, is_hang_up).await?;
+    // The entry's fallback is a message: the caller hears the prompt, then
+    // the call ends — and the node says it did that by itself.
+    stand.reported("a declined call", true, is_message).await?;
+    phone.hears(PROMPT_SAYS, true).await?;
     stand.expect_no_channels("after a declined call").await
 }
 
@@ -3165,7 +3235,7 @@ async fn a_caller_alone_loses_the_application(stand: &Stand) -> TestResult {
     })?;
     owner.closed().await?;
     stand
-        .reported("a caller alone who lost the application", true, is_hang_up)
+        .reported("a caller alone who lost the application", true, is_message)
         .await?;
     stand
         .expect_no_channels("after a caller alone lost the application")
@@ -3753,6 +3823,26 @@ async fn the_application_gives_the_node_its_settings(stand: &Stand) -> TestResul
         "settings whose parts disagree were answered {answer:?}"
     );
 
+    // A prompt the application does not serve: the settings are refused.
+    let mut unfetchable = settings(stand.operator_port);
+    *unfetchable
+        .pointer_mut("/prompts/0/id")
+        .ok_or("the settings have no prompt")? = serde_json::json!("nowhere");
+    // Other audio than the node has: the node must fetch it.
+    *unfetchable
+        .pointer_mut("/prompts/0/sha256")
+        .ok_or("the settings have no prompt")? = serde_json::json!("1".repeat(64));
+    *unfetchable
+        .pointer_mut("/entries/0/fallback/prompt")
+        .ok_or("the settings have no message fallback")? = serde_json::json!("nowhere");
+    let unfetchable: Settings = node_protocol::decode_value(unfetchable)?;
+    let answer = service.give(unfetchable).await?;
+    assert!(
+        matches!(&answer, NodeMessage::SettingsRefused { problem, .. }
+            if problem.as_str().contains("cannot be fetched")),
+        "settings with a prompt nobody serves were answered {answer:?}"
+    );
+
     let later = settings_with_a_later_entry(stand.operator_port)?;
     let later_fingerprint = node_protocol::fingerprint(&later)?;
     let answer = service.give(later).await?;
@@ -3784,7 +3874,7 @@ async fn the_application_gives_the_node_its_settings(stand: &Stand) -> TestResul
     })?;
     owner.closed().await?;
     service
-        .reported("a declined call to the new entry", true, is_hang_up)
+        .reported("a declined call to the new entry", true, is_message)
         .await?;
     stand
         .expect_no_channels("after a call to an entry added while the node ran")
@@ -3832,7 +3922,7 @@ async fn a_silent_instance_is_no_owner(stand: &Stand) -> TestResult {
         "a silent instance was not pinged every ten seconds until the silence ran out"
     );
     stand
-        .reported("a caller left with a silent instance", true, is_hang_up)
+        .reported("a caller left with a silent instance", true, is_message)
         .await?;
     stand
         .expect_no_channels("after an instance that said nothing")
