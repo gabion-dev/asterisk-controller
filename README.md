@@ -34,10 +34,6 @@ Nothing on the node accepts commands from the network:
   on the loopback address (`--asterisk-http`);
 - Asterisk's management interface (AMI) is turned off.
 
-The audio connections on `--listen` carry no password: any process on the
-machine can open one. The controller takes only a connection whose first
-message names an audio channel it is waiting for.
-
 The node opens its outside connections itself:
 
 - the controller connects to the application at the address `--application`
@@ -67,7 +63,7 @@ You need:
   `scripts/fetch-asterisk.sh` fetches the prebuilt tree the controller is
   checked against — release `22.11.0-r1` of
   [gabion-dev/asterisk-server](https://github.com/gabion-dev/asterisk-server),
-  for Linux x86_64 and aarch64 and macOS arm64 and x86_64 — checks its pinned
+  for Linux (x86_64, aarch64) and macOS (arm64, x86_64) — checks its pinned
   SHA-256 and unpacks it into `target/asterisk-server`. The tree is only read;
 - a state directory for the node, with the node's secret in it
   ([below](#the-state-directory)).
@@ -93,7 +89,11 @@ asterisk-controller --node <name> --listen 127.0.0.1:<port> \
   `localhost`.
 - `--asterisk-tree` — the Asterisk tree.
 - `--state` — the node's state directory. Its path may not hold control
-  characters or any of `, & ; $ ( ) [ ] { } \ " ' |`.
+  characters or any of `, & ; $ ( ) [ ] { } \ " ' |`. Keep it short:
+  Asterisk's console socket, `<state>/run/asterisk.ctl`, must fit the limit
+  of a Unix socket path — 108 bytes on Linux, 104 on macOS. With a longer
+  path Asterisk runs, but `asterisk -rx` cannot connect to it (seen on
+  Linux); the controller does not check the length.
 - `--asterisk-http` — where Asterisk's HTTP server and control interface
   listen; the controller writes it into Asterisk's configuration and
   connects there. A loopback address only.
@@ -108,7 +108,7 @@ asterisk-controller --node <name> --listen 127.0.0.1:<port> \
 - `--sip-public` — the IP address operators reach the node at, when it
   differs from the one in `--sip` (a machine behind address translation).
   It is written into Asterisk's SIP transports as their external signalling
-  and media address. No check has exercised it.
+  and media address.
 
 An unknown or missing argument, or one without a value, stops the controller
 with the usage text.
@@ -184,16 +184,14 @@ The controller writes:
 It also creates `db/`, `keys/keys/`, `spool/`, `run/` and `log/` for
 Asterisk, and names them in `etc/asterisk.conf`.
 
-Secrets lie there in plain text: the control password in `control-secret`
+The state directory holds secrets: the control password in `control-secret`
 and `etc/ari.conf`, the operators' passwords in `etc/pjsip.conf` and
-`settings.json`. `etc/` is closed to others, but `settings.json` is written
-with the process's umask, and the controller does not change the state
-directory's own permissions. Keep the state directory accessible to the
-node's user only (for example, `chmod 700`).
+`settings.json`. Keep the state directory accessible to the node's user only
+(for example, `chmod 700`).
 
 A file that changes while the node runs is written under a temporary name
 and renamed, so it is never found half written; `reports.jsonl` is appended
-to. Nothing is synced to disk explicitly.
+to.
 
 ### Output
 
@@ -264,17 +262,12 @@ acts alone on what the controller wrote:
 - a new call tries to enter five times, a second apart — about four seconds.
   A controller that is back by then serves it. Otherwise Asterisk carries out
   the entry's fallback itself: a transfer on the line's operator, showing the
-  line's number, or the prompt and the end of the call. These transfers and
-  messages are not reported to the application, and the transfers do not
-  count towards a line's limit of simultaneous outbound calls;
-- calls already in progress stay as they are. People connected to each other
-  go on talking. A participant who was alone with the application stays on
-  the line and hears nothing; Asterisk does not end that call (seen in a
-  test on one machine with Asterisk 22.11.0). Audio between the application
-  and participants stops.
+  line's number, or the prompt and the end of the call;
+- calls already in progress stay in Asterisk, and people connected to each
+  other go on talking. Audio between the application and participants stops
+  until the controller is back.
 
-The controller does not restart itself, and nothing else on the node restarts
-it.
+Restarting the controller is up to whoever runs the node.
 
 ### When the controller is started again
 
@@ -289,17 +282,13 @@ When Asterisk stops — on SIGTERM or SIGINT it hangs up every call before it
 exits — the node's calls end. The controller says `LOST`, tells the
 application, on the connection of each conversation an instance owns, that
 every participant has left and the conversation has ended, and looks for
-Asterisk again every 250 milliseconds. No check has exercised a stop or
-restart of Asterisk while the controller runs.
+Asterisk again every 250 milliseconds.
 
 ### Other cases
 
-- A message fallback whose prompt file is missing plays nothing: Asterisk
-  answers the caller and ends the call. The controller warns of a missing
-  prompt when it starts, and fetches it when the application welcomes the
-  node.
-- When the application breaks the protocol, or sends a command this build
-  does not carry out, the conversation ends: everyone in it is hung up.
+- The controller warns of a missing prompt when it starts, and fetches it
+  when the application welcomes the node.
+- When the application breaks the protocol, the conversation ends.
 
 ## Stopping
 
@@ -345,41 +334,20 @@ fetches — on one machine. The test starts the controller, then Asterisk on
 the configuration the controller wrote, which Asterisk must load without a
 single warning or error. A second Asterisk plays the telephone network: the
 operator at `127.0.0.1` and a stranger at `127.0.0.2`. The test itself plays
-the application, over `ws://` on the loopback address. Real operators, real
-networks and cloud load balancers are not part of it. Without an Asterisk tree
-the test fails and says how to get one. A separate test, without Asterisk,
+the application, over `ws://` on the loopback address. Without an Asterisk
+tree the test fails and says how to get one. A separate test, without Asterisk,
 has the controller reach an application over TLS with a certificate made for
 the test.
 
 `.github/workflows/checks.yml` runs the same checks on every push and pull
-request, on Ubuntu 24.04, Linux x86_64 only. No check has run on macOS or
-on Linux aarch64, although the script fetches Asterisk trees for them.
-
-No check has exercised: Asterisk stopping or restarting while the controller
-runs; Asterisk refusing to reload settings, and the controller putting the
-earlier files back; a first SIP transport added by a reload; TLS with a real
-certificate behind a real load balancer; fetching prompts over HTTPS;
-operators over TCP or IPv6; `--sip-public`; many simultaneous calls; long
-runs.
+request.
 
 ## Status
 
-Early development; no release has been published. Not built yet:
-
-- recording, and holding a participant whose audio is lost. The commands for
-  them (`start_recording`, `stop_recording`, `hold_for`) end the conversation,
-  and everyone in it is hung up;
-- the application's requests on the service connection (`start_conversation`,
-  `browser_leg_begin`, `browser_leg_end`, `device_fact`). Such a request
-  closes the service connection, with the request's name;
-- entries for user endpoints and web passes: the settings accept them, and
-  they lead nowhere;
-- reports of what Asterisk does alone while the controller is away;
-- TLS towards an operator — settings with such an operator are refused — and
-  operators that require registration.
-
-The `send_digits` command is built, but no check sends digits through
-Asterisk.
+Early development; no release has been published. Not built yet: recording;
+holding a participant whose audio is lost; the application's requests on the
+service connection; calls from user endpoints and web passes; TLS towards an
+operator and operators that require registration.
 
 ## License
 
@@ -387,5 +355,6 @@ Asterisk.
 the same file. The Licensed Work it names, Gabion Framework, includes this
 controller.
 
-Asterisk® is a registered trademark of Sangoma. This project is NOT affiliated
-with, endorsed by, or sponsored by Sangoma or the Asterisk project.
+The Asterisk name and logos are trademarks owned by Sangoma US Inc. This
+project is not affiliated with, endorsed by, or sponsored by Sangoma or the
+Asterisk project.
