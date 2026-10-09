@@ -314,7 +314,9 @@ fn network_dialplan() -> String {
 /// silence included; a channel of this test network that nobody speaks into
 /// sends nothing. So the operator's calls keep their audio alive with a
 /// packet a second (`rtp_keepalive`) — except through `the-node-quiet`, the
-/// same operator's side for a call whose audio is to stop.
+/// same operator's side for a call whose audio is to stop, and which puts
+/// the call on hold as a telephone does: by telling the node
+/// (`moh_passthrough`), not by playing music of its own.
 fn network_sides(ports: &NetworkPorts) -> String {
     let side = |name: &str, transport: &str, more: &str| {
         format!(
@@ -342,7 +344,7 @@ fn network_sides(ports: &NetworkPorts) -> String {
             "auth = the-node-credentials\nrtp_keepalive = 1\n"
         ),
         side("the-node-from-elsewhere", "stranger", ""),
-        side("the-node-quiet", "operator", ""),
+        side("the-node-quiet", "operator", "moh_passthrough = yes\n"),
         OPERATOR_PASSWORD.replace(';', "\\;"),
     )
 }
@@ -3765,6 +3767,18 @@ async fn digits_go_both_ways(
         pressed.0 == *participant && pressed.1.as_str() == "5",
         "the caller pressed 5 and the application was told {pressed:?}"
     );
+    // The network's Asterisk reports a digit that arrives back to back with
+    // the one before twice while its channel is in a bridge — "122##" for
+    // "12#" — and once otherwise; the node sends them once either way
+    // (digits sent one at a time arrive once in the bridge too). So the
+    // caller's end listens outside its bridge, and goes back after.
+    let network = &stand.network.control;
+    network
+        .request(
+            "POST",
+            &format!("bridges/the-callers-phone/removeChannel?channel={caller}"),
+        )
+        .await?;
     owner.command(
         id,
         Command::SendDigits {
@@ -3777,8 +3791,14 @@ async fn digits_go_both_ways(
         matches!(outcome, CommandOutcome::Accepted),
         "`send_digits` was {outcome:?}"
     );
-    let heard = stand.network.control.digits_heard(caller, 3).await?;
+    let heard = network.digits_heard(caller, 3).await?;
     assert_eq!(heard, "12#", "the caller's network heard other digits");
+    network
+        .request(
+            "POST",
+            &format!("bridges/the-callers-phone/addChannel?channel={caller}"),
+        )
+        .await?;
     Ok(())
 }
 
