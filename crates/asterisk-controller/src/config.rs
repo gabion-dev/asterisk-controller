@@ -18,7 +18,8 @@ pub const PROTOCOL_VERSION: u64 = 1;
 const USAGE: &str = "usage: asterisk-controller \
     --node <name> --listen <127.0.0.1:port> --application <wss://host[:port][/path]> \
     --asterisk-tree <directory> --state <directory> --asterisk-http <127.0.0.1:port> \
-    --audio-ports <first>-<last> [--sip <address:port>] [--sip-public <address>]";
+    --audio-ports <first>-<last> [--sip <address:port>] [--sip-public <address>] \
+    [--sip-tls <address:port> --sip-tls-certificate <file> --sip-tls-key <file>]";
 
 /// Everything the controller is told at start.
 #[derive(Clone, Debug)]
@@ -54,6 +55,23 @@ pub struct Config {
     /// The address operators reach this node at, when it differs from the
     /// one Asterisk listens on — a machine behind address translation.
     pub sip_public: Option<IpAddr>,
+    /// Where Asterisk listens for operators over TLS, with the node's
+    /// certificate. Needed only when the settings name an operator reached
+    /// over TLS.
+    pub sip_tls: Option<SipTls>,
+}
+
+/// Where Asterisk listens for operators over TLS, and what it proves the
+/// node with: a certificate and its private key, in files whoever runs the
+/// node keeps — and renews in place.
+#[derive(Clone, Debug)]
+pub struct SipTls {
+    /// The address and port.
+    pub address: SocketAddr,
+    /// The node's certificate, PEM.
+    pub certificate: PathBuf,
+    /// Its private key, PEM.
+    pub key: PathBuf,
 }
 
 impl Config {
@@ -73,6 +91,9 @@ impl Config {
         let mut audio_ports = None;
         let mut sip = None;
         let mut sip_public = None;
+        let mut sip_tls = None;
+        let mut sip_tls_certificate = None;
+        let mut sip_tls_key = None;
 
         let mut arguments = arguments;
         while let Some(name) = arguments.next() {
@@ -101,11 +122,35 @@ impl Config {
                             .map_err(|error| format!("--sip-public {value}: {error}\n{USAGE}"))?,
                     );
                 }
+                "--sip-tls" => {
+                    sip_tls = Some(
+                        value
+                            .parse()
+                            .map_err(|error| format!("--sip-tls {value}: {error}\n{USAGE}"))?,
+                    );
+                }
+                "--sip-tls-certificate" => sip_tls_certificate = Some(file(&name, &value)?),
+                "--sip-tls-key" => sip_tls_key = Some(file(&name, &value)?),
                 other => return Err(format!("unknown argument {other}\n{USAGE}")),
             }
         }
 
         let missing = |name: &str| format!("{name} is missing\n{USAGE}");
+        // TLS is the three of them or none: an address without the node's
+        // certificate could not be listened on.
+        let sip_tls = match (sip_tls, sip_tls_certificate, sip_tls_key) {
+            (Some(address), Some(certificate), Some(key)) => Some(SipTls {
+                address,
+                certificate,
+                key,
+            }),
+            (None, None, None) => None,
+            _ => {
+                return Err(format!(
+                    "--sip-tls, --sip-tls-certificate and --sip-tls-key go together\n{USAGE}"
+                ));
+            }
+        };
         Ok(Self {
             node: node.ok_or_else(|| missing("--node"))?,
             listen: listen.ok_or_else(|| missing("--listen"))?,
@@ -116,8 +161,29 @@ impl Config {
             audio_ports: audio_ports.ok_or_else(|| missing("--audio-ports"))?,
             sip,
             sip_public,
+            sip_tls,
         })
     }
+}
+
+/// A file Asterisk is told to read: an absolute path — Asterisk would read
+/// a relative one from wherever it was started — that its configuration can
+/// carry as itself.
+fn file(name: &str, value: &str) -> Result<PathBuf, String> {
+    let path = PathBuf::from(value);
+    if !path.is_absolute() {
+        return Err(format!(
+            "{name} {value:?}: the path must be absolute — Asterisk reads it, and would read a \
+             relative one from wherever it was started"
+        ));
+    }
+    if value.chars().any(char::is_control) || value.trim() != value {
+        return Err(format!(
+            "{name} {value:?}: a path with control characters or spaces at its ends is not one \
+             Asterisk's configuration can carry"
+        ));
+    }
+    Ok(path)
 }
 
 /// A node name: what may travel as the user name of HTTP Basic
@@ -273,7 +339,8 @@ fn port_range(value: &str) -> Result<(u16, u16), String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CONSOLE_SOCKET, LONGEST_SOCKET_PATH, application, node_name, port_range, state_directory,
+        CONSOLE_SOCKET, Config, LONGEST_SOCKET_PATH, application, node_name, port_range,
+        state_directory,
     };
 
     #[test]
@@ -341,6 +408,56 @@ mod tests {
     fn an_even_last_port_is_refused() {
         assert!(port_range("4100-4198").is_err());
         assert!(port_range("4100-4100").is_err());
+    }
+
+    /// The arguments every launch has, and then `more`.
+    fn launched_with(more: &[&str]) -> Result<Config, String> {
+        let arguments = [
+            "--node",
+            "n",
+            "--listen",
+            "127.0.0.1:4000",
+            "--application",
+            "ws://127.0.0.1:4001",
+            "--asterisk-tree",
+            "/tree",
+            "--state",
+            "/state",
+            "--asterisk-http",
+            "127.0.0.1:4002",
+            "--audio-ports",
+            "4100-4199",
+        ]
+        .iter()
+        .chain(more)
+        .map(|argument| (*argument).to_owned());
+        Config::from_arguments(arguments)
+    }
+
+    #[test]
+    fn tls_towards_operators_is_an_address_with_the_nodes_certificate_or_nothing() {
+        let tls = [
+            "--sip-tls",
+            "0.0.0.0:5061",
+            "--sip-tls-certificate",
+            "/etc/node/cert.pem",
+            "--sip-tls-key",
+            "/etc/node/key.pem",
+        ];
+        assert!(launched_with(&tls).is_ok_and(|config| config.sip_tls.is_some()));
+        assert!(launched_with(&[]).is_ok_and(|config| config.sip_tls.is_none()));
+        for partial in [&tls[..2], &tls[..4], &tls[2..]] {
+            assert!(launched_with(partial).is_err(), "{partial:?}");
+        }
+        let relative = [
+            "--sip-tls",
+            "0.0.0.0:5061",
+            "--sip-tls-certificate",
+            "cert.pem",
+            "--sip-tls-key",
+            "/etc/node/key.pem",
+        ];
+        assert!(launched_with(&relative).is_err());
     }
 
     #[test]

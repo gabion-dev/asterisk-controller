@@ -1,4 +1,6 @@
-// java/src/vectors/java/ServiceCheck.java
+// java/src/vectors/java/dev/gabion/telephony/protocol/checks/ServiceCheck.java
+
+package dev.gabion.telephony.protocol.checks;
 
 import dev.gabion.telephony.protocol.ApplicationServiceMessage;
 import dev.gabion.telephony.protocol.NodeMessage;
@@ -222,7 +224,7 @@ public final class ServiceCheck {
                 int opcode = first & 0x0F;
                 long length = second & 0x7F;
                 if (length == 126) {
-                    length = (readByte() << 8) | readByte();
+                    length = ((long) readByte() << 8) | readByte();
                 } else if (length == 127) {
                     length = 0;
                     for (int i = 0; i < 8; i++) {

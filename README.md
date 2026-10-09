@@ -20,7 +20,8 @@ controller carries out what the application's settings say for that case
 From the network a node accepts only what Asterisk accepts:
 
 - SIP from the telephone operators named in the node's settings, at the
-  address `--sip` gives, over UDP or TCP as each operator's transport says.
+  address `--sip` gives, over UDP or TCP as each operator's transport says —
+  or over TLS at the address `--sip-tls` gives;
   Asterisk recognises an operator only by the address its calls come from; a
   call from any other address is refused. Without operators in the settings
   the controller configures no SIP transport;
@@ -77,7 +78,8 @@ asterisk-controller --node <name> --listen 127.0.0.1:<port> \
     --application <wss://host[:port][/path]> \
     --asterisk-tree <directory> --state <directory> \
     --asterisk-http 127.0.0.1:<port> --audio-ports <first>-<last> \
-    [--sip <address:port>] [--sip-public <address>]
+    [--sip <address:port>] [--sip-public <address>] \
+    [--sip-tls <address:port> --sip-tls-certificate <file> --sip-tls-key <file>]
 ```
 
 - `--node` — the node's name, as the application knows it: 1 to 128
@@ -109,14 +111,24 @@ asterisk-controller --node <name> --listen 127.0.0.1:<port> \
   differs from the one in `--sip` (a machine behind address translation).
   It is written into Asterisk's SIP transports as their external signalling
   and media address.
+- `--sip-tls`, `--sip-tls-certificate`, `--sip-tls-key` — where Asterisk
+  listens for operators over TLS, and the node's certificate and private key
+  (PEM files, absolute paths): all three or none. Needed when the settings
+  name an operator whose transport is `tls`; with such settings stored and
+  no `--sip-tls`, the controller does not start. Calls with such an operator
+  have their audio encrypted too (SRTP), or there is no call. The
+  operator's certificate is checked against the root certificates the
+  machine trusts (`SSL_CERT_FILE` points at others); TLS 1.2 is used.
 
 An unknown or missing argument, or one without a value, stops the controller
 with the usage text.
 
 Before it says it is ready, the controller checks the Asterisk version, reads
 the stored settings, makes or reads the control secret, rewrites
-`<state>/etc` whole, reads the node's secret and — for a `wss://` address —
-the machine's trusted root certificates, and starts listening on `--listen`.
+`<state>/etc` whole, reads the node's secret and — for a `wss://` address,
+or with `--sip-tls` — the machine's trusted root certificates (and with
+`--sip-tls` the node's certificate and key), and starts listening on
+`--listen`.
 If any step fails it says why on standard error and exits with status 1.
 When it is ready it prints one line on standard output:
 
@@ -138,6 +150,11 @@ the connection is lost.
 
 `<state>/etc` is rewritten whole on every start of the controller: do not
 edit it.
+
+When you renew the node's certificate in place — same file names — send the
+controller SIGHUP (with certbot, from a `--deploy-hook`). Asterisk takes the
+new certificate in without dropping a call; connections already open keep
+the old one until they close.
 
 ### Settings
 
@@ -216,7 +233,8 @@ Lines that say the node is working:
 - `asterisk-controller: Asterisk is not there yet — <reason>` — until
   Asterisk is started;
 - `asterisk-controller: connected to Asterisk`;
-- `asterisk-controller: the application welcomed this node`.
+- `asterisk-controller: the application welcomed this node`;
+- `asterisk-controller: SIGHUP — Asterisk's configuration follows the files it is made from`.
 
 Lines that say something is wrong:
 
@@ -342,7 +360,8 @@ The machine needs:
 - for `scripts/fetch-asterisk.sh`: bash, curl, tar, `sha256sum` or `shasum`,
   and access to github.com;
 - for the tests: the Asterisk tree (from the script, or `ASTERISK_TREE`
-  pointing at one) and `127.0.0.2` as an address of the machine; the path of
+  pointing at one), `127.0.0.2` and `127.0.0.3` as addresses of the machine,
+  and the `kill` command; the path of
   the system's temporary directory may not hold the characters `--state`
   refuses, because the tests keep a node's state directory there;
 - for the Java side: a JDK 21, and `cargo` on the `PATH` — the Java message
@@ -367,19 +386,22 @@ operator at `127.0.0.1` and a stranger at `127.0.0.2`. The test itself plays
 the application, over `ws://` on the loopback address. Without an Asterisk
 tree the test fails and says how to get one. A separate test, without Asterisk,
 has the controller reach an application over TLS with a certificate made for
-the test. The Java side's check runs the library through the shared vectors
-and plays the application on the service connection of the controller built
+the test. The Java side is compiled with Error Prone and NullAway, every
+warning an error; its check runs the library through the shared vectors and
+plays the application on the service connection of the controller built
 from this repository, without Asterisk.
 
 `.github/workflows/checks.yml` runs the same checks on every push and pull
-request.
+request. `.github/workflows/release.yml` builds a release for Linux (x64 and
+ARM64, glibc 2.34 or newer) and macOS 13 or newer (Apple Silicon and Intel),
+each on a machine of its own platform after every check passed there, starts
+each binary on clean hosts, and publishes the release only when all did.
 
 ## Status
 
 Early development; no release has been published. Not built yet: recording;
 the application's requests for browser call legs and device facts; calls
-from user endpoints and web passes; TLS towards an operator and operators
-that require registration.
+from user endpoints and web passes; operators that require registration.
 
 ## License
 

@@ -1,0 +1,247 @@
+# .github/workflows/release.yml
+
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release — the version in crates/asterisk-controller/Cargo.toml (e.g. 0.1.0-dev.1)'
+        required: true
+
+permissions:
+  contents: write
+
+# =============================================================================
+# One controller binary per platform and architecture, published only when
+# every one of them was built and checked.
+#
+# Every architecture builds on a NATIVE runner (no emulation), and on it every
+# check of the repository runs before the binary is kept — the controller
+# against the pinned Asterisk included: a verdict obtained under emulation
+# says nothing about real hardware.
+#
+# Linux: built inside AlmaLinux 9 (glibc 2.34), the base the Asterisk tree is
+# built on, so the binary runs wherever the tree runs; the newest glibc symbol
+# version it needs is held to that floor (scripts/build-release-linux.sh).
+# macOS: built for macOS 13 and newer, as the tree is.
+#
+# Each binary is then started on hosts with nothing of ours installed — every
+# Linux image the tree is verified on, every macOS a native runner exists for.
+# A release with a platform missing would be a different product under the
+# same tag.
+# =============================================================================
+
+jobs:
+  version:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+
+      # The controller names its version to the application in every hello:
+      # the release is that version, or it is not released.
+      - name: The version asked for is the controller's
+        env:
+          VERSION: ${{ github.event.inputs.version }}
+        run: |
+          set -euo pipefail
+          OWN="$(sed -n 's/^version = "\(.*\)"$/\1/p' crates/asterisk-controller/Cargo.toml)"
+          if [ "${OWN}" != "${VERSION}" ]; then
+            echo "ERROR: the controller is version ${OWN}, not ${VERSION}" >&2
+            exit 1
+          fi
+
+  build-linux:
+    needs: [version]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+
+      - name: Build and check on the glibc floor
+        run: |
+          set -euxo pipefail
+          mkdir -p out
+          docker run --rm \
+            -v "${PWD}:/src:ro" \
+            -v "${PWD}/out:/out" \
+            almalinux:9 \
+            bash /src/scripts/build-release-linux.sh /src /out
+
+      - name: Run on clean hosts (nothing installed)
+        run: |
+          set -euxo pipefail
+          for img in almalinux:9-minimal almalinux:10-minimal ubuntu:22.04 ubuntu:24.04 ubuntu:26.04 debian:12 debian:13 fedora:latest; do
+            echo "=== ${img} (${{ matrix.arch }}) ==="
+            docker run --rm \
+              -v "${PWD}:/src:ro" \
+              -v "${PWD}/out:/out:ro" \
+              "${img}" \
+              bash /src/scripts/verify-release.sh /out/asterisk-controller
+          done
+
+      - name: Package
+        run: |
+          set -euxo pipefail
+          ARCHIVE="asterisk-controller-linux-${{ matrix.arch }}.tar.gz"
+          cp LICENSE README.md out/
+          tar -czf "${ARCHIVE}" -C out asterisk-controller LICENSE README.md
+          sha256sum "${ARCHIVE}" > "${ARCHIVE}.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: asterisk-controller-linux-${{ matrix.arch }}
+          path: |
+            asterisk-controller-linux-${{ matrix.arch }}.tar.gz
+            asterisk-controller-linux-${{ matrix.arch }}.tar.gz.sha256
+
+  build-macos:
+    needs: [version]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-15
+          - arch: amd64
+            runner: macos-15-intel
+    runs-on: ${{ matrix.runner }}
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '13.0'
+      # The node's state directory of the checks lives in the temporary
+      # directory, and the socket of Asterisk's console inside it may not
+      # be longer than 103 bytes on macOS; the default one is too long.
+      TMPDIR: /tmp
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+
+      # The checks reach the operators of their telephone network and its
+      # stranger at addresses of their own.
+      - name: Loopback addresses of the checks
+        run: |
+          sudo ifconfig lo0 alias 127.0.0.2 up
+          sudo ifconfig lo0 alias 127.0.0.3 up
+
+      - name: Rust toolchain
+        run: rustup show active-toolchain
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Linter (strict)
+        run: cargo clippy --all-targets --locked
+
+      - name: Asterisk the controller is pinned to
+        run: bash scripts/fetch-asterisk.sh
+
+      - name: Tests
+        run: cargo test --locked
+
+      - name: Build
+        run: cargo build --release --locked -p asterisk-controller
+
+      - name: Package
+        run: |
+          set -euxo pipefail
+          ARCHIVE="asterisk-controller-darwin-${{ matrix.arch }}.tar.gz"
+          mkdir out
+          cp target/release/asterisk-controller LICENSE README.md out/
+          tar -czf "${ARCHIVE}" -C out asterisk-controller LICENSE README.md
+          shasum -a 256 "${ARCHIVE}" > "${ARCHIVE}.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: asterisk-controller-darwin-${{ matrix.arch }}
+          path: |
+            asterisk-controller-darwin-${{ matrix.arch }}.tar.gz
+            asterisk-controller-darwin-${{ matrix.arch }}.tar.gz.sha256
+
+  verify-macos:
+    # A different machine from the one that built the binary, on every macOS
+    # a native runner exists for — the newest first of all: a node's Mac runs
+    # the current macOS. When GitHub adds a runner for a new macOS, add it here.
+    needs: [build-macos]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-14
+          - arch: arm64
+            runner: macos-15
+          - arch: arm64
+            runner: macos-26
+          # macOS 27: GitHub runs it on the image of Xcode 27 (arm64 only).
+          - arch: arm64
+            runner: xcode-27
+          - arch: amd64
+            runner: macos-15-intel
+          - arch: amd64
+            runner: macos-26-intel
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+
+      - name: Download the built archive
+        uses: actions/download-artifact@v8
+        with:
+          name: asterisk-controller-darwin-${{ matrix.arch }}
+
+      - name: Run on a clean host
+        run: |
+          set -euxo pipefail
+          shasum -a 256 --check "asterisk-controller-darwin-${{ matrix.arch }}.tar.gz.sha256"
+          mkdir out
+          tar -xzf "asterisk-controller-darwin-${{ matrix.arch }}.tar.gz" -C out
+          bash scripts/verify-release.sh out/asterisk-controller
+
+  release:
+    needs: [build-linux, verify-macos]
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          merge-multiple: true
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.event.inputs.version }}
+          name: asterisk-controller ${{ github.event.inputs.version }}
+          prerelease: ${{ contains(github.event.inputs.version, '-') }}
+          body: |
+            The controller of a Gabion telephony node, for Asterisk 22.11.0 (release `22.11.0-r1` of gabion-dev/asterisk-server). How to run it — the README in each archive.
+
+            Every archive was built on a native machine of its platform, where every check of this repository passed first — the controller against the pinned Asterisk included — and was then started on clean hosts: Linux — AlmaLinux 9 and 10, Ubuntu 22.04, 24.04 and 26.04, Debian 12 and 13, Fedora; macOS — 14, 15, 26 and 27 on Apple Silicon, 15 and 26 on Intel.
+
+            ## Platforms
+            - `asterisk-controller-linux-amd64.tar.gz` — Linux x64, glibc 2.34+
+            - `asterisk-controller-linux-arm64.tar.gz` — Linux ARM64, glibc 2.34+
+            - `asterisk-controller-darwin-arm64.tar.gz` — macOS 13+, Apple Silicon
+            - `asterisk-controller-darwin-amd64.tar.gz` — macOS 13+, Intel
+
+            Not covered: Linux with glibc older than 2.34, musl (Alpine), Windows.
+
+            ## License
+            Business Source License 1.1 — the license of the Gabion framework.
+          files: |
+            asterisk-controller-linux-*
+            asterisk-controller-darwin-*

@@ -9,8 +9,13 @@
 // decoding and the audio frames. `check` then runs the whole library through
 // the shared vectors, the same files the Rust tests read.
 
+import net.ltgt.gradle.errorprone.errorprone
+
 plugins {
     `java-library`
+    // Null is checked when the library compiles, as in the framework it is
+    // compiled into: NullAway, run by Error Prone, of the same versions.
+    id("net.ltgt.errorprone") version "4.1.0"
 }
 
 group = "dev.gabion"
@@ -35,6 +40,9 @@ dependencies {
     // into an application built on them.
     api("tools.jackson.core:jackson-databind:3.0.3")
     api("org.jspecify:jspecify:1.0.0")
+
+    errorprone("com.google.errorprone:error_prone_core:2.36.0")
+    errorprone("com.uber.nullaway:nullaway:0.12.3")
 }
 
 java {
@@ -89,9 +97,15 @@ tasks.processResources {
 
 tasks.withType<JavaCompile>().configureEach {
     options.release = 21
-    // Every warning the compiler knows is an error: generated code is held to
-    // the same standard as code written by hand.
+    // Every warning the compiler knows is an error — Error Prone's too:
+    // generated code is held to the same standard as code written by hand.
     options.compilerArgs.addAll(listOf("-Xlint:all", "-Werror", "-proc:none"))
+    options.errorprone {
+        // Every package of the library is @NullMarked: what may be null says
+        // so, and NullAway holds every use to it.
+        option("NullAway:AnnotatedPackages", "dev.gabion")
+        error("NullAway")
+    }
 }
 
 val vectorCheck by tasks.registering(JavaExec::class) {
@@ -104,7 +118,7 @@ val vectorCheck by tasks.registering(JavaExec::class) {
     inputs.files(messages, audioFrames, fingerprints)
 
     classpath = vectors.runtimeClasspath
-    mainClass = "VectorCheck"
+    mainClass = "dev.gabion.telephony.protocol.checks.VectorCheck"
     args(protocolPackage, messages.asFile.path, audioFrames.asFile.path, fingerprints.asFile.path)
 }
 
@@ -122,7 +136,7 @@ val serviceCheck by tasks.registering(JavaExec::class) {
 
     dependsOn(buildController)
     classpath = vectors.runtimeClasspath
-    mainClass = "ServiceCheck"
+    mainClass = "dev.gabion.telephony.protocol.checks.ServiceCheck"
     args(repositoryRoot.file("target/debug/asterisk-controller").asFile.path)
 }
 

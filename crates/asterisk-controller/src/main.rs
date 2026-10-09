@@ -91,6 +91,16 @@ async fn main() -> ExitCode {
         }
     };
 
+    // Whoever renews the node's certificate for operators says so with
+    // SIGHUP: Asterisk is then given it, with no call dropped.
+    let mut hangup = match signal(SignalKind::hangup()) {
+        Ok(hangup) => hangup,
+        Err(error) => {
+            eprintln!("asterisk-controller: cannot listen for SIGHUP: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     let listener = match TcpListener::bind(config.listen).await {
         Ok(listener) => listener,
         Err(error) => {
@@ -126,7 +136,7 @@ async fn main() -> ExitCode {
         replaced: tokio::sync::Notify::new(),
     });
     tokio::spawn(asterisk::run(Arc::clone(&node), Arc::clone(&asterisk)));
-    tokio::spawn(service::run(Arc::clone(&node), asterisk));
+    tokio::spawn(service::run(Arc::clone(&node), Arc::clone(&asterisk)));
 
     loop {
         tokio::select! {
@@ -142,6 +152,9 @@ async fn main() -> ExitCode {
             },
             _ = tokio::signal::ctrl_c() => return ExitCode::SUCCESS,
             _ = terminate.recv() => return ExitCode::SUCCESS,
+            _ = hangup.recv() => {
+                tokio::spawn(certificate_renewed(Arc::clone(&node), Arc::clone(&asterisk)));
+            }
             () = node.replaced.notified() => return ExitCode::FAILURE,
         }
     }
@@ -181,6 +194,21 @@ fn prepare_asterisk(config: &Config) -> Result<(settings::Applied, String, Strin
         main_file.display()
     );
     Ok((applied, secret, tree.version))
+}
+
+/// The node's certificate for operators may have been renewed: Asterisk's
+/// configuration follows it, and Asterisk takes the new one in.
+async fn certificate_renewed(node: Arc<Node>, asterisk: Arc<asterisk::Asterisk>) {
+    match service::files_follow(&node, &asterisk).await {
+        Ok(()) => eprintln!(
+            "asterisk-controller: SIGHUP — Asterisk's configuration follows the files it is \
+             made from"
+        ),
+        Err(problem) => eprintln!(
+            "asterisk-controller: SIGHUP — Asterisk's configuration could not follow the files \
+             it is made from: {problem}"
+        ),
+    }
 }
 
 /// Complete the WebSocket handshake of a media connection of Asterisk and

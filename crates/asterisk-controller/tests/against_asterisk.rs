@@ -125,6 +125,9 @@ const NODE_APPLICATION: &str = "gabion";
 /// An address of this machine that is not the operator's. The stranger of
 /// the test calls from it.
 const STRANGER_ADDRESS: &str = "127.0.0.2";
+/// The address of the operator the node reaches over TLS: an operator is
+/// known by the address its calls come from, so it has one of its own.
+const SECURE_ADDRESS: &str = "127.0.0.3";
 
 fn asterisk_tree() -> TestResult<PathBuf> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -146,18 +149,34 @@ async fn free_port() -> TestResult<u16> {
     Ok(TcpListener::bind("127.0.0.1:0").await?.local_addr()?.port())
 }
 
+/// Where the operators of the test's telephone network are: the plain one
+/// and the one reached over TLS.
+#[derive(Clone, Copy)]
+struct OperatorPorts {
+    plain: u16,
+    secure: u16,
+}
+
 /// The settings the node of the test starts on: three entries, and the
-/// operator whose trunk is the test's telephone network, with lines through
-/// it.
-fn settings(operator_port: u16) -> serde_json::Value {
+/// operators whose trunks are the test's telephone network — one over UDP,
+/// one over TLS — with lines through them.
+fn settings(operators: OperatorPorts) -> serde_json::Value {
     serde_json::json!({
         "operators": [{
             "id": "the test's operator",
             "host": "127.0.0.1",
-            "port": operator_port,
+            "port": operators.plain,
             "transport": "udp",
             "credentials": { "username": "node", "password": OPERATOR_PASSWORD },
             "source_networks": ["127.0.0.1/32"],
+            "countries": ["US"]
+        }, {
+            "id": "the test's secure operator",
+            "host": SECURE_ADDRESS,
+            "port": operators.secure,
+            "transport": "tls",
+            "credentials": { "username": "node", "password": OPERATOR_PASSWORD },
+            "source_networks": [format!("{SECURE_ADDRESS}/32")],
             "countries": ["US"]
         }],
         "lines": [{
@@ -174,6 +193,12 @@ fn settings(operator_port: u16) -> serde_json::Value {
             "operator": "the test's operator",
             "allowed_countries": ["US"],
             "concurrent_outbound_limit": 2
+        }, {
+            "id": "secure",
+            "number": DIALED,
+            "operator": "the test's secure operator",
+            "allowed_countries": ["US"],
+            "concurrent_outbound_limit": 1
         }],
         // Entries for the two things a fallback can be, and a transfer that
         // cannot connect the caller.
@@ -201,6 +226,22 @@ fn settings(operator_port: u16) -> serde_json::Value {
     })
 }
 
+/// What whoever runs the node puts into its state directory: the settings
+/// it starts on and its secret — each readable by its owner alone, or the
+/// node does not start on it (the settings carry the operators' passwords).
+fn what_the_node_is_given(state: &Path, operators: OperatorPorts) -> TestResult {
+    let stored_settings = state.join("settings.json");
+    fs::write(&stored_settings, settings(operators).to_string())?;
+    fs::set_permissions(
+        &stored_settings,
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    )?;
+    let secret = state.join("node-secret");
+    fs::write(&secret, NODE_SECRET)?;
+    fs::set_permissions(&secret, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+    Ok(())
+}
+
 /// Ports of the telephone network of the test.
 struct NetworkPorts {
     http: u16,
@@ -208,9 +249,51 @@ struct NetworkPorts {
     operator: u16,
     /// Where the stranger sends from.
     stranger: u16,
+    /// Where the operator's trunk over TLS is.
+    secure: u16,
     audio: u16,
     /// Where the node listens for operators.
     node: u16,
+    /// Where the node listens for operators over TLS.
+    node_secure: u16,
+}
+
+/// The certificates of the test: the node's, which the network judges, and
+/// the network's, which the node judges — each made for the address it is
+/// reached at.
+struct Certificates {
+    node: PathBuf,
+    node_key: PathBuf,
+    /// The node's certificate itself, as a TLS connection presents it.
+    node_der: Vec<u8>,
+    network: PathBuf,
+    network_key: PathBuf,
+}
+
+impl Certificates {
+    fn make(directory: &Path) -> TestResult<Self> {
+        fs::create_dir_all(directory)?;
+        let made = |address: &str, name: &str| -> TestResult<(PathBuf, PathBuf, Vec<u8>)> {
+            let made = rcgen::generate_simple_self_signed(vec![address.to_owned()])?;
+            let (certificate, key) = (
+                directory.join(format!("{name}.pem")),
+                directory.join(format!("{name}-key.pem")),
+            );
+            fs::write(&certificate, made.cert.pem())?;
+            fs::write(&key, made.signing_key.serialize_pem())?;
+            fs::set_permissions(&key, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+            Ok((certificate, key, made.cert.der().to_vec()))
+        };
+        let (node, node_key, node_der) = made("127.0.0.1", "node")?;
+        let (network, network_key, _) = made(SECURE_ADDRESS, "network")?;
+        Ok(Self {
+            node,
+            node_key,
+            node_der,
+            network,
+            network_key,
+        })
+    }
 }
 
 /// Write the configuration of the telephone network and return its main
@@ -221,6 +304,7 @@ fn write_network_configuration(
     tree: &Path,
     state: &Path,
     ports: &NetworkPorts,
+    certificates: &Certificates,
 ) -> TestResult<PathBuf> {
     let etc = state.join("etc");
     for directory in ["etc", "db", "keys/keys", "spool", "run", "log"] {
@@ -276,7 +360,7 @@ fn write_network_configuration(
                 .into(),
         ),
         ("extensions.conf", network_dialplan()),
-        ("pjsip.conf", network_sides(ports)),
+        ("pjsip.conf", network_sides(ports, certificates)),
     ];
     for (name, content) in files {
         fs::write(etc.join(name), content)?;
@@ -318,7 +402,12 @@ fn network_dialplan() -> String {
 /// same operator's side for a call whose audio is to stop, and which puts
 /// the call on hold as a telephone does: by telling the node
 /// (`moh_passthrough`), not by playing music of its own.
-fn network_sides(ports: &NetworkPorts) -> String {
+///
+/// The secure operator reaches the node over TLS, at its own address, with
+/// encrypted audio, and judges the node's certificate. Calls the node places
+/// through it come from the node's address and are taken by `the-node`,
+/// which takes encrypted audio when it is offered and plain audio otherwise.
+fn network_sides(ports: &NetworkPorts, certificates: &Certificates) -> String {
     let side = |name: &str, transport: &str, more: &str| {
         format!(
             "[{name}]\ntype = endpoint\ntransport = {transport}\ncontext = from-the-node\n\
@@ -327,22 +416,37 @@ fn network_sides(ports: &NetworkPorts) -> String {
             ports.node,
         )
     };
+    let secure_side = format!(
+        "[the-node-secure]\ntype = endpoint\ntransport = secure\ncontext = from-the-node\n\
+         disallow = all\nallow = ulaw\naors = the-node-secure\ndirect_media = no\n\
+         media_encryption = sdes\nmedia_encryption_optimistic = no\nrtp_keepalive = 1\n\n\
+         [the-node-secure]\ntype = aor\ncontact = sip:127.0.0.1:{}\\;transport=tls\n\n",
+        ports.node_secure,
+    );
     format!(
         "[global]\ntype = global\nendpoint_identifier_order = ip\n\n\
          [operator]\ntype = transport\nprotocol = udp\nbind = 127.0.0.1:{}\n\n\
          [stranger]\ntype = transport\nprotocol = udp\nbind = {STRANGER_ADDRESS}:{}\n\n\
-         {}{}{}\
+         [secure]\ntype = transport\nprotocol = tls\nbind = {SECURE_ADDRESS}:{}\n\
+         method = tlsv1_2\ncert_file = {}\npriv_key_file = {}\nca_list_file = {}\n\
+         verify_server = yes\n\n\
+         {}{}{}{secure_side}\
          [the-node]\ntype = identify\nendpoint = the-node\nmatch = 127.0.0.1/32\n\n\
          [the-node-credentials]\ntype = auth\nauth_type = userpass\nusername = node\n\
          password = {}\n",
         ports.operator,
         ports.stranger,
+        ports.secure,
+        certificates.network.display(),
+        certificates.network_key.display(),
+        certificates.node.display(),
         // The operator asks the node who it is, and knows the same password
         // the node's settings carry.
         side(
             "the-node",
             "operator",
-            "auth = the-node-credentials\nrtp_keepalive = 1\n"
+            "auth = the-node-credentials\nrtp_keepalive = 1\n\
+             media_encryption = sdes\nmedia_encryption_optimistic = yes\n"
         ),
         side("the-node-from-elsewhere", "stranger", ""),
         side("the-node-quiet", "operator", "moh_passthrough = yes\n"),
@@ -359,10 +463,12 @@ fn read_asterisk(text: &str) -> TestResult<serde_json::Value> {
     Ok(serde_json::from_str(text)?)
 }
 
-/// Start the controller and wait until it is ready for Asterisk.
-async fn start_controller(arguments: &[OsString]) -> TestResult<Running> {
+/// Start the controller and wait until it is ready for Asterisk. It trusts
+/// the roots in `roots` alone — told so the way any program on the machine
+/// is told of roots other than the system's, `SSL_CERT_FILE`.
+async fn start_controller(arguments: &[OsString], roots: &Path) -> TestResult<Running> {
     let mut controller = Process::new(env!("CARGO_BIN_EXE_asterisk-controller"));
-    controller.args(arguments);
+    controller.args(arguments).env("SSL_CERT_FILE", roots);
     start(controller, "asterisk-controller ready", "the controller").await
 }
 
@@ -1517,12 +1623,14 @@ struct Stand {
     /// A report left unacknowledged on purpose: a controller started again
     /// must send it again.
     unacknowledged: Mutex<Option<String>>,
-    /// Where the operator's trunk is.
-    operator_port: u16,
+    /// Where the operators' trunks are.
+    operators: OperatorPorts,
     /// The state directory of the node.
     state: PathBuf,
     /// What the controller is started with.
     controller_arguments: Vec<OsString>,
+    /// The certificates of the node and of the network.
+    certificates: Certificates,
     controller: Running,
     asterisk: Running,
     network: Network,
@@ -1557,24 +1665,17 @@ impl Stand {
             http: free_port().await?,
             operator: free_port().await?,
             stranger: free_port().await?,
+            secure: free_port().await?,
             audio: free_port().await? & !1,
             node: sip_port,
+            node_secure: free_port().await?,
         };
-        // Settings carry the operators' passwords: readable by their owner
-        // alone, or the node does not start on them.
-        let stored_settings = state.join("settings.json");
-        fs::write(
-            &stored_settings,
-            settings(network_ports.operator).to_string(),
-        )?;
-        fs::set_permissions(
-            &stored_settings,
-            std::os::unix::fs::PermissionsExt::from_mode(0o600),
-        )?;
-        // Whoever runs the node gives it its secret, readable by its owner alone.
-        let secret = state.join("node-secret");
-        fs::write(&secret, NODE_SECRET)?;
-        fs::set_permissions(&secret, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+        let operators = OperatorPorts {
+            plain: network_ports.operator,
+            secure: network_ports.secure,
+        };
+        let certificates = Certificates::make(&root.join("certificates"))?;
+        what_the_node_is_given(&state, operators)?;
 
         let controller_arguments: Vec<OsString> = [
             "--node".into(),
@@ -1593,9 +1694,15 @@ impl Stand {
             format!("{audio_port}-{}", audio_port.saturating_add(19)).into(),
             "--sip".into(),
             format!("127.0.0.1:{sip_port}").into(),
+            "--sip-tls".into(),
+            format!("127.0.0.1:{}", network_ports.node_secure).into(),
+            "--sip-tls-certificate".into(),
+            certificates.node.clone().into_os_string(),
+            "--sip-tls-key".into(),
+            certificates.node_key.clone().into_os_string(),
         ]
         .into();
-        let controller = start_controller(&controller_arguments).await?;
+        let controller = start_controller(&controller_arguments, &certificates.network).await?;
 
         // Asterisk is started on what the controller wrote, and on nothing else.
         let mut asterisk =
@@ -1608,13 +1715,14 @@ impl Stand {
         control.serve_far_ends().await?;
 
         let network_state = root.join("network");
-        let network_file = write_network_configuration(&tree, &network_state, &network_ports)?;
+        let network_file =
+            write_network_configuration(&tree, &network_state, &network_ports, &certificates)?;
         let mut network = start_asterisk(&tree, &network_file, "the telephone network").await?;
         if network.said("ERROR[").await {
             network.report().await;
             return Err(format!(
                 "the telephone network of the test did not start cleanly; it needs \
-                 {STRANGER_ADDRESS} to be an address of this machine"
+                 {STRANGER_ADDRESS} and {SECURE_ADDRESS} to be addresses of this machine"
             )
             .into());
         }
@@ -1626,9 +1734,10 @@ impl Stand {
             application,
             service: Mutex::new(None),
             unacknowledged: Mutex::new(None),
-            operator_port: network_ports.operator,
+            operators,
             state,
             controller_arguments,
+            certificates,
             controller,
             asterisk,
             network: Network {
@@ -1677,6 +1786,17 @@ impl Stand {
         }
     }
 
+    /// The value the controller was started with for `name`.
+    fn controller_argument(&self, name: &str) -> TestResult<String> {
+        let mut arguments = self.controller_arguments.iter();
+        arguments
+            .find(|argument| argument.as_os_str() == name)
+            .and_then(|_| arguments.next())
+            .and_then(|value| value.to_str())
+            .map(str::to_owned)
+            .ok_or_else(|| format!("the controller was started without {name}").into())
+    }
+
     /// Where the controller listens for Asterisk's media connections.
     fn controller_address(&self) -> TestResult<String> {
         let mut arguments = self.controller_arguments.iter();
@@ -1713,7 +1833,8 @@ impl Stand {
 
     /// Start a controller in place of the one that was killed.
     async fn start_the_controller(&mut self) -> TestResult {
-        self.controller = start_controller(&self.controller_arguments).await?;
+        self.controller =
+            start_controller(&self.controller_arguments, &self.certificates.network).await?;
         Ok(())
     }
 
@@ -2428,6 +2549,206 @@ async fn a_call_arrives_from_the_operator(stand: &Stand) -> TestResult {
     stand
         .expect_no_channels("after a call from the operator")
         .await
+}
+
+/// The node's Asterisk has a channel whose identifier holds `part`, or —
+/// for an empty `part` — a channel of an operator's call that arrived:
+/// waited for, since a call takes a moment to arrive.
+async fn node_channel(stand: &Stand, part: &str) -> TestResult<String> {
+    timeout(STEP, async {
+        loop {
+            let channels = read_asterisk(&stand.control.request("GET", "channels").await?.1)?;
+            let found = channels
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find_map(|channel| {
+                    let id = channel.get("id").and_then(serde_json::Value::as_str)?;
+                    let name = channel.get("name").and_then(serde_json::Value::as_str)?;
+                    let wanted = if part.is_empty() {
+                        name.starts_with("PJSIP/") && !id.contains(".participant-")
+                    } else {
+                        id.contains(part)
+                    };
+                    wanted.then(|| id.to_owned())
+                });
+            if let Some(found) = found {
+                return Ok::<_, Box<dyn Error>>(found);
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .map_err(|_| format!("the node has no channel {part:?}"))?
+}
+
+/// The node's Asterisk says a channel's signalling travels over a secure
+/// transport and its audio is encrypted.
+async fn secured(stand: &Stand, channel: &str) -> TestResult {
+    for (what, function) in [
+        ("signalling", "CHANNEL%28pjsip%2Csecure%29"),
+        ("audio", "CHANNEL%28rtp%2Csecure%2Caudio%29"),
+    ] {
+        let (status, body) = stand
+            .control
+            .request(
+                "GET",
+                &format!("channels/{channel}/variable?variable={function}"),
+            )
+            .await?;
+        assert!(
+            status == 200 && body.contains("\"value\":\"1\""),
+            "the {what} of channel {channel} is not secured: {status} {body}"
+        );
+    }
+    Ok(())
+}
+
+/// Calls over TLS, with encrypted audio: the operator reached over TLS calls
+/// the node, and the node calls through it. Asterisk itself says each call's
+/// signalling and audio are secured, and the application hears and speaks
+/// as on any call.
+async fn calls_go_over_tls(stand: &Stand) -> TestResult {
+    let caller = stand
+        .network
+        .control
+        .create_channel(&format!(
+            "endpoint=PJSIP/{DIALED_IN_URL}@the-node-secure&app={FAR_END}&callerId={CALLER_IN_URL}"
+        ))
+        .await?;
+    let mut owner = Owner::accept(&stand.application).await?;
+    let first = hello(&mut owner).await?.first.id;
+    owner.send(&ApplicationMessage::Accept)?;
+    let participant = first.clone();
+    let mut events = accepted(&mut owner, 1, Command::Answer { participant }).await?;
+    if events.is_empty() {
+        events.push(owner.next_event().await?);
+    }
+    let (telephone, mut phone) = stand.network.give_a_phone(&caller).await?;
+    hears_the_caller(&mut owner, &first, 2).await?;
+    plays_to_the_caller(&mut owner, &mut phone, &first, 4).await?;
+    secured(stand, &node_channel(stand, "").await?).await?;
+
+    let (outcome, mut events) = dial(&mut owner, 5, ANSWERS, "secure", 5000).await?;
+    let CommandOutcome::AcceptedParticipant { participant } = outcome else {
+        return Err(format!("dialling through the operator over TLS was {outcome:?}").into());
+    };
+    while events.len() < 2 {
+        events.push(owner.next_event().await?);
+    }
+    assert!(
+        matches!(
+            events.as_slice(),
+            [
+                Event::ParticipantRinging { participant: ringing },
+                Event::ParticipantAnswered { participant: answered },
+            ] if ringing.id == participant && *answered == participant
+        ),
+        "a call through the operator over TLS came to {events:?}"
+    );
+    secured(stand, &node_channel(stand, ".participant-").await?).await?;
+    ends_it(&mut owner, 6, 2).await?;
+    the_telephone_is_put_down(stand, &telephone).await?;
+    stand.expect_no_channels("after calls over TLS").await?;
+    stand
+        .network
+        .control
+        .expect_none("channels", "after calls over TLS")
+        .await
+}
+
+/// Tell the controller the node's certificate was renewed, as whoever renews
+/// it does — SIGHUP — and wait until it says Asterisk's configuration
+/// follows: the `times`th time it says so.
+async fn the_certificate_is_renewed(stand: &Stand, times: usize) -> TestResult {
+    let pid = stand
+        .controller
+        .child
+        .id()
+        .ok_or("the controller is not running")?;
+    let sent = std::process::Command::new("kill")
+        .args(["-HUP", &pid.to_string()])
+        .status()?;
+    if !sent.success() {
+        return Err("SIGHUP could not be sent to the controller".into());
+    }
+    let followed = timeout(STEP, async {
+        loop {
+            let said = stand
+                .controller
+                .output
+                .lock()
+                .await
+                .iter()
+                .filter(|line| line.contains("SIGHUP — Asterisk's configuration follows"))
+                .count();
+            if said >= times {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    if followed.is_err() {
+        return Err("the controller did not follow a renewed certificate".into());
+    }
+    Ok(())
+}
+
+/// Open a TLS connection to where the node listens for operators, trusting
+/// `certificate` alone: it succeeds only if that is the certificate the
+/// node presents.
+async fn presents(stand: &Stand, certificate: &[u8]) -> TestResult {
+    let address = stand.controller_argument("--sip-tls")?;
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(rustls::pki_types::CertificateDer::from(
+        certificate.to_vec(),
+    ))?;
+    let trusting = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()?
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    let stream = TcpStream::connect(&address).await?;
+    let name = rustls::pki_types::ServerName::try_from("127.0.0.1")?;
+    timeout(
+        STEP,
+        tokio_rustls::TlsConnector::from(Arc::new(trusting)).connect(name, stream),
+    )
+    .await??;
+    Ok(())
+}
+
+/// The node's certificate is renewed in place, and whoever renewed it says
+/// so with SIGHUP: a new connection is presented the renewed one from then
+/// on, with no restart — and one already open goes on as it was.
+async fn a_renewed_certificate_is_taken_in(stand: &Stand) -> TestResult {
+    let Certificates {
+        node: certificate,
+        node_key: key,
+        node_der: before,
+        ..
+    } = &stand.certificates;
+    let kept = (fs::read(certificate)?, fs::read(key)?);
+    let renewed = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_owned()])?;
+    fs::write(certificate, renewed.cert.pem())?;
+    fs::write(key, renewed.signing_key.serialize_pem())?;
+    the_certificate_is_renewed(stand, 1).await?;
+    presents(stand, renewed.cert.der())
+        .await
+        .map_err(|error| format!("the renewed certificate is not presented: {error}"))?;
+
+    fs::write(certificate, &kept.0)?;
+    fs::write(key, &kept.1)?;
+    the_certificate_is_renewed(stand, 2).await?;
+    presents(stand, before)
+        .await
+        .map_err(|error| format!("the certificate before is not presented again: {error}"))?;
+    if stand.asterisk.said("Failed to restart TLS transport").await {
+        return Err("Asterisk could not take a renewed certificate in".into());
+    }
+    Ok(())
 }
 
 /// The same call from an address that is no operator's is refused by
@@ -4405,7 +4726,7 @@ async fn the_new_controller_carries_on_the_service(stand: &Stand) -> TestResult 
         return Err("the new controller's service connection did not open with a hello".into());
     };
     let later_fingerprint =
-        node_protocol::fingerprint(&settings_with_a_later_entry(stand.operator_port)?)?;
+        node_protocol::fingerprint(&settings_with_a_later_entry(stand.operators)?)?;
     assert_eq!(
         applied_settings
             .as_ref()
@@ -4607,8 +4928,8 @@ async fn a_ringing_call_is_turned_away(stand: &Stand) -> TestResult {
 
 /// The settings of the test with one more entry: the number the
 /// application adds while the node runs. Its fallback is a message.
-fn settings_with_a_later_entry(operator_port: u16) -> TestResult<Settings> {
-    let mut value = settings(operator_port);
+fn settings_with_a_later_entry(operators: OperatorPorts) -> TestResult<Settings> {
+    let mut value = settings(operators);
     value
         .get_mut("entries")
         .and_then(serde_json::Value::as_array_mut)
@@ -4624,7 +4945,7 @@ fn settings_with_a_later_entry(operator_port: u16) -> TestResult<Settings> {
 /// it had: whose parts disagree, that the protocol does not allow, and
 /// with a prompt nobody serves.
 async fn settings_that_are_refused(stand: &Stand, service: &mut ServiceEnd) -> TestResult {
-    let mut disagreeing = settings(stand.operator_port);
+    let mut disagreeing = settings(stand.operators);
     *disagreeing
         .pointer_mut("/lines/0/operator")
         .ok_or("the settings have no line")? = serde_json::json!("nobody");
@@ -4641,7 +4962,7 @@ async fn settings_that_are_refused(stand: &Stand, service: &mut ServiceEnd) -> T
     // Settings that are not what the protocol allows are refused with the
     // reason and the fingerprint of what was sent, on a connection that
     // goes on — the steps below take place on it.
-    let mut malformed = settings(stand.operator_port);
+    let mut malformed = settings(stand.operators);
     *malformed
         .pointer_mut("/operators/0/port")
         .ok_or("the settings have no operator")? = serde_json::json!("five thousand");
@@ -4658,7 +4979,7 @@ async fn settings_that_are_refused(stand: &Stand, service: &mut ServiceEnd) -> T
     );
 
     // A prompt the application does not serve: the settings are refused.
-    let mut unfetchable = settings(stand.operator_port);
+    let mut unfetchable = settings(stand.operators);
     *unfetchable
         .pointer_mut("/prompts/0/id")
         .ok_or("the settings have no prompt")? = serde_json::json!("nowhere");
@@ -4700,7 +5021,7 @@ async fn the_application_gives_the_node_its_settings(stand: &Stand) -> TestResul
     else {
         return Err("the service connection did not open with a hello".into());
     };
-    let stored: Settings = node_protocol::decode_value(settings(stand.operator_port))?;
+    let stored: Settings = node_protocol::decode_value(settings(stand.operators))?;
     let stored_fingerprint = node_protocol::fingerprint(&stored)?;
     assert_eq!(
         (protocol.get(), node.as_str(), asterisk_version.as_str()),
@@ -4723,7 +5044,7 @@ async fn the_application_gives_the_node_its_settings(stand: &Stand) -> TestResul
 
     settings_that_are_refused(stand, &mut service).await?;
 
-    let later = settings_with_a_later_entry(stand.operator_port)?;
+    let later = settings_with_a_later_entry(stand.operators)?;
     let later_fingerprint = node_protocol::fingerprint(&later)?;
     let answer = service.give(later).await?;
     assert!(
@@ -4819,6 +5140,8 @@ async fn every_scenario(stand: &Stand) -> TestResult {
     the_owner_breaks_the_protocol(stand).await?;
     the_application_hears_and_speaks(stand).await?;
     a_call_arrives_from_the_operator(stand).await?;
+    calls_go_over_tls(stand).await?;
+    a_renewed_certificate_is_taken_in(stand).await?;
     a_call_from_elsewhere_is_refused(stand).await?;
     a_ringing_call_is_turned_away(stand).await?;
     the_application_dials(stand).await?;

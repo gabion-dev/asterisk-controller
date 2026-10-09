@@ -79,7 +79,7 @@ pub async fn run(node: Arc<Node>, asterisk: Arc<Asterisk>) {
                 said_why.clear();
                 // Prompts fetched on the welcome change what the dialplan
                 // says for a message fallback.
-                if let Err(problem) = files_follow_prompts(&node, &asterisk).await {
+                if let Err(problem) = files_follow(&node, &asterisk).await {
                     eprintln!(
                         "asterisk-controller: the dialplan could not follow the prompts that \
                          are here now — {problem}; a message fallback whose prompt was missing \
@@ -488,13 +488,13 @@ async fn apply(
 
 /// Rewrite the files that follow from the settings in force where what
 /// they say has changed without the settings changing — a prompt that was
-/// missing when they were written is here now — and have Asterisk reload
-/// them.
+/// missing when they were written is here now, the node's certificate was
+/// renewed — and have Asterisk reload them.
 ///
 /// # Errors
 ///
 /// A file cannot be written, or Asterisk does not reload it.
-async fn files_follow_prompts(node: &Node, asterisk: &Asterisk) -> Result<(), String> {
+pub async fn files_follow(node: &Node, asterisk: &Asterisk) -> Result<(), String> {
     let config = &node.config;
     let applied = node.applied();
     let now = asterisk_files::from_settings(config, &applied.settings)?;

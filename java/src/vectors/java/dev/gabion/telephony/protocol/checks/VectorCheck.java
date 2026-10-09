@@ -1,4 +1,6 @@
-// java/src/vectors/java/VectorCheck.java
+// java/src/vectors/java/dev/gabion/telephony/protocol/checks/VectorCheck.java
+
+package dev.gabion.telephony.protocol.checks;
 
 import java.lang.reflect.Method;
 import java.nio.file.Files;

@@ -21,7 +21,10 @@ use std::{
 use node_protocol::messages::{EntryKey, Fallback, Operator, Settings, SipTransport};
 use sha2::{Digest, Sha256};
 
-use crate::{config::Config, destination, media, prompts, state_files};
+use crate::{
+    config::{Config, SipTls},
+    destination, media, prompts, state_files,
+};
 
 /// The Asterisk versions this controller knows how to drive. What Asterisk
 /// says about its channels, what its media channel does and how its
@@ -49,6 +52,9 @@ pub const NETWORK_CONTEXT: &str = "gabion-from-network";
 /// not here: a temporary failure (Q.850 cause 41) — the message will be
 /// there once the application gives it.
 const PROMPT_MISSING_CAUSE: u8 = 41;
+/// The file of the configuration that holds the root certificates the
+/// machine trusts: what an operator's certificate is judged against.
+const OPERATOR_ROOTS: &str = "operator-roots.pem";
 /// The label of the step of an entry where its fallback begins.
 pub const FALLBACK_LABEL: &str = "fallback";
 const FALLBACK_STEP: &str = "(fallback)";
@@ -203,7 +209,11 @@ pub fn write(
     settings: &Settings,
     secret: &str,
 ) -> Result<PathBuf, String> {
-    let files = files(config, tree, settings, secret)?;
+    let roots = match config.sip_tls {
+        Some(_) => Some(operator_roots()?),
+        None => None,
+    };
+    let files = files(config, tree, settings, secret, roots)?;
 
     let etc = config.state.join("etc");
     let failed = |path: &Path, error: std::io::Error| format!("{}: {error}", path.display());
@@ -279,12 +289,50 @@ pub fn replace(config: &Config, name: &str, content: &str) -> Result<(), String>
         .map_err(|error| format!("{}: {error}", path.display()))
 }
 
-/// Every configuration file, by name.
+/// The root certificates the machine trusts, as one PEM text — what Asterisk
+/// judges an operator's certificate against, as the controller judges the
+/// application's ([`crate::application`]): one source of trust on the node.
+/// Read when Asterisk starts: it takes them in when its TLS transport does.
+///
+/// # Errors
+///
+/// The machine trusts no root at all: no operator's certificate could be
+/// judged.
+fn operator_roots() -> Result<String, String> {
+    let found = rustls_native_certs::load_native_certs();
+    if found.certs.is_empty() {
+        let problems: Vec<String> = found.errors.iter().map(ToString::to_string).collect();
+        return Err(format!(
+            "--sip-tls: the machine trusts no root certificates, so no operator's certificate \
+             could be judged{}",
+            if problems.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", problems.join("; "))
+            }
+        ));
+    }
+    let mut pem = String::new();
+    for certificate in &found.certs {
+        pem.push_str("-----BEGIN CERTIFICATE-----\n");
+        let encoded = data_encoding::BASE64.encode(certificate.as_ref());
+        for line in encoded.as_bytes().chunks(64) {
+            pem.push_str(&String::from_utf8_lossy(line));
+            pem.push('\n');
+        }
+        pem.push_str("-----END CERTIFICATE-----\n");
+    }
+    Ok(pem)
+}
+
+/// Every configuration file, by name. `roots` are the root certificates
+/// the machine trusts, when the node is reached over TLS.
 fn files(
     config: &Config,
     tree: &Tree,
     settings: &Settings,
     secret: &str,
+    roots: Option<String>,
 ) -> Result<Vec<(&'static str, String)>, String> {
     let mut files = vec![
         ("asterisk.conf", directories(config)),
@@ -326,6 +374,7 @@ fn files(
         ("extensions.conf", dialplan(config, settings)),
         ("pjsip.conf", operators(config, settings)?),
     ];
+    files.extend(roots.map(|roots| (OPERATOR_ROOTS, roots)));
     files.extend(EMPTY_FILES.iter().map(|name| (*name, String::new())));
     Ok(files)
 }
@@ -501,14 +550,12 @@ fn fallback(config: &Config, settings: &Settings, fallback: &Fallback) -> Vec<St
 /// The telephone operators: where each one's trunk is, what the node
 /// presents to it, and where its calls are accepted from.
 fn operators(config: &Config, settings: &Settings) -> Result<String, String> {
-    if settings.operators.is_empty() {
-        // Without operators Asterisk listens for none.
+    // Without operators Asterisk listens for none — except over TLS, whose
+    // transport is a fact of the launch: it is started with Asterisk, and
+    // never has to appear on a reload.
+    if settings.operators.is_empty() && config.sip_tls.is_none() {
         return Ok(String::new());
     }
-    let sip = config.sip.ok_or(
-        "the settings name a telephone operator, and the controller was not told where \
-         Asterisk listens for operators (--sip)",
-    )?;
 
     // A request is matched to an operator by the address it came from and by
     // nothing it says about itself; one that matches no operator is refused.
@@ -521,19 +568,35 @@ fn operators(config: &Config, settings: &Settings) -> Result<String, String> {
             .iter()
             .any(|operator| operator.transport == transport)
         {
+            let sip = config.sip.ok_or(
+                "the settings name a telephone operator reached over UDP or TCP, and the \
+                 controller was not told where Asterisk listens for operators (--sip)",
+            )?;
             let _ = write!(
                 text,
                 "[{}]\ntype = transport\nprotocol = {transport}\nbind = {sip}\n",
                 transport_name(transport),
             );
-            if let Some(public) = config.sip_public {
-                let _ = write!(
-                    text,
-                    "external_signaling_address = {public}\nexternal_media_address = {public}\n",
-                );
-            }
+            public_address(&mut text, config);
             text.push('\n');
         }
+    }
+    match &config.sip_tls {
+        Some(tls) => tls_transport(&mut text, config, tls)?,
+        None if settings
+            .operators
+            .iter()
+            .any(|operator| operator.transport == SipTransport::Tls) =>
+        {
+            return Err(
+                "the settings name a telephone operator reached over TLS, and the \
+                        controller was not told where Asterisk listens for operators over TLS, \
+                        nor given the node's certificate (--sip-tls, --sip-tls-certificate, \
+                        --sip-tls-key)"
+                    .into(),
+            );
+        }
+        None => {}
     }
 
     let mut names = std::collections::HashSet::new();
@@ -555,6 +618,66 @@ fn transport_name(transport: SipTransport) -> String {
     format!("gabion-transport-{transport}")
 }
 
+/// The address operators reach the node at, when it is not the one Asterisk
+/// listens on.
+fn public_address(text: &mut String, config: &Config) {
+    if let Some(public) = config.sip_public {
+        let _ = write!(
+            text,
+            "external_signaling_address = {public}\nexternal_media_address = {public}\n",
+        );
+    }
+}
+
+/// The transport operators reach the node over with TLS.
+///
+/// The node proves itself with the certificate it was given, and judges an
+/// operator's against the roots the machine trusts — wildcards included, as
+/// operators present them. TLS 1.2: Asterisk offers one version, and asked
+/// for none it would use TLS 1.0, which operators no longer accept.
+///
+/// Asterisk reads the certificate again, with no call dropped, when it
+/// reloads the transport's module and finds the file changed under the same
+/// name — but it reloads nothing from a configuration that has not changed.
+/// So the digest of the certificate is written here: a certificate renewed
+/// in place changes this file, and the reload that follows takes it in.
+///
+/// # Errors
+///
+/// The certificate or its key cannot be read.
+fn tls_transport(text: &mut String, config: &Config, tls: &SipTls) -> Result<(), String> {
+    let unreadable =
+        |path: &Path, error: std::io::Error| format!("--sip-tls: {}: {error}", path.display());
+    let certificate =
+        fs::read(&tls.certificate).map_err(|error| unreadable(&tls.certificate, error))?;
+    fs::File::open(&tls.key).map_err(|error| unreadable(&tls.key, error))?;
+    let mut digest = String::new();
+    for byte in Sha256::digest(&certificate) {
+        let _ = write!(digest, "{byte:02x}");
+    }
+    let _ = write!(
+        text,
+        "; the node's certificate is {digest}\n\
+         [{}]\ntype = transport\nprotocol = tls\nbind = {}\nmethod = tlsv1_2\n\
+         cert_file = {}\npriv_key_file = {}\nca_list_file = {}\nverify_server = yes\n\
+         allow_wildcard_certs = yes\n",
+        transport_name(SipTransport::Tls),
+        tls.address,
+        value(&tls.certificate.to_string_lossy()),
+        value(&tls.key.to_string_lossy()),
+        value(
+            &config
+                .state
+                .join("etc")
+                .join(OPERATOR_ROOTS)
+                .to_string_lossy()
+        ),
+    );
+    public_address(text, config);
+    text.push('\n');
+    Ok(())
+}
+
 fn operator_sections(text: &mut String, name: &str, operator: &Operator) {
     let host = operator.host.as_str();
     // An IPv6 address is written in brackets inside an address with a port.
@@ -570,6 +693,11 @@ fn operator_sections(text: &mut String, name: &str, operator: &Operator) {
          rtp_symmetric = yes\nforce_rport = yes\n",
         transport_name(operator.transport),
     );
+    // Over TLS the audio is encrypted too, or there is no call: the keys of
+    // SRTP travel in the signalling, which TLS keeps from the network.
+    if operator.transport == SipTransport::Tls {
+        text.push_str("media_encryption = sdes\nmedia_encryption_optimistic = no\n");
+    }
     if operator.credentials.is_some() {
         let _ = writeln!(text, "outbound_auth = {name}");
     }
@@ -578,8 +706,10 @@ fn operator_sections(text: &mut String, name: &str, operator: &Operator) {
         "\n[{name}]\ntype = aor\ncontact = sip:{host}:{}",
         operator.port
     );
-    if operator.transport == SipTransport::Tcp {
-        text.push_str("\\;transport=tcp");
+    match operator.transport {
+        SipTransport::Tcp => text.push_str("\\;transport=tcp"),
+        SipTransport::Tls => text.push_str("\\;transport=tls"),
+        SipTransport::Udp => {}
     }
     text.push_str("\n\n");
     if let Some(credentials) = &operator.credentials {
@@ -620,11 +750,11 @@ fn value(text: &str) -> String {
 mod tests {
     use std::path::PathBuf;
 
-    use node_protocol::messages::Settings;
+    use node_protocol::messages::{Settings, SipTransport};
     use serde_json::json;
 
     use super::{Tree, files, operator_name};
-    use crate::config::Config;
+    use crate::config::{Config, SipTls};
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -639,6 +769,7 @@ mod tests {
             audio_ports: (4100, 4199),
             sip: sip.map(str::parse).transpose()?,
             sip_public: None,
+            sip_tls: None,
         })
     }
 
@@ -711,7 +842,7 @@ mod tests {
         let nothing: Settings = node_protocol::decode_value(
             json!({ "operators": [], "lines": [], "entries": [], "prompts": [] }),
         )?;
-        let files = files(&config(None)?, &tree(), &nothing, "secret")?;
+        let files = files(&config(None)?, &tree(), &nothing, "secret", None)?;
         assert_eq!(file(&files, "pjsip.conf"), "");
         assert_eq!(file(&files, "extensions.conf"), "[gabion-from-network]\n");
         assert_eq!(
@@ -728,6 +859,7 @@ mod tests {
             &tree(),
             &settings()?,
             "secret",
+            None,
         )?;
         let operators = file(&files, "pjsip.conf");
         assert!(operators.contains("endpoint_identifier_order = ip\n"));
@@ -751,13 +883,13 @@ mod tests {
         let mut config = config(Some("203.0.113.5:5060"))?;
         config.state.clone_from(&state);
         let without = file(
-            &files(&config, &tree(), &settings()?, "secret")?,
+            &files(&config, &tree(), &settings()?, "secret", None)?,
             "extensions.conf",
         );
         std::fs::create_dir_all(state.join("prompts"))?;
         std::fs::write(prompt.with_extension("sln16"), [0_u8; 2])?;
         let with = file(
-            &files(&config, &tree(), &settings()?, "secret")?,
+            &files(&config, &tree(), &settings()?, "secret", None)?,
             "extensions.conf",
         );
         std::fs::remove_dir_all(&state)?;
@@ -816,6 +948,7 @@ mod tests {
             &tree(),
             &settings,
             "secret",
+            None,
         )?;
         let dialplan = file(&files, "extensions.conf");
         let expected = format!(
@@ -830,8 +963,55 @@ mod tests {
     }
 
     #[test]
+    fn an_operator_over_tls_is_reached_with_the_nodes_certificate_and_encrypted_audio() -> TestResult
+    {
+        let mut settings = settings()?;
+        let operator = settings.operators.first_mut().ok_or("no operator")?;
+        operator.transport = SipTransport::Tls;
+        let mut config = config(None)?;
+        let problem = files(&config, &tree(), &settings, "secret", None)
+            .err()
+            .unwrap_or_default();
+        assert!(problem.contains("--sip-tls"), "{problem:?}");
+
+        let directory = std::env::temp_dir().join(format!("gabion-tls-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory)?;
+        std::fs::write(directory.join("cert.pem"), "a certificate")?;
+        std::fs::write(directory.join("key.pem"), "a key")?;
+        config.sip_tls = Some(SipTls {
+            address: "203.0.113.5:5061".parse()?,
+            certificate: directory.join("cert.pem"),
+            key: directory.join("key.pem"),
+        });
+        let before = file(
+            &files(&config, &tree(), &settings, "secret", None)?,
+            "pjsip.conf",
+        );
+        std::fs::write(directory.join("cert.pem"), "a renewed certificate")?;
+        let renewed = file(
+            &files(&config, &tree(), &settings, "secret", None)?,
+            "pjsip.conf",
+        );
+        std::fs::remove_dir_all(&directory)?;
+
+        for expected in [
+            "protocol = tls\nbind = 203.0.113.5:5061\nmethod = tlsv1_2\n",
+            "verify_server = yes\nallow_wildcard_certs = yes\n",
+            "ca_list_file = /state/etc/operator-roots.pem\n",
+            "media_encryption = sdes\nmedia_encryption_optimistic = no\n",
+            "contact = sip:[2001:db8::1]:5060\\;transport=tls\n",
+        ] {
+            assert!(before.contains(expected), "{expected:?} in {before}");
+        }
+        // A certificate renewed in place changes the file, so a reload
+        // takes it in.
+        assert_ne!(before, renewed);
+        Ok(())
+    }
+
+    #[test]
     fn settings_with_an_operator_need_a_place_to_listen_for_it() -> TestResult {
-        let problem = files(&config(None)?, &tree(), &settings()?, "secret")
+        let problem = files(&config(None)?, &tree(), &settings()?, "secret", None)
             .err()
             .unwrap_or_default();
         assert!(problem.contains("--sip"), "{problem:?}");

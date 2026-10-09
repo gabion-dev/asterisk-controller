@@ -29,6 +29,11 @@ public sealed interface AudioFrame {
      * @param positionMs  milliseconds of this participant's audio before the frame; unsigned
      * @param audio       exactly twenty milliseconds of audio
      */
+    // The audio is bytes, as the frame carries it; a list of boxed bytes, fifty
+    // times a second for each participant, would be no improvement. What the
+    // check guards against is handled here: the array is copied in and out,
+    // and equality, hashing and the text compare and show its bytes.
+    @SuppressWarnings("ArrayRecordComponent")
     record Heard(ParticipantId participant, long positionMs, byte[] audio) implements AudioFrame {
         public Heard {
             Objects.requireNonNull(participant, "participant");
@@ -38,6 +43,26 @@ public sealed interface AudioFrame {
         @Override
         public byte[] audio() {
             return audio.clone();
+        }
+
+        /** Frames are equal when they say the same: the audio is compared by its bytes. */
+        @Override
+        public boolean equals(Object other) {
+            return other instanceof Heard heard
+                    && participant.equals(heard.participant)
+                    && positionMs == heard.positionMs
+                    && Arrays.equals(audio, heard.audio);
+        }
+
+        @Override
+        public int hashCode() {
+            return Objects.hash(participant, positionMs, Arrays.hashCode(audio));
+        }
+
+        @Override
+        public String toString() {
+            return "Heard[participant=" + participant + ", positionMs=" + positionMs
+                    + ", audio=" + audio.length + " bytes]";
         }
     }
 
@@ -49,6 +74,11 @@ public sealed interface AudioFrame {
      * @param last        whether this frame ends the segment
      * @param audio       a whole number of samples; may be empty only when last
      */
+    // The audio is bytes, as the frame carries it; a list of boxed bytes, fifty
+    // times a second for each participant, would be no improvement. What the
+    // check guards against is handled here: the array is copied in and out,
+    // and equality, hashing and the text compare and show its bytes.
+    @SuppressWarnings("ArrayRecordComponent")
     record Playback(ParticipantId participant, SegmentId segment, boolean last, byte[] audio)
             implements AudioFrame {
         public Playback {
@@ -60,6 +90,27 @@ public sealed interface AudioFrame {
         @Override
         public byte[] audio() {
             return audio.clone();
+        }
+
+        /** Frames are equal when they say the same: the audio is compared by its bytes. */
+        @Override
+        public boolean equals(Object other) {
+            return other instanceof Playback playback
+                    && participant.equals(playback.participant)
+                    && segment.equals(playback.segment)
+                    && last == playback.last
+                    && Arrays.equals(audio, playback.audio);
+        }
+
+        @Override
+        public int hashCode() {
+            return Objects.hash(participant, segment, last, Arrays.hashCode(audio));
+        }
+
+        @Override
+        public String toString() {
+            return "Playback[participant=" + participant + ", segment=" + segment + ", last="
+                    + last + ", audio=" + audio.length + " bytes]";
         }
     }
 

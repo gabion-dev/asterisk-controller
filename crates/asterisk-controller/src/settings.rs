@@ -16,7 +16,7 @@
 
 use std::{collections::HashSet, fs, io::ErrorKind, net::IpAddr, path::Path};
 
-use node_protocol::messages::{EntryKey, Fallback, Operator, Settings, SipTransport};
+use node_protocol::messages::{EntryKey, Fallback, Operator, Settings};
 
 use crate::{destination, state_files};
 
@@ -191,12 +191,6 @@ fn check_operator(operator: &Operator) -> Result<(), String> {
     }
     if u16::try_from(operator.port.get()).is_err() {
         return Err(format!("port {} does not exist", operator.port));
-    }
-    if operator.transport == SipTransport::Tls {
-        return Err(
-            "transport tls needs a certificate of the node, and settings cannot carry one yet"
-                .into(),
-        );
     }
     for network in &operator.source_networks {
         if !is_network(network.as_str()) {
@@ -377,7 +371,6 @@ mod tests {
                 "neither a host name nor an address",
             ),
             ("/operators/0/port", json!(70000), "does not exist"),
-            ("/operators/0/transport", json!("tls"), "certificate"),
             (
                 "/operators/0/source_networks/0",
                 json!("3.80.16.0/40"),
