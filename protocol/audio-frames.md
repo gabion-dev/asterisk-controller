@@ -16,7 +16,9 @@ One format in both directions: signed 16-bit linear PCM, little-endian, mono,
 ## Frames
 
 All integers are big-endian. An identifier is its length in one byte
-(1 to 128) followed by that many bytes of UTF-8.
+(1 to 128) followed by that many bytes of printable ASCII (`!` to `~`) — the
+identifiers of `node-protocol.schema.json` are printable ASCII, so each takes
+one byte a character.
 
 ### Heard — controller to application
 
@@ -72,7 +74,7 @@ participant gone.
 A frame is refused — a protocol error, never a skipped frame — when:
 
 - its first byte is neither `0x01` nor `0x02`;
-- an identifier is empty, longer than 128 bytes, or not UTF-8;
+- an identifier is empty, longer than 128 bytes, or not printable ASCII;
 - it ends before its content does;
 - a heard frame carries anything but exactly 640 bytes of audio;
 - a playback frame carries an odd number of audio bytes, more than 64 000, or

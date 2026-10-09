@@ -53,6 +53,15 @@ pub async fn run(node: Arc<Node>, asterisk: Arc<Asterisk>) {
         let why = match Service::open(&node).await {
             Ok(mut service) => {
                 said_why.clear();
+                // Prompts fetched on the welcome change what the dialplan
+                // says for a message fallback.
+                if let Err(problem) = files_follow_prompts(&node, &asterisk).await {
+                    eprintln!(
+                        "asterisk-controller: the dialplan could not follow the prompts that \
+                         are here now — {problem}; a message fallback whose prompt was missing \
+                         still turns callers away"
+                    );
+                }
                 let why = service.serve(&asterisk).await;
                 service.close(&why).await;
                 why
@@ -258,10 +267,19 @@ impl<'a> Service<'a> {
             };
             self.heard_at = Instant::now();
             match frame {
-                Some(Ok(Frame::Text(text))) => {
-                    return node_protocol::decode(text.as_str())
-                        .map_err(|error| format!("protocol: {error}"));
-                }
+                Some(Ok(Frame::Text(text))) => match node_protocol::decode(text.as_str()) {
+                    Ok(message) => return Ok(message),
+                    Err(error) => match refusal_of_malformed_settings(text.as_str(), &error) {
+                        Some(refusal) => {
+                            eprintln!(
+                                "asterisk-controller: settings that are not what the protocol \
+                                 allows are refused — {error}"
+                            );
+                            self.tell(&refusal).await?;
+                        }
+                        None => return Err(format!("protocol: {error}")),
+                    },
+                },
                 Some(Ok(Frame::Binary(_))) => {
                     return Err("protocol: the service connection carries no binary frames".into());
                 }
@@ -290,6 +308,41 @@ impl<'a> Service<'a> {
         };
         let _ = self.socket.close(Some(close)).await;
     }
+}
+
+/// The refusal of settings the protocol description does not allow — when
+/// the message is settings at all.
+///
+/// A message of the right kind whose settings are wrong is the
+/// application's mistake about its settings, and is answered as refused
+/// settings are: with the fingerprint of what was sent and the reason, on a
+/// connection that goes on. Ending the connection instead would only have
+/// it opened again a second later, saying the old fingerprint, with nobody
+/// told why. Anything else that does not decode is a broken protocol.
+fn refusal_of_malformed_settings(
+    text: &str,
+    error: &node_protocol::DecodeError,
+) -> Option<NodeMessage> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the text failed the description; it is read only to see whether it is settings and to fingerprint them, never used as a message"
+    )]
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    if value.get("type")?.as_str()? != "settings" {
+        return None;
+    }
+    let settings = value.get("settings")?;
+    let fingerprint = node_protocol::sha256_hex(node_protocol::canonical(settings).as_bytes())
+        .parse()
+        .ok()?;
+    let problem: String = format!("the settings are not what the protocol allows: {error}")
+        .chars()
+        .take(PROBLEM_LENGTH)
+        .collect();
+    Some(NodeMessage::SettingsRefused {
+        fingerprint,
+        problem: problem.parse().ok()?,
+    })
 }
 
 /// Apply settings the application gave, while calls go on, and say what
@@ -335,6 +388,27 @@ async fn apply(
         fingerprint: Some(fingerprint),
     });
     Ok(NodeMessage::SettingsApplied { fingerprint: told })
+}
+
+/// Rewrite the files that follow from the settings in force where what
+/// they say has changed without the settings changing — a prompt that was
+/// missing when they were written is here now — and have Asterisk reload
+/// them.
+///
+/// # Errors
+///
+/// A file cannot be written, or Asterisk does not reload it.
+async fn files_follow_prompts(node: &Node, asterisk: &Asterisk) -> Result<(), String> {
+    let config = &node.config;
+    let applied = node.applied();
+    let now = asterisk_files::from_settings(config, &applied.settings)?;
+    for ((name, module), content) in FROM_SETTINGS.iter().zip(now) {
+        if asterisk_files::current(config, name)? != content {
+            asterisk_files::replace(config, name, &content)?;
+            asterisk.reload(module).await?;
+        }
+    }
+    Ok(())
 }
 
 /// Make settings Asterisk's and the node's: judge them, put the files that

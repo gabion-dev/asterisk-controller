@@ -109,7 +109,7 @@ public final class VectorCheck {
             throws Exception {
         Class<?> json = Class.forName(protocolPackage + ".ProtocolJson");
         Method decode = json.getMethod("decode", JsonNode.class, Class.class);
-        Method encode = json.getMethod("encode", Object.class);
+        Method encode = json.getMethod("encode", Object.class, Class.class);
         Class<?> violation = Class.forName(protocolPackage + ".ProtocolViolation");
 
         JsonNode vectors = MAPPER.readTree(Files.readString(file)).get("vectors");
@@ -137,7 +137,7 @@ public final class VectorCheck {
                 problems.add(name + ": accepted but must be refused");
                 continue;
             }
-            JsonNode encoded = MAPPER.readTree((String) encode.invoke(null, decoded));
+            JsonNode encoded = MAPPER.readTree((String) encode.invoke(null, decoded, type));
             if (!encoded.equals(value)) {
                 problems.add(name + ": accepted, but encodes back as " + encoded + " instead of " + value);
             }

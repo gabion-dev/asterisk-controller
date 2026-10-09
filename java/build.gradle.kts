@@ -71,9 +71,11 @@ sourceSets {
     }
 }
 
-// The program that runs the library through the shared vectors has a source
-// set of its own. It is not a test in the build tool's sense — one program,
-// one verdict over two files — and is run by the `vectorCheck` task below.
+// The programs that hold the library to the controller have a source set of
+// their own: one runs it through the shared vectors, the other through a real
+// exchange with the controller. They are not tests in the build tool's sense
+// — each is one program with one verdict — and are run by the `vectorCheck`
+// and `serviceCheck` tasks below.
 val vectors: SourceSet by sourceSets.creating {
     compileClasspath += sourceSets.main.get().output
     runtimeClasspath += sourceSets.main.get().output
@@ -106,6 +108,24 @@ val vectorCheck by tasks.registering(JavaExec::class) {
     args(protocolPackage, messages.asFile.path, audioFrames.asFile.path, fingerprints.asFile.path)
 }
 
+val buildController by tasks.registering(Exec::class) {
+    description = "Builds the controller the service check talks to."
+    group = "build"
+
+    workingDir = repositoryRoot.asFile
+    commandLine("cargo", "build", "--quiet", "--locked", "-p", "asterisk-controller")
+}
+
+val serviceCheck by tasks.registering(JavaExec::class) {
+    description = "Plays the application on the controller's service connection with this library."
+    group = "verification"
+
+    dependsOn(buildController)
+    classpath = vectors.runtimeClasspath
+    mainClass = "ServiceCheck"
+    args(repositoryRoot.file("target/debug/asterisk-controller").asFile.path)
+}
+
 tasks.check {
-    dependsOn(vectorCheck)
+    dependsOn(vectorCheck, serviceCheck)
 }

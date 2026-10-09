@@ -27,7 +27,7 @@
 //! limit: an instance that takes the connection and never answers is as
 //! good as none.
 
-use std::{fs, io::ErrorKind, os::unix::fs::PermissionsExt, path::Path, sync::Arc, time::Duration};
+use std::{fs, io::ErrorKind, path::Path, sync::Arc, time::Duration};
 
 use data_encoding::BASE64;
 use http_body_util::{BodyExt, Empty, Limited};
@@ -52,7 +52,7 @@ use tokio_tungstenite::{
     },
 };
 
-use crate::config::Config;
+use crate::{config::Config, state_files};
 
 /// A connection to the application.
 pub type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -251,7 +251,7 @@ fn secret(state: &Path) -> Result<String, String> {
         }
         Err(error) => return Err(failed(error.to_string())),
     };
-    if metadata.permissions().mode() & 0o077 != 0 {
+    if state_files::open_to_others(&metadata) {
         return Err(failed("others than its owner may read it".into()));
     }
     let secret = fs::read_to_string(&path).map_err(|error| failed(error.to_string()))?;

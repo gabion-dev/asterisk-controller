@@ -172,7 +172,16 @@ fn certificate(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn the_application_is_reached_over_tls_and_only_with_a_trusted_certificate() -> TestResult {
-    let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("application-over-tls");
+    // The node's state directory holds the socket of Asterisk's console,
+    // whose path the controller holds to what a Unix socket address takes:
+    // a directory inside the clone's `target` is too long on a build
+    // machine. So it lives in the system's temporary directory, under a name
+    // of this clone's own.
+    let clone = node_protocol::sha256_hex(env!("CARGO_TARGET_TMPDIR").as_bytes());
+    let root = std::env::temp_dir().join(format!(
+        "application-over-tls-{}",
+        clone.get(..12).ok_or("a digest is shorter than 12")?
+    ));
     prepare(&root)?;
     let (served, key) = certificate(&root.join("application.pem"))?;
     certificate(&root.join("another.pem"))?;

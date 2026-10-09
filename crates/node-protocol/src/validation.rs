@@ -342,7 +342,9 @@ fn check_type(rule: &Value, value: &Value, at: &str) -> Result<(), DecodeError> 
         Some("array") => value.is_array(),
         Some("string") => value.is_string(),
         // A whole number written as a JSON integer: 1.5 and 1.0 are not one.
-        Some("integer") => value.is_i64() || value.is_u64(),
+        // Every integer of the protocol is a signed 64-bit one — what the
+        // other side can hold — whatever its field's lower bound.
+        Some("integer") => value.is_i64(),
         _ => {
             return Err(DecodeError::Description(format!(
                 "type {rule} is not one this checker knows"

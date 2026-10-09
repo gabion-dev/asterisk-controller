@@ -47,6 +47,20 @@ pub enum Message {
         /// The channel.
         channel: Channel,
     },
+    /// The far end of a channel has put the call on hold: no audio is to
+    /// be expected from it until it takes the call off hold.
+    ChannelHold {
+        /// The channel whose far end did so.
+        channel: Channel,
+    },
+    /// The far end of a channel has taken the call off hold.
+    ChannelUnhold {
+        /// The channel.
+        channel: Channel,
+    },
+    /// Another connection has subscribed to the application: from now on
+    /// Asterisk says nothing more about it on this one.
+    ApplicationReplaced,
     /// Anything else Asterisk says.
     #[serde(other)]
     Other,
@@ -60,8 +74,10 @@ impl Message {
             | Self::StasisEnd { channel }
             | Self::ChannelStateChange { channel }
             | Self::ChannelDtmfReceived { channel, .. }
-            | Self::ChannelDestroyed { channel, .. } => Some(&channel.id),
-            Self::Other => None,
+            | Self::ChannelDestroyed { channel, .. }
+            | Self::ChannelHold { channel }
+            | Self::ChannelUnhold { channel } => Some(&channel.id),
+            Self::ApplicationReplaced | Self::Other => None,
         }
     }
 }
@@ -166,6 +182,9 @@ pub fn read_bridge(text: &str) -> Result<Bridge, serde_json::Error> {
 pub struct Channel {
     /// Asterisk's identifier of the channel.
     pub id: String,
+    /// Asterisk's name of the channel, its technology first
+    /// (`PJSIP/operator-00000001`): what Asterisk finds a channel by fastest.
+    pub name: String,
     /// State name, e.g. `Ring` or `Up`.
     pub state: String,
     /// Who is calling.
@@ -223,9 +242,30 @@ pub fn query(value: &str) -> String {
     escaped
 }
 
+/// What Asterisk counts of a channel's audio, as much as the controller reads.
+#[derive(Debug, Deserialize)]
+struct RtpStatistics {
+    /// Packets received from the far end.
+    rxcount: u64,
+}
+
+/// Read how many audio packets a channel has received, from Asterisk's
+/// answer about its RTP statistics.
+///
+/// # Errors
+///
+/// Text that is not such an answer is an error.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "this is Asterisk's language, not the node protocol: there is no description to judge it"
+)]
+pub fn read_received_packets(text: &str) -> Result<u64, serde_json::Error> {
+    serde_json::from_str::<RtpStatistics>(text).map(|statistics| statistics.rxcount)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::is_in_application;
+    use super::{is_in_application, read_received_packets};
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -233,6 +273,7 @@ mod tests {
     fn doing(app_name: &str, app_data: &str) -> String {
         serde_json::json!({
             "id": "1759792000.7",
+            "name": "PJSIP/operator-00000007",
             "state": "Up",
             "caller": { "name": "", "number": "" },
             "dialplan": {
@@ -241,6 +282,17 @@ mod tests {
             }
         })
         .to_string()
+    }
+
+    #[test]
+    fn the_packets_a_channel_received_are_read_from_its_statistics() -> TestResult {
+        let statistics = serde_json::json!({
+            "channel_uniqueid": "1759792000.7", "rxcount": 512, "txcount": 498,
+            "rxjitter": 0.0, "rxploss": 0, "local_ssrc": 1, "remote_ssrc": 2
+        });
+        assert_eq!(read_received_packets(&statistics.to_string())?, 512);
+        assert!(read_received_packets("{}").is_err());
+        Ok(())
     }
 
     #[test]

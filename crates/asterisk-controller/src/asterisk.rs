@@ -75,9 +75,16 @@ pub enum FromAsterisk {
         /// What Asterisk answered with; empty when it could not be asked.
         body: String,
     },
-    /// The connection to Asterisk is lost. Asterisk has stopped, or is no
-    /// longer the Asterisk the conversation's channels were in.
+    /// The conversation's line is closed: nothing more comes on it.
     Gone,
+    /// The connection to Asterisk is lost: Asterisk may have stopped, or
+    /// only the connection. Until it is found again nothing is known of the
+    /// conversation's channels.
+    Lost,
+    /// Asterisk is found again after a loss. What was found of the
+    /// conversation in the node's application, if anything: whoever is not
+    /// in it ended their call meanwhile.
+    Back(Option<conversation::Found>),
 }
 
 #[derive(Default)]
@@ -213,6 +220,7 @@ impl Asterisk {
         // The conversation's requests, one after another. This outlives the
         // conversation by as long as it takes to make what it left behind:
         // its last requests are the ones that take its channels down.
+        let own = to_conversation.clone();
         let asterisk = Arc::clone(self);
         tokio::spawn(async move {
             while let Some((request, method, uri, body)) = asked.recv().await {
@@ -237,6 +245,7 @@ impl Asterisk {
         Line {
             asterisk: Arc::clone(self),
             conversation: conversation.to_owned(),
+            own,
             inbox,
             requests,
         }
@@ -249,6 +258,10 @@ impl Asterisk {
 pub struct Line {
     asterisk: Arc<Asterisk>,
     conversation: String,
+    /// The way into this line's inbox, as the routes hold it: what tells
+    /// this line's routes from those of a later line of the same
+    /// conversation.
+    own: mpsc::UnboundedSender<FromAsterisk>,
     inbox: mpsc::UnboundedReceiver<FromAsterisk>,
     requests: mpsc::UnboundedSender<Asked>,
 }
@@ -285,29 +298,52 @@ impl Line {
 }
 
 impl Drop for Line {
+    /// Take the conversation's routes down — unless a later line of the
+    /// same conversation holds them now. A conversation found again after
+    /// the connection to Asterisk was lost keeps its identifier, and its new
+    /// line may be open before the old one is dropped.
     fn drop(&mut self) {
         let mut routes = self.asterisk.routes();
-        routes.conversations.remove(&self.conversation);
-        routes
-            .channels
-            .retain(|_, conversation| *conversation != self.conversation);
+        let still_ours = routes
+            .conversations
+            .get(&self.conversation)
+            .is_some_and(|routed| routed.same_channel(&self.own));
+        if still_ours {
+            routes.conversations.remove(&self.conversation);
+            routes
+                .channels
+                .retain(|_, conversation| *conversation != self.conversation);
+        }
     }
 }
 
 /// Keep the controller connected to Asterisk for as long as the controller
-/// runs: find Asterisk, clear what an earlier connection left, listen until
+/// runs: find Asterisk, carry on the conversations an earlier connection
+/// left and remove the rest of what it left ([`take_over`]), listen until
 /// the connection is lost, and begin again.
 pub async fn run(node: Arc<Node>, asterisk: Arc<Asterisk>) {
     let mut said_why = String::new();
     loop {
         match connected(&node, &asterisk).await {
-            Ok(()) => {
+            Ok(Ended::Replaced) => {
+                // Taking the application back would only take it from the
+                // other one in turn; staying would be a controller that
+                // hears nothing. It stops, and says why.
+                eprintln!(
+                    "asterisk-controller: the node's application in Asterisk was TAKEN by another \
+                     connection — is a second controller running next to the same Asterisk? \
+                     This controller hears nothing more from Asterisk and stops"
+                );
+                node.replaced.notify_one();
+                return;
+            }
+            Ok(Ended::Lost) => {
                 said_why.clear();
                 eprintln!("asterisk-controller: the connection to Asterisk is LOST");
-                // Every conversation is told. Its channels are out of reach,
-                // and when Asterisk is found again they are leftovers.
+                // Every conversation is told, and waits: when Asterisk is
+                // found again, what it still has of each says who is left.
                 for conversation in asterisk.routes().conversations.values() {
-                    let _ = conversation.send(FromAsterisk::Gone);
+                    let _ = conversation.send(FromAsterisk::Lost);
                 }
             }
             Err(problem) => {
@@ -322,13 +358,31 @@ pub async fn run(node: Arc<Node>, asterisk: Arc<Asterisk>) {
     }
 }
 
+/// How a connection to Asterisk ended.
+enum Ended {
+    /// The connection is gone.
+    Lost,
+    /// Another connection has taken the node's application: nothing more
+    /// comes on this one.
+    Replaced,
+}
+
 /// One connection to Asterisk, from finding it to losing it.
 ///
 /// # Errors
 ///
 /// Asterisk could not be found or would not let the controller in; nothing
 /// was begun.
-async fn connected(node: &Arc<Node>, asterisk: &Arc<Asterisk>) -> Result<(), String> {
+async fn connected(node: &Arc<Node>, asterisk: &Arc<Asterisk>) -> Result<Ended, String> {
+    // What is in the application is read before the event connection is
+    // opened. Until then nobody is connected for the application and no
+    // call can enter it, so what is there is exactly what was left from
+    // before: the conversations of a controller that was restarted, carried
+    // on from here, and the pieces of the audio paths it had built, removed.
+    // Read once the connection is open, it could also hold a call that has
+    // just entered and is not yet known — and be removed as a leftover.
+    let found = take_over(asterisk).await?;
+
     let address = format!(
         "ws://{}/ari/events?app={APPLICATION}&api_key={}",
         asterisk.address,
@@ -339,10 +393,22 @@ async fn connected(node: &Arc<Node>, asterisk: &Arc<Asterisk>) -> Result<(), Str
         .map_err(|error| format!("the event connection: {error}"))?;
     eprintln!("asterisk-controller: connected to Asterisk");
 
-    // What is in the application is from before this connection: the
-    // conversations of a controller that was restarted, carried on from
-    // here, and the pieces of the audio paths it had built, removed.
-    for found in take_over(asterisk).await? {
+    // A conversation still alive in this controller — the connection was
+    // lost, not the controller — is told what was found of it, and goes on
+    // with it. One that was not found ended with Asterisk.
+    let mut found: HashMap<String, conversation::Found> = found
+        .into_iter()
+        .map(|found| (found.id.clone(), found))
+        .collect();
+    for (id, conversation) in &asterisk.routes().conversations {
+        let _ = conversation.send(FromAsterisk::Back(found.remove(id)));
+    }
+
+    // The rest are left by a controller before this one. A participant
+    // found and gone before the connection was open is told by Asterisk's
+    // answer about their channel, which each carried-on conversation asks
+    // for first.
+    for found in found.into_values() {
         let channels: Vec<&str> = found
             .members
             .iter()
@@ -360,6 +426,7 @@ async fn connected(node: &Arc<Node>, asterisk: &Arc<Asterisk>) -> Result<(), Str
     while let Some(Ok(frame)) = events.next().await {
         if let Frame::Text(text) = frame {
             match ari::read(text.as_str()) {
+                Ok(ari::Message::ApplicationReplaced) => return Ok(Ended::Replaced),
                 Ok(message) => pass_on(node, asterisk, message),
                 Err(error) => {
                     eprintln!("asterisk-controller: Asterisk said something unreadable: {error}");
@@ -367,19 +434,19 @@ async fn connected(node: &Arc<Node>, asterisk: &Arc<Asterisk>) -> Result<(), Str
             }
         }
     }
-    Ok(())
+    Ok(Ended::Lost)
 }
 
 /// Read what is in the node's application and sort it: the channels of
 /// participants, by the conversation each belongs to, with the groups
 /// their bridges make — and everything else, which is removed.
 ///
-/// Nothing new can enter the application before this connection —
-/// to Asterisk it does not exist while nobody is connected for it — so what
-/// is found is exactly what a controller before this one left: its
-/// conversations, which carry on, and the media channels, taps and bridges
-/// of the audio paths it had built, which died with it or are of no use to
-/// anyone, and nobody may be left on a line that no one controls.
+/// Read while nobody is connected for the application ([`connected`]):
+/// nothing can enter it then, so what is found is exactly what a controller
+/// before this one left — its conversations, which carry on, and the media
+/// channels, taps and bridges of the audio paths it had built, which died
+/// with it or are of no use to anyone, and nobody may be left on a line
+/// that no one controls.
 async fn take_over(asterisk: &Asterisk) -> Result<Vec<conversation::Found>, String> {
     let (status, body) = asterisk
         .request("GET", &format!("applications/{APPLICATION}"))

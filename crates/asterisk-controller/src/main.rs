@@ -27,17 +27,24 @@ mod prompts;
 mod reports;
 mod service;
 mod settings;
+mod state_files;
 
 use std::{
     process::ExitCode,
     sync::{Arc, RwLock},
 };
-use tokio::net::{TcpListener, TcpStream};
+use tokio::{
+    net::{TcpListener, TcpStream},
+    signal::unix::{SignalKind, signal},
+};
 use tokio_tungstenite::{
     accept_hdr_async,
     tungstenite::{
         handshake::server::{ErrorResponse, Request, Response},
-        http::{HeaderValue, StatusCode, header::SEC_WEBSOCKET_PROTOCOL},
+        http::{
+            HeaderValue, StatusCode,
+            header::{AUTHORIZATION, SEC_WEBSOCKET_PROTOCOL},
+        },
     },
 };
 
@@ -73,6 +80,17 @@ async fn main() -> ExitCode {
         }
     };
 
+    // Whoever runs the node stops the controller with SIGTERM, or with
+    // SIGINT from a terminal; either is a stop asked for, and ends it with
+    // success.
+    let mut terminate = match signal(SignalKind::terminate()) {
+        Ok(terminate) => terminate,
+        Err(error) => {
+            eprintln!("asterisk-controller: cannot listen for SIGTERM: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     let listener = match TcpListener::bind(config.listen).await {
         Ok(listener) => listener,
         Err(error) => {
@@ -89,6 +107,7 @@ async fn main() -> ExitCode {
     println!("asterisk-controller ready on {}", config.listen);
 
     let asterisk = asterisk::Asterisk::new(config.asterisk_http, &secret);
+    let media_authorization: Arc<str> = media::authorization(&secret).into();
     let reports = reports::Journal::of(&config.state);
     let node = Arc::new(Node {
         config,
@@ -104,6 +123,7 @@ async fn main() -> ExitCode {
         reports,
         door: media::Door::default(),
         lines: node::Lines::default(),
+        replaced: tokio::sync::Notify::new(),
     });
     tokio::spawn(asterisk::run(Arc::clone(&node), Arc::clone(&asterisk)));
     tokio::spawn(service::run(Arc::clone(&node), asterisk));
@@ -112,11 +132,17 @@ async fn main() -> ExitCode {
         tokio::select! {
             accepted = listener.accept() => match accepted {
                 Ok((stream, _peer)) => {
-                    tokio::spawn(accept_media(stream, node.door.clone()));
+                    tokio::spawn(accept_media(
+                        stream,
+                        node.door.clone(),
+                        Arc::clone(&media_authorization),
+                    ));
                 }
                 Err(error) => eprintln!("asterisk-controller: accept failed: {error}"),
             },
             _ = tokio::signal::ctrl_c() => return ExitCode::SUCCESS,
+            _ = terminate.recv() => return ExitCode::SUCCESS,
+            () = node.replaced.notified() => return ExitCode::FAILURE,
         }
     }
 }
@@ -145,7 +171,7 @@ fn prepare_asterisk(config: &Config) -> Result<(settings::Applied, String, Strin
     for prompt in prompts::missing(&config.state, &applied.settings) {
         eprintln!(
             "asterisk-controller: prompt {:?} is not here; it is fetched when the application \
-             welcomes the node, and until then a message fallback plays nothing",
+             welcomes the node, and until then a message fallback with it turns callers away",
             prompt.id.as_str()
         );
     }
@@ -158,8 +184,9 @@ fn prepare_asterisk(config: &Config) -> Result<(settings::Applied, String, Strin
 }
 
 /// Complete the WebSocket handshake of a media connection of Asterisk and
-/// serve it.
-async fn accept_media(stream: TcpStream, door: media::Door) {
+/// serve it. Only Asterisk is let in: the connection must present the
+/// control secret Asterisk has from its configuration.
+async fn accept_media(stream: TcpStream, door: media::Door, authorization: Arc<str>) {
     #[expect(
         clippy::result_large_err,
         reason = "the callback's signature is the WebSocket library's"
@@ -167,6 +194,13 @@ async fn accept_media(stream: TcpStream, door: media::Door) {
     let agree = |request: &Request, mut response: Response| {
         if request.uri().path() != media::PATH {
             return Err(not_found(request.uri().path()));
+        }
+        let presented = request
+            .headers()
+            .get(AUTHORIZATION)
+            .and_then(|value| value.to_str().ok());
+        if presented != Some(&*authorization) {
+            return Err(unauthorized());
         }
         response.headers_mut().insert(
             SEC_WEBSOCKET_PROTOCOL,
@@ -178,6 +212,15 @@ async fn accept_media(stream: TcpStream, door: media::Door) {
         Ok(asterisk) => media::serve(asterisk, door).await,
         Err(error) => eprintln!("asterisk-controller: handshake with Asterisk failed: {error}"),
     }
+}
+
+/// The refusal of a media connection that is not Asterisk's.
+fn unauthorized() -> ErrorResponse {
+    let mut refusal = ErrorResponse::new(Some(
+        "a media connection is Asterisk's, with the node's control secret".to_owned(),
+    ));
+    *refusal.status_mut() = StatusCode::UNAUTHORIZED;
+    refusal
 }
 
 /// The refusal of a connection to a path the controller does not have.

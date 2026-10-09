@@ -21,7 +21,7 @@ use std::{
 use node_protocol::messages::{EntryKey, Fallback, Operator, Settings, SipTransport};
 use sha2::{Digest, Sha256};
 
-use crate::{config::Config, destination, media, prompts};
+use crate::{config::Config, destination, media, prompts, state_files};
 
 /// The Asterisk versions this controller knows how to drive. What Asterisk
 /// says about its channels, what its media channel does and how its
@@ -35,15 +35,20 @@ pub const APPLICATION: &str = "gabion";
 pub const CONTROL_USER: &str = "gabion-controller";
 /// The file of the state directory that holds that user's secret.
 const SECRET_FILE: &str = "control-secret";
-/// How many times, a second apart, a call that cannot enter the node's
-/// application tries again before the fallback of its entry is carried
-/// out. A call cannot enter while the controller is not connected to
+/// How many times in all a call tries to enter the node's application
+/// before the fallback of its entry is carried out — the first try and the
+/// tries after it, a second apart (so the last try comes four seconds after
+/// the first). A call cannot enter while the controller is not connected to
 /// Asterisk; this is how long whoever runs the node has to start the
 /// controller again before callers are turned to the fallback.
 const ENTRY_TRIES: u32 = 5;
 /// The dialplan context calls from telephone operators arrive in. Nothing
 /// in it leads back out to the network.
 pub const NETWORK_CONTEXT: &str = "gabion-from-network";
+/// Why a caller is turned away when the prompt of a message fallback is
+/// not here: a temporary failure (Q.850 cause 41) — the message will be
+/// there once the application gives it.
+const PROMPT_MISSING_CAUSE: u8 = 41;
 /// The label of the step of an entry where its fallback begins.
 pub const FALLBACK_LABEL: &str = "fallback";
 const FALLBACK_STEP: &str = "(fallback)";
@@ -133,25 +138,48 @@ pub fn operator_name(operator: &Operator) -> String {
 /// It is made once for a state directory and kept there. Asterisk reads it
 /// from its configuration when it starts, and a controller that is started
 /// again next to a running Asterisk must present the same one. Nobody but
-/// the owner of the state directory can read it.
+/// its owner can read it.
+///
+/// The controller writes the file whole, so a file it made is never empty;
+/// one that is empty, or open to others, was touched by someone else, and
+/// the controller does not start on it — a secret replaced quietly would
+/// not be the one a running Asterisk has read, and one others can read is
+/// no secret.
 ///
 /// # Errors
 ///
-/// The state directory cannot be written or the secret cannot be read.
+/// The state directory cannot be written, the secret cannot be read, or
+/// the file is empty or open to others than its owner.
 pub fn control_secret(state: &Path) -> Result<String, String> {
     let path = state.join(SECRET_FILE);
-    let failed = |error: std::io::Error| format!("{}: {error}", path.display());
-    match fs::read_to_string(&path) {
-        Ok(secret) if !secret.trim().is_empty() => return Ok(secret.trim().to_owned()),
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(failed(error)),
+    let failed = |problem: &dyn std::fmt::Display| format!("{}: {problem}", path.display());
+    match fs::metadata(&path) {
+        Ok(metadata) => {
+            if state_files::open_to_others(&metadata) {
+                return Err(failed(
+                    &"others than its owner may read it; the controller makes it readable by \
+                      its owner alone, so someone else has changed it",
+                ));
+            }
+            let secret = fs::read_to_string(&path).map_err(|error| failed(&error))?;
+            let secret = secret.trim();
+            if secret.is_empty() {
+                return Err(failed(
+                    &"it is empty; the controller never writes it so, and a new secret would \
+                      not be the one Asterisk has read — remove the file and restart Asterisk \
+                      after the controller",
+                ));
+            }
+            Ok(secret.to_owned())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir_all(state).map_err(|error| failed(&error))?;
+            let secret = uuid::Uuid::new_v4().simple().to_string();
+            state_files::replace(&path, secret.as_bytes()).map_err(|error| failed(&error))?;
+            Ok(secret)
+        }
+        Err(error) => Err(failed(&error)),
     }
-    fs::create_dir_all(state).map_err(failed)?;
-    let secret = uuid::Uuid::new_v4().simple().to_string();
-    fs::write(&path, &secret).map_err(failed)?;
-    owner_only(&path, 0o600).map_err(failed)?;
-    Ok(secret)
 }
 
 /// Leave a file or directory readable by its owner alone.
@@ -188,7 +216,7 @@ pub fn write(
         Err(error) => return Err(failed(&etc, error)),
     }
     // Asterisk looks for keys in a `keys` directory inside its key directory.
-    for directory in ["etc", "db", "keys/keys", "spool", "run", "log"] {
+    for directory in ["etc", "db", "keys/keys", "spool", "run", "log", "cache"] {
         let directory = config.state.join(directory);
         fs::create_dir_all(&directory).map_err(|error| failed(&directory, error))?;
     }
@@ -197,7 +225,7 @@ pub fn write(
     owner_only(&etc, 0o700).map_err(|error| failed(&etc, error))?;
     for (name, content) in files {
         let path = etc.join(name);
-        fs::write(&path, content).map_err(|error| failed(&path, error))?;
+        state_files::replace(&path, content.as_bytes()).map_err(|error| failed(&path, error))?;
     }
     Ok(etc.join("asterisk.conf"))
 }
@@ -246,12 +274,9 @@ pub fn current(config: &Config, name: &str) -> Result<String, String> {
 ///
 /// The file cannot be written.
 pub fn replace(config: &Config, name: &str, content: &str) -> Result<(), String> {
-    let etc = config.state.join("etc");
-    let path = etc.join(name);
-    let written = etc.join(format!(".{name}.new"));
-    let failed = |error: std::io::Error| format!("{}: {error}", path.display());
-    fs::write(&written, content).map_err(failed)?;
-    fs::rename(&written, &path).map_err(failed)
+    let path = config.state.join("etc").join(name);
+    state_files::replace(&path, content.as_bytes())
+        .map_err(|error| format!("{}: {error}", path.display()))
 }
 
 /// Every configuration file, by name.
@@ -297,7 +322,7 @@ fn files(
                 .to_owned(),
         ),
         ("ari.conf", control_interface(secret)),
-        ("websocket_client.conf", connections(config)),
+        ("websocket_client.conf", connections(config, secret)),
         ("extensions.conf", dialplan(config, settings)),
         ("pjsip.conf", operators(config, settings)?),
     ];
@@ -305,9 +330,10 @@ fn files(
     Ok(files)
 }
 
-/// No path is compiled into an Asterisk tree: every directory is named here.
-/// The tree is only read; everything Asterisk writes goes under the state
-/// directory.
+/// Every directory of Asterisk, named. The build compiles defaults into
+/// Asterisk (under `/opt/asterisk-server`); naming each one here means no
+/// default is ever used. The tree is only read; everything Asterisk writes
+/// goes under the state directory.
 fn directories(config: &Config) -> String {
     let tree = &config.asterisk_tree;
     let state = &config.state;
@@ -315,7 +341,8 @@ fn directories(config: &Config) -> String {
     format!(
         "[directories]\nastetcdir => {}\nastmoddir => {}\nastvarlibdir => {lib}\n\
          astdatadir => {lib}\nastagidir => {}\nastsbindir => {}\nastdbdir => {}\n\
-         astkeydir => {}\nastspooldir => {}\nastrundir => {}\nastlogdir => {}\n",
+         astkeydir => {}\nastspooldir => {}\nastrundir => {}\nastlogdir => {}\n\
+         astcachedir => {}\n",
         state.join("etc").display(),
         tree.join("lib/asterisk/modules").display(),
         lib.join("agi-bin").display(),
@@ -325,6 +352,7 @@ fn directories(config: &Config) -> String {
         state.join("spool").display(),
         state.join("run").display(),
         state.join("log").display(),
+        state.join("cache").display(),
         lib = lib.display(),
     )
 }
@@ -350,17 +378,20 @@ fn control_interface(secret: &str) -> String {
 }
 
 /// Asterisk's connections to the controller: one for each media channel,
-/// opened when the channel is created. For control it is the controller
-/// that connects to Asterisk.
-fn connections(config: &Config) -> String {
+/// opened when the channel is created, proving itself with the control
+/// secret. For control it is the controller that connects to Asterisk.
+fn connections(config: &Config, secret: &str) -> String {
     format!(
         "[{media}]\ntype = websocket_client\nuri = ws://{listen}{path}\nprotocols = {protocol}\n\
+         username = {user}\npassword = {password}\n\
          connection_type = per_call_config\nconnection_timeout = 500\n\
          reconnect_interval = 500\nreconnect_attempts = 4\ntls_enabled = no\n",
         listen = config.listen,
         media = media::CONNECTION,
         path = media::PATH,
         protocol = media::SUBPROTOCOL,
+        user = media::USER,
+        password = value(secret),
     )
 }
 
@@ -441,15 +472,26 @@ fn fallback(config: &Config, settings: &Settings, fallback: &Fallback) -> Vec<St
             Err(_) => Vec::new(),
         },
         // The prompt is played from its file; playing answers the caller.
+        // Without the file there is no message to give: the caller is
+        // turned away unanswered, as by a temporary failure, rather than
+        // answered with silence. The file is fetched when the application
+        // welcomes the node, and this is written again then.
         Fallback::Message { prompt } => settings
             .prompts
             .iter()
             .find(|named| named.id == *prompt)
             .map(|named| {
-                vec![format!(
-                    "Playback({})",
-                    prompts::playable(&config.state, named).display()
-                )]
+                if prompts::is_here(&config.state, named) {
+                    vec![format!(
+                        "Playback({})",
+                        prompts::playable(&config.state, named).display()
+                    )]
+                } else {
+                    vec![
+                        "NoOp(the prompt of the message is not here)".to_owned(),
+                        format!("Hangup({PROMPT_MISSING_CAUSE})"),
+                    ]
+                }
             })
             // Checked settings name only prompts they have.
             .unwrap_or_default(),
@@ -565,9 +607,11 @@ fn operator_sections(text: &mut String, name: &str, operator: &Operator) {
 }
 
 /// A free-form value as it is written into Asterisk's configuration. A
-/// semicolon would begin a comment, so it is written escaped. Everything
-/// else that the format cannot carry was refused when the settings were
-/// checked ([`crate::settings::check`]).
+/// semicolon would begin a comment, so it is written escaped. Every value is
+/// written after `= `, with the space: Asterisk takes a `>` right after the
+/// `=` as part of `=>` and drops it, so a value beginning with `>` keeps it
+/// only behind the space. Everything else that the format cannot carry was
+/// refused when the settings were checked ([`crate::settings::check`]).
 fn value(text: &str) -> String {
     text.replace(';', "\\;")
 }
@@ -700,15 +744,25 @@ mod tests {
 
     #[test]
     fn an_entry_tries_the_application_and_falls_back_when_it_cannot_enter() -> TestResult {
-        let playback = format!(" same = n,Playback(/state/prompts/{})", "0".repeat(64));
-        let files = files(
-            &config(Some("203.0.113.5:5060"))?,
-            &tree(),
-            &settings()?,
-            "secret",
-        )?;
-        assert_eq!(
-            file(&files, "extensions.conf"),
+        // The fallback's message is played from its file when the node has
+        // it, and the caller is turned away unanswered when it does not.
+        let state = std::env::temp_dir().join(format!("gabion-state-{}", uuid::Uuid::new_v4()));
+        let prompt = state.join("prompts").join("0".repeat(64));
+        let mut config = config(Some("203.0.113.5:5060"))?;
+        config.state.clone_from(&state);
+        let without = file(
+            &files(&config, &tree(), &settings()?, "secret")?,
+            "extensions.conf",
+        );
+        std::fs::create_dir_all(state.join("prompts"))?;
+        std::fs::write(prompt.with_extension("sln16"), [0_u8; 2])?;
+        let with = file(
+            &files(&config, &tree(), &settings()?, "secret")?,
+            "extensions.conf",
+        );
+        std::fs::remove_dir_all(&state)?;
+
+        let dialplan = |fallback: &[&str]| {
             [
                 "[gabion-from-network]",
                 "exten = +19715870050,1,Set(GABION_TRIES=0)",
@@ -719,11 +773,21 @@ mod tests {
                 " same = n,Wait(1)",
                 " same = n,Goto(enter)",
                 " same = n(fallback),NoOp(the fallback of the entry)",
-                playback.as_str(),
-                " same = n(done),Hangup()",
-                "",
             ]
+            .into_iter()
+            .chain(fallback.iter().copied())
+            .chain([" same = n(done),Hangup()", ""])
+            .collect::<Vec<_>>()
             .join("\n")
+        };
+        let playback = format!(" same = n,Playback({})", prompt.display());
+        assert_eq!(with, dialplan(&[playback.as_str()]));
+        assert_eq!(
+            without,
+            dialplan(&[
+                " same = n,NoOp(the prompt of the message is not here)",
+                " same = n,Hangup(41)",
+            ])
         );
         Ok(())
     }

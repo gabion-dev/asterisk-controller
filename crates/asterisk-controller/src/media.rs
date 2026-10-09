@@ -34,6 +34,19 @@ pub const CONNECTION: &str = "gabion-media";
 pub const PATH: &str = "/media";
 /// The WebSocket subprotocol Asterisk speaks on a media connection.
 pub const SUBPROTOCOL: &str = "media";
+/// The user Asterisk presents when it opens a media connection. Its
+/// password is the controller's control secret, which Asterisk reads from
+/// its configuration: the loopback address keeps the network out, and this
+/// keeps out every other process of the machine.
+pub const USER: &str = "gabion-asterisk";
+
+/// The `Authorization` header a media connection must come with.
+pub fn authorization(secret: &str) -> String {
+    format!(
+        "Basic {}",
+        data_encoding::BASE64.encode(format!("{USER}:{secret}").as_bytes())
+    )
+}
 /// The audio format the controller asks every media channel for: the one
 /// format of the node protocol, so nothing is converted here.
 pub const FORMAT: &str = "slin16";

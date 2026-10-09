@@ -42,7 +42,13 @@
 //! that takes the conversation is told what it is like now, and nothing of
 //! what its predecessor had asked for.
 
-use std::{collections::HashMap, fmt, num::NonZeroU64, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+    num::NonZeroU64,
+    sync::Arc,
+    time::Duration,
+};
 
 use futures_util::{SinkExt, StreamExt};
 use node_protocol::{
@@ -50,9 +56,10 @@ use node_protocol::{
     audio::{AudioFrame, AudioFrameError},
     messages::{
         ApplicationMessage, Command, CommandOutcome, CommandRejection, ControllerMessage,
-        ConversationId, Departure, EndReason, EntryKey, Event, Fallback, FallbackKind, LineId,
-        Opening, Origin, Participant, ParticipantId, ParticipantMedium, ParticipantSnapshot,
-        ParticipantState as StateTold, PhoneNumber, RejectReason, Report, SegmentId,
+        ConversationId, Departure, EndReason, EntryKey, Event, Fallback, FallbackFailure,
+        FallbackKind, LineId, Opening, Origin, Participant, ParticipantId, ParticipantMedium,
+        ParticipantSnapshot, ParticipantState as StateTold, PhoneNumber, RejectReason, Report,
+        SegmentId,
     },
 };
 use tokio::{sync::mpsc, time::Instant};
@@ -71,11 +78,22 @@ use crate::{
     media::{self, FromMedia},
     node::{Node, Place},
     playout::{FRAME_BYTES, Outcome, Playout, ToMedium},
-    reports,
+    prompts, reports,
 };
 
 /// Milliseconds of audio in one heard frame.
 const HEARD_FRAME_MS: u64 = 20;
+/// How long a participant's audio may stop arriving before the node says it
+/// is lost. Audio arrives in quiet moments too — packets of silence — so
+/// what is waited for is not speech; five seconds is the author's decision,
+/// longer than the four seconds a real network was seen to drop audio for
+/// and recover by itself.
+const MEDIUM_LOST_AFTER: Duration = Duration::from_secs(5);
+/// How often Asterisk is asked how much audio each participant has sent.
+/// Asterisk says nothing when audio stops: its count is the state, read at
+/// this pace — which also bounds how late the end of a held participant's
+/// limit is noticed.
+const MEDIUM_READ_EVERY: Duration = Duration::from_secs(1);
 /// How much a media connection may say before the conversation has taken it
 /// in. Past this the connection waits, and Asterisk with it: audio is never
 /// piled up without bound behind an application that does not read.
@@ -129,6 +147,19 @@ enum ParticipantState {
 }
 
 impl Member {
+    /// Whether the audio they send is watched: they have answered, the node
+    /// is not dropping them, and their channel carries audio Asterisk
+    /// counts — a SIP channel. A channel of another kind has no such count.
+    fn medium_watched(&self) -> bool {
+        self.state == ParticipantState::InConversation
+            && !self.removed_by_us
+            && !self.watch.unwatchable
+            && self
+                .name
+                .as_deref()
+                .is_some_and(|name| name.starts_with("PJSIP/"))
+    }
+
     /// Whether they called in and have not been answered yet.
     fn rings_in(&self) -> bool {
         self.state == ParticipantState::Ringing && !self.awaiting_answer
@@ -181,6 +212,46 @@ struct Member {
     group: Option<u64>,
     /// Where Asterisk has been asked to put their channel.
     put: Put,
+    /// Asterisk's name of their channel, once Asterisk has said it.
+    name: Option<String>,
+    /// What is known of the audio they send.
+    watch: Watch,
+    /// Why they leave, when the node drops them for a reason of its own.
+    leaving: Option<Departure>,
+}
+
+/// What the node knows of the audio a participant sends: how many packets
+/// Asterisk has received from them, and what follows from that. Whether
+/// they are held is an axis of its own, beside whether they have answered.
+struct Watch {
+    /// The count last read; none yet.
+    received: Option<u64>,
+    /// When the count last grew — or watching began.
+    grew_at: Instant,
+    /// Their far end has put the call on hold: no audio is expected.
+    far_end_on_hold: bool,
+    /// Their audio stopped arriving and they are held, since then.
+    held_since: Option<Instant>,
+    /// How long they stay held before they count as gone (`hold_for`).
+    hold_limit: Duration,
+    /// A count has been asked for and not answered yet.
+    asking: bool,
+    /// Asterisk keeps no count for their channel.
+    unwatchable: bool,
+}
+
+impl Watch {
+    fn new() -> Self {
+        Self {
+            received: None,
+            grew_at: Instant::now(),
+            far_end_on_hold: false,
+            held_since: None,
+            hold_limit: Duration::ZERO,
+            asking: false,
+            unwatchable: false,
+        }
+    }
 }
 
 /// Where a participant's channel has been asked to be.
@@ -305,6 +376,8 @@ pub struct FoundMember {
     pub participant: ParticipantId,
     /// Their channel.
     pub channel: String,
+    /// Asterisk's name of their channel.
+    pub name: String,
     /// Their number, when known.
     pub number: Option<PhoneNumber>,
     /// They have answered.
@@ -335,6 +408,7 @@ pub fn found(
     let member = FoundMember {
         participant,
         channel: channel.id.clone(),
+        name: channel.name.clone(),
         number: notes
             .get(NOTE_NUMBER)
             .and_then(|number| number.parse().ok()),
@@ -379,6 +453,10 @@ enum Step {
     Tap,
     EnterGroup,
     LeaveGroup,
+    Answer,
+    TurnAway,
+    HangUp,
+    SendDigits,
 }
 
 impl fmt::Display for Step {
@@ -390,6 +468,10 @@ impl fmt::Display for Step {
             Self::Tap => "tap the participant's channel",
             Self::EnterGroup => "put the participant into a group",
             Self::LeaveGroup => "take the participant out of a group",
+            Self::Answer => "answer the call",
+            Self::TurnAway => "turn the call away",
+            Self::HangUp => "hang up the participant",
+            Self::SendDigits => "send tone digits to the participant",
         })
     }
 }
@@ -414,8 +496,11 @@ enum Pending {
     Group,
     /// Whether a participant found at a restart is still there.
     Exists(ParticipantId),
-    /// A caller sent to the message of their entry's fallback: the channel.
-    Message(String),
+    /// A caller sent to the message of their entry's fallback: their
+    /// channel, and who they are.
+    Message(String, ParticipantId),
+    /// How much audio a participant has sent.
+    Medium(ParticipantId),
     /// Housekeeping of the controller; nobody waits for the answer.
     Internal,
 }
@@ -440,6 +525,14 @@ struct Conversation {
     /// How the conversation came to exist.
     origin: Origin,
     fallback: FallbackProgress,
+    /// Why the fallback in progress is failing, as first learned: the reason
+    /// its report gives when it is given up.
+    fallback_failure: Option<FallbackFailure>,
+    /// The connection to Asterisk is lost, and it has not been found again:
+    /// nothing is known of the participants, and nothing is asked of it.
+    server_lost: bool,
+    /// When Asterisk is next asked how much audio each participant has sent.
+    medium_read_at: Instant,
     members: Vec<Member>,
     pending: HashMap<String, Pending>,
     next_request: u64,
@@ -472,6 +565,10 @@ struct Conversation {
     /// such a participant from the answer to its `dial` command, and that
     /// answer waits for Asterisk's; events about them wait with it.
     unannounced: HashMap<ParticipantId, Vec<Event>>,
+    /// The identifiers of the commands the owner has sent on its connection.
+    /// The description makes each unique on a connection: answers are told
+    /// apart by them, and one used twice would make two answers alike.
+    command_ids: HashSet<u64>,
 }
 
 /// The channel a call arrived on.
@@ -531,6 +628,9 @@ fn begin(
     let first = Member {
         id: participant_id(&node, 1)?,
         number: channel.caller.number.parse().ok(),
+        name: Some(channel.name),
+        watch: Watch::new(),
+        leaving: None,
         channel: channel.id,
         state: if channel.state == ari::STATE_UP {
             ParticipantState::InConversation
@@ -562,6 +662,9 @@ fn begin(
         pings: 0,
         origin,
         fallback: FallbackProgress::NotBegun,
+        fallback_failure: None,
+        server_lost: false,
+        medium_read_at: Instant::now(),
         members: vec![first],
         pending: HashMap::new(),
         next_request: 0,
@@ -576,6 +679,7 @@ fn begin(
         caller: Some(caller),
         names,
         unannounced: HashMap::new(),
+        command_ids: HashSet::new(),
     };
     Ok((conversation, opening))
 }
@@ -632,6 +736,9 @@ impl Conversation {
                 Member {
                     id: member.participant,
                     number: member.number,
+                    name: Some(member.name),
+                    watch: Watch::new(),
+                    leaving: None,
                     channel: member.channel,
                     state: if member.answered {
                         ParticipantState::InConversation
@@ -660,6 +767,9 @@ impl Conversation {
             pings: 0,
             origin: found.origin,
             fallback: FallbackProgress::NotBegun,
+            fallback_failure: None,
+            server_lost: false,
+            medium_read_at: Instant::now(),
             members,
             pending: HashMap::new(),
             next_request: 0,
@@ -674,6 +784,7 @@ impl Conversation {
             caller,
             names,
             unannounced: HashMap::new(),
+            command_ids: HashSet::new(),
         };
         // A group that has lost all but one of its people is no group.
         for group in groups {
@@ -767,6 +878,7 @@ impl Conversation {
             // With an application the fallback has no part; should this one
             // be lost too, a caller alone is given it again.
             self.fallback = FallbackProgress::NotBegun;
+            self.fallback_failure = None;
             owned = Ok(());
         }
     }
@@ -785,6 +897,7 @@ impl Conversation {
             .await
             .map_err(Fault::Owner)?;
         self.application = Some(socket);
+        self.command_ids.clear();
         self.heard_at = Instant::now();
         self.ping_at = self.heard_at + PING_EVERY;
         let offered = async {
@@ -795,6 +908,9 @@ impl Conversation {
         .await;
         if matches!(offered, Err(Fault::Owner(_))) {
             self.application = None;
+        }
+        if offered.is_ok() && self.server_lost {
+            self.event(Event::TelephonyServerLost).await?;
         }
         offered
     }
@@ -830,6 +946,9 @@ impl Conversation {
                 participant: member.known(),
                 state: match member.state {
                     ParticipantState::Ringing => StateTold::Ringing,
+                    ParticipantState::InConversation if member.watch.held_since.is_some() => {
+                        StateTold::Held
+                    }
                     ParticipantState::InConversation => StateTold::InConversation,
                 },
             })
@@ -937,6 +1056,9 @@ impl Conversation {
                 () = tokio::time::sleep_until(due), if self.application.is_some() => {
                     self.keep_alive().await?;
                 }
+                () = tokio::time::sleep_until(self.medium_read_at), if self.watching_media() => {
+                    self.read_media();
+                }
             }
         }
 
@@ -994,7 +1116,76 @@ impl Conversation {
             } => self.answered(&request, status, &body).await,
             // Whoever is still listed left with Asterisk.
             FromAsterisk::Gone => self.asterisk_gone().await,
+            FromAsterisk::Lost => self.telephony_server_lost().await,
+            FromAsterisk::Back(found) => self.telephony_server_back(found).await,
         }
+    }
+
+    /// Asterisk is lost. Until it is found again nothing is known of the
+    /// participants — their calls may go on or may have ended — and nothing
+    /// is asked of it. The audio paths are lost with it: what was queued is
+    /// dropped, and listening ends; the owner is told, and asks again when
+    /// it is back.
+    async fn telephony_server_lost(&mut self) -> Result<(), Fault> {
+        if self.server_lost {
+            return Ok(());
+        }
+        self.server_lost = true;
+        let mut dropped = Vec::new();
+        for member in &mut self.members {
+            if let Some(mut sound) = member.sound.take() {
+                // The bridge they were in goes with the path.
+                if member.put == Put::BesideMedia {
+                    member.put = Put::Nowhere;
+                }
+                let mut outcomes = Vec::new();
+                sound.playout.abandon(&mut outcomes);
+                dropped.push((member.id.clone(), sound, outcomes));
+            }
+        }
+        let owned = self.application.is_some();
+        for (participant, sound, outcomes) in dropped {
+            self.close_sound(&sound);
+            if owned {
+                self.report(&participant, outcomes).await?;
+            }
+        }
+        if owned {
+            self.event(Event::TelephonyServerLost).await?;
+        }
+        Ok(())
+    }
+
+    /// Asterisk is found again. Whoever is not in what was found of the
+    /// conversation ended their call meanwhile, how is not known; the
+    /// others are where they were.
+    async fn telephony_server_back(&mut self, found: Option<Found>) -> Result<(), Fault> {
+        if !self.server_lost {
+            return Ok(());
+        }
+        self.server_lost = false;
+        let still: HashSet<String> = found
+            .map(|found| {
+                found
+                    .members
+                    .into_iter()
+                    .map(|member| member.channel)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let gone: Vec<String> = self
+            .members
+            .iter()
+            .filter(|member| !still.contains(&member.channel))
+            .map(|member| member.channel.clone())
+            .collect();
+        for channel in gone {
+            self.left_as(&channel, None, Some(Departure::Lost)).await?;
+        }
+        if self.application.is_some() {
+            self.event(Event::TelephonyServerBack).await?;
+        }
+        Ok(())
     }
 
     /// The application is gone, and with it everything that lived only
@@ -1045,7 +1236,10 @@ impl Conversation {
         let mut said_why = String::new();
         let mut holding_reported = false;
         loop {
-            if self.members.is_empty() {
+            // A caller sent to the message has left the conversation, but
+            // the fallback is reported by Asterisk's answer, which may come
+            // after they have gone.
+            if self.members.is_empty() && !self.message_answer_awaited() {
                 return Ok(false);
             }
             if look {
@@ -1062,7 +1256,11 @@ impl Conversation {
                 look = false;
                 look_at = Instant::now() + LOOK_FOR_OWNER;
             }
-            self.keep_without_owner().await?;
+            // Without Asterisk there is nothing to do for anyone, and nothing
+            // known of them.
+            if !self.server_lost {
+                self.keep_without_owner().await?;
+            }
             if !holding_reported && self.someone_is_connected() {
                 holding_reported = true;
                 self.keep_report(|conversation, at_unix_ms| Report::HoldingWithoutOwner {
@@ -1074,8 +1272,176 @@ impl Conversation {
                 said = self.asterisk.next() => self.asterisk_said(said).await?,
                 Some(said) = self.from_media.recv() => self.on_media(said).await?,
                 () = tokio::time::sleep_until(look_at), if self.someone_is_connected() => look = true,
+                () = tokio::time::sleep_until(self.medium_read_at), if self.watching_media() => {
+                    self.read_media();
+                }
             }
         }
+    }
+
+    /// Whether anyone's audio is watched now.
+    fn watching_media(&self) -> bool {
+        !self.server_lost && self.members.iter().any(Member::medium_watched)
+    }
+
+    /// Ask Asterisk how much audio each watched participant has sent, and
+    /// let go of the held whose limit has passed.
+    fn read_media(&mut self) {
+        let now = Instant::now();
+        self.medium_read_at = now + MEDIUM_READ_EVERY;
+        let mut asks = Vec::new();
+        let mut gone = Vec::new();
+        for member in self
+            .members
+            .iter_mut()
+            .filter(|member| member.medium_watched())
+        {
+            if let Some(since) = member.watch.held_since
+                && now >= since + member.watch.hold_limit
+            {
+                gone.push(member.id.clone());
+                continue;
+            }
+            if !member.watch.asking
+                && let Some(name) = &member.name
+            {
+                member.watch.asking = true;
+                asks.push((member.id.clone(), name.clone()));
+            }
+        }
+        for (participant, name) in asks {
+            self.ask(
+                Pending::Medium(participant),
+                "GET",
+                &format!("channels/{}/rtp_statistics", ari::query(&name)),
+            );
+        }
+        for participant in gone {
+            self.did_not_return(&participant);
+        }
+    }
+
+    /// Asterisk said how much audio a participant has sent. A count that
+    /// grew is audio arriving: one who was held is back. One that stood
+    /// still for [`MEDIUM_LOST_AFTER`] — while their far end has not put the
+    /// call on hold — is audio lost: they are held, for as long as their
+    /// limit allows; with none, they are gone at once.
+    async fn medium_read(
+        &mut self,
+        participant: &ParticipantId,
+        status_code: u16,
+        body: &str,
+    ) -> Result<(), Fault> {
+        let conversation = self.id.clone();
+        let Some(member) = self.member(participant) else {
+            return Ok(());
+        };
+        member.watch.asking = false;
+        let received = match status_code {
+            200 => ari::read_received_packets(body).map_err(|error| {
+                Fault::Asterisk(format!(
+                    "described the audio of a channel unreadably: {error}"
+                ))
+            })?,
+            // Asterisk keeps no count for this channel: it is not watched.
+            403 => {
+                eprintln!(
+                    "conversation {conversation}: Asterisk keeps no audio count for {} ({body}); \
+                     whether their audio is lost is not watched",
+                    participant.as_str()
+                );
+                member.watch.unwatchable = true;
+                return Ok(());
+            }
+            // Gone, or Asterisk could not be asked: the word of either
+            // comes on its own.
+            _ => return Ok(()),
+        };
+        let now = Instant::now();
+        let grew = member.watch.received.is_none_or(|before| received > before);
+        member.watch.received = Some(received);
+        if grew {
+            member.watch.grew_at = now;
+            if member.watch.held_since.take().is_some() {
+                let participant = participant.clone();
+                return self
+                    .about(
+                        &participant.clone(),
+                        Event::ParticipantReturned { participant },
+                    )
+                    .await;
+            }
+            return Ok(());
+        }
+        let lost = member.watch.held_since.is_none()
+            && !member.watch.far_end_on_hold
+            && now >= member.watch.grew_at + MEDIUM_LOST_AFTER;
+        if !lost {
+            return Ok(());
+        }
+        member.watch.held_since = Some(now);
+        let no_limit = member.watch.hold_limit.is_zero();
+        let who = participant.clone();
+        self.about(
+            participant,
+            Event::MediumLost {
+                participant: who.clone(),
+            },
+        )
+        .await?;
+        self.about(participant, Event::ParticipantHeld { participant: who })
+            .await?;
+        if no_limit {
+            self.did_not_return(participant);
+        }
+        Ok(())
+    }
+
+    /// The far end of a channel put the call on hold, or took it off: while
+    /// on hold no audio is expected, and when off, waiting begins anew.
+    fn far_end_hold(&mut self, channel: &str, on_hold: bool) {
+        if let Some(member) = self
+            .members
+            .iter_mut()
+            .find(|member| member.channel == channel)
+        {
+            member.watch.far_end_on_hold = on_hold;
+            member.watch.grew_at = Instant::now();
+        }
+    }
+
+    /// A held participant whose audio did not come back within their limit
+    /// is gone: the node drops their channel, and they leave as one who did
+    /// not return. With no instance to say it to, it is reported.
+    fn did_not_return(&mut self, participant: &ParticipantId) {
+        let Some(member) = self.member(participant) else {
+            return;
+        };
+        if member.removed_by_us {
+            return;
+        }
+        member.removed_by_us = true;
+        member.leaving = Some(Departure::DidNotReturn);
+        let channel = member.channel.clone();
+        eprintln!(
+            "conversation {}: {} did not return; their call is ended",
+            self.id,
+            participant.as_str()
+        );
+        self.ask(
+            Pending::Step(participant.clone(), Step::HangUp),
+            "DELETE",
+            &format!("channels/{channel}"),
+        );
+        if self.application.is_none() {
+            self.report_dropped(participant.clone(), false);
+        }
+    }
+
+    fn message_answer_awaited(&self) -> bool {
+        self.pending
+            .values()
+            .any(|pending| matches!(pending, Pending::Message(..)))
     }
 
     fn someone_is_connected(&self) -> bool {
@@ -1094,7 +1460,7 @@ impl Conversation {
         }
         let Some(caller) = self.caller.clone() else {
             // The one the fallback is for is gone: nobody is kept.
-            self.give_up();
+            self.give_up(FallbackFailure::CallerLeft);
             return Ok(());
         };
         let state_of = |members: &[Member], who: &ParticipantId| {
@@ -1130,7 +1496,10 @@ impl Conversation {
                     ) => self.transferred(&caller, &dialled),
                     (Some(_), Some(ParticipantState::Ringing)) => {}
                     // One of the two is gone.
-                    (None, _) | (_, None) => self.give_up(),
+                    (None, _) => self.give_up(FallbackFailure::CallerLeft),
+                    (_, None) => self.give_up(FallbackFailure::NotConnected {
+                        departure: Departure::HungUp,
+                    }),
                 }
                 Ok(())
             }
@@ -1144,7 +1513,10 @@ impl Conversation {
                         self.transferred(&caller, &dialled);
                     }
                     (Some(ParticipantState::Ringing), Some(_)) => {}
-                    (None, _) | (_, None) => self.give_up(),
+                    (None, _) => self.give_up(FallbackFailure::CallerLeft),
+                    (_, None) => self.give_up(FallbackFailure::NotConnected {
+                        departure: Departure::HungUp,
+                    }),
                 }
                 Ok(())
             }
@@ -1185,26 +1557,54 @@ impl Conversation {
                 answer_limit_ms,
             }) if is_here => {
                 self.hang_up(|member| member.id != *caller);
-                let before = self.participants;
-                self.dial(None, number, line, *answer_limit_ms).await?;
-                if self.participants > before {
-                    eprintln!(
-                        "conversation {}: the caller is being transferred to {}, the fallback of their entry",
-                        self.id,
-                        number.as_str()
-                    );
-                    self.fallback =
-                        FallbackProgress::Calling(participant_id(&self.node, self.participants)?);
+                match self.dial(None, number, line, *answer_limit_ms).await? {
+                    None => {
+                        eprintln!(
+                            "conversation {}: the caller is being transferred to {}, the fallback of their entry",
+                            self.id,
+                            number.as_str()
+                        );
+                        self.fallback = FallbackProgress::Calling(participant_id(
+                            &self.node,
+                            self.participants,
+                        )?);
+                    }
+                    Some(rejection) => {
+                        eprintln!(
+                            "conversation {}: the fallback of the entry — a transfer to {} — cannot be carried out; the caller is hung up",
+                            self.id,
+                            number.as_str()
+                        );
+                        self.fallback_failed(
+                            FallbackKind::Transfer,
+                            FallbackFailure::Refused { rejection },
+                        );
+                        self.hang_up(|_| true);
+                    }
+                }
+            }
+            Some(Fallback::Message { prompt }) if is_here => {
+                let here = applied
+                    .settings
+                    .prompts
+                    .iter()
+                    .find(|named| named.id == *prompt)
+                    .is_some_and(|named| prompts::is_here(&self.node.config.state, named));
+                if here {
+                    self.play_message(caller);
                 } else {
+                    // The dialplan would turn them away as well; the caller
+                    // is hung up here, and reported so.
                     eprintln!(
-                        "conversation {}: the fallback of the entry — a transfer to {} — cannot be carried out; the caller is hung up",
+                        "conversation {}: the prompt of the entry's message {:?} is not here; \
+                         the caller is hung up",
                         self.id,
-                        number.as_str()
+                        prompt.as_str()
                     );
+                    self.fallback_failed(FallbackKind::Message, FallbackFailure::PromptMissing);
                     self.hang_up(|_| true);
                 }
             }
-            Some(Fallback::Message { .. }) if is_here => self.play_message(caller),
             Some(Fallback::Transfer { .. } | Fallback::Message { .. }) | None => {
                 eprintln!(
                     "conversation {}: nobody is connected and there is no application; everyone is hung up",
@@ -1236,7 +1636,7 @@ impl Conversation {
         member.removed_by_us = true;
         let channel = member.channel.clone();
         self.ask(
-            Pending::Message(channel.clone()),
+            Pending::Message(channel.clone(), caller.clone()),
             "POST",
             &format!(
                 "channels/{}/continue?context={}&extension={}&label={}",
@@ -1250,13 +1650,6 @@ impl Conversation {
             "conversation {}: the caller is given the message of their entry's fallback",
             self.id
         );
-        let origin = self.origin.clone();
-        self.keep_report(|conversation, at_unix_ms| Report::FallbackApplied {
-            conversation,
-            origin,
-            fallback: FallbackKind::Message,
-            at_unix_ms,
-        });
     }
 
     /// The fallback's transfer is done: the caller and the one who was
@@ -1274,10 +1667,32 @@ impl Conversation {
         });
     }
 
-    /// The fallback could not be carried through: nobody is kept.
-    fn give_up(&mut self) {
+    /// The fallback could not be carried through: nobody is kept. A transfer
+    /// that was under way is reported failed — for the reason first learned,
+    /// or, when none was, for `otherwise`.
+    fn give_up(&mut self, otherwise: FallbackFailure) {
+        if matches!(
+            self.fallback,
+            FallbackProgress::Calling(_) | FallbackProgress::Answering(_)
+        ) {
+            let failure = self.fallback_failure.take().unwrap_or(otherwise);
+            self.fallback_failed(FallbackKind::Transfer, failure);
+        }
         self.fallback = FallbackProgress::Done;
         self.hang_up(|_| true);
+    }
+
+    /// Report that the fallback of the caller's entry could not be carried
+    /// out, and why.
+    fn fallback_failed(&self, fallback: FallbackKind, failure: FallbackFailure) {
+        let origin = self.origin.clone();
+        self.keep_report(|conversation, at_unix_ms| Report::FallbackFailed {
+            conversation,
+            origin,
+            fallback,
+            failure,
+            at_unix_ms,
+        });
     }
 
     /// Have Asterisk drop the channels of the participants `whom` picks.
@@ -1301,23 +1716,33 @@ impl Conversation {
             })
             .collect();
         for (channel, participant, being_called) in gone {
-            self.ask(Pending::Internal, "DELETE", &format!("channels/{channel}"));
-            self.keep_report(|conversation, at_unix_ms| {
-                if being_called {
-                    Report::RingingCancelled {
-                        conversation,
-                        participant,
-                        at_unix_ms,
-                    }
-                } else {
-                    Report::ParticipantHungUp {
-                        conversation,
-                        participant,
-                        at_unix_ms,
-                    }
-                }
-            });
+            self.ask(
+                Pending::Step(participant.clone(), Step::HangUp),
+                "DELETE",
+                &format!("channels/{channel}"),
+            );
+            self.report_dropped(participant, being_called);
         }
+    }
+
+    /// Report a participant the node dropped on its own: as a call that was
+    /// cancelled for one still being called, as a hang-up for anyone else.
+    fn report_dropped(&self, participant: ParticipantId, being_called: bool) {
+        self.keep_report(|conversation, at_unix_ms| {
+            if being_called {
+                Report::RingingCancelled {
+                    conversation,
+                    participant,
+                    at_unix_ms,
+                }
+            } else {
+                Report::ParticipantHungUp {
+                    conversation,
+                    participant,
+                    at_unix_ms,
+                }
+            }
+        });
     }
 
     /// Keep a report of what the node did on its own in this conversation,
@@ -1373,8 +1798,21 @@ impl Conversation {
             ari::Message::ChannelDestroyed { cause, channel } => {
                 self.left(&channel.id, Some(cause)).await?;
             }
-            ari::Message::StasisStart { channel, .. } => self.entered(&channel.id).await?,
-            ari::Message::Other => {}
+            ari::Message::StasisStart { channel, .. } => {
+                // A channel the node called is named by Asterisk only now.
+                if let Some(member) = self
+                    .members
+                    .iter_mut()
+                    .find(|member| member.channel == channel.id)
+                {
+                    member.name.get_or_insert(channel.name.clone());
+                }
+                self.entered(&channel.id).await?;
+            }
+            ari::Message::ChannelHold { channel } => self.far_end_hold(&channel.id, true),
+            ari::Message::ChannelUnhold { channel } => self.far_end_hold(&channel.id, false),
+            // Not about a channel: never routed to a conversation.
+            ari::Message::ApplicationReplaced | ari::Message::Other => {}
         }
         Ok(())
     }
@@ -1386,9 +1824,36 @@ impl Conversation {
         status_code: u16,
         body: &str,
     ) -> Result<(), Fault> {
-        match self.pending.remove(request_id) {
+        let pending = self.pending.remove(request_id);
+        // Asterisk could not be asked at all: that is no word of its own,
+        // and is not judged as a refusal. The connection to it is being
+        // lost; what is still there is learned when it is found again. Only
+        // a call that was to be placed is known now: it was not.
+        if status_code == 0 {
+            return match pending {
+                Some(Pending::Dial(id, participant)) => {
+                    self.call_placed(id, participant, status_code).await
+                }
+                Some(Pending::Medium(participant)) => {
+                    self.medium_read(&participant, status_code, body).await
+                }
+                Some(_) => {
+                    eprintln!(
+                        "conversation {}: Asterisk could not be asked ({body}); what it has is \
+                         learned when it is found again",
+                        self.id
+                    );
+                    Ok(())
+                }
+                None => Ok(()),
+            };
+        }
+        match pending {
             Some(Pending::Dial(id, participant)) => {
                 self.call_placed(id, participant, status_code).await
+            }
+            Some(Pending::Medium(participant)) => {
+                self.medium_read(&participant, status_code, body).await
             }
             Some(Pending::Step(participant, step)) => {
                 self.step_answered(&participant, step, status_code).await
@@ -1419,16 +1884,34 @@ impl Conversation {
             },
             // A caller Asterisk would not send to the message is not left on
             // a line nobody controls.
-            Some(Pending::Message(channel)) if !(200..=299).contains(&status_code) => {
+            Some(Pending::Message(channel, caller)) if !(200..=299).contains(&status_code) => {
                 eprintln!(
                     "conversation {}: Asterisk answered {status_code} when asked to play the \
                      message of the fallback ({body}); the caller is hung up",
                     self.id
                 );
                 self.ask(Pending::Internal, "DELETE", &format!("channels/{channel}"));
+                self.fallback_failed(FallbackKind::Message, FallbackFailure::NotPlayed);
+                self.keep_report(|conversation, at_unix_ms| Report::ParticipantHungUp {
+                    conversation,
+                    participant: caller,
+                    at_unix_ms,
+                });
                 Ok(())
             }
-            Some(Pending::Group | Pending::Internal | Pending::Message(_)) | None => Ok(()),
+            // The caller is in the dialplan's steps of the fallback: only now
+            // is it carried out.
+            Some(Pending::Message(..)) => {
+                let origin = self.origin.clone();
+                self.keep_report(|conversation, at_unix_ms| Report::FallbackApplied {
+                    conversation,
+                    origin,
+                    fallback: FallbackKind::Message,
+                    at_unix_ms,
+                });
+                Ok(())
+            }
+            Some(Pending::Group | Pending::Internal) | None => Ok(()),
         }
     }
 
@@ -1459,6 +1942,17 @@ impl Conversation {
     /// network's reason, when the channel ended without ever having been in
     /// the application.
     async fn left(&mut self, channel: &str, cause: Option<i64>) -> Result<(), Fault> {
+        self.left_as(channel, cause, None).await
+    }
+
+    /// The same, for a participant whose departure is known otherwise than
+    /// from their channel's end: `known` is it.
+    async fn left_as(
+        &mut self,
+        channel: &str,
+        cause: Option<i64>,
+        known: Option<Departure>,
+    ) -> Result<(), Fault> {
         let Some(position) = self
             .members
             .iter()
@@ -1478,13 +1972,30 @@ impl Conversation {
         if let Some(group) = member.group {
             self.settle_group(group);
         }
-        let departure = if member.removed_by_us {
-            Departure::Removed
-        } else if member.awaiting_answer {
-            unanswered(cause)
-        } else {
-            Departure::HungUp
-        };
+        let departure = known.or_else(|| member.leaving.take()).unwrap_or_else(|| {
+            if member.removed_by_us {
+                Departure::Removed
+            } else if member.awaiting_answer {
+                unanswered(cause)
+            } else {
+                Departure::HungUp
+            }
+        });
+        // A transfer under way fails when either of its two leaves before
+        // they are connected; the first to leave says why.
+        if let FallbackProgress::Calling(dialled) | FallbackProgress::Answering(dialled) =
+            &self.fallback
+        {
+            if *dialled == member.id {
+                self.fallback_failure
+                    .get_or_insert(FallbackFailure::NotConnected {
+                        departure: departure.clone(),
+                    });
+            } else if self.caller.as_ref() == Some(&member.id) {
+                self.fallback_failure
+                    .get_or_insert(FallbackFailure::CallerLeft);
+            }
+        }
         let participant = member.id.clone();
         self.about(
             &participant.clone(),
@@ -1522,7 +2033,14 @@ impl Conversation {
 
     async fn on_application(&mut self, message: ApplicationMessage) -> Result<(), Fault> {
         match message {
-            ApplicationMessage::Command { id, command } => self.command(id, command).await,
+            ApplicationMessage::Command { id, command } => {
+                if !self.command_ids.insert(id) {
+                    return Err(Fault::Application(format!(
+                        "used the command identifier {id} a second time on this connection"
+                    )));
+                }
+                self.command(id, command).await
+            }
             ApplicationMessage::Ping { n } => self.tell(&ControllerMessage::Pong { n }).await,
             ApplicationMessage::Pong { .. } => Ok(()),
             ApplicationMessage::Accept | ApplicationMessage::Decline { .. } => Err(
@@ -1532,6 +2050,11 @@ impl Conversation {
     }
 
     async fn command(&mut self, id: u64, command: Command) -> Result<(), Fault> {
+        if self.server_lost {
+            return self
+                .reject(id, CommandRejection::TelephonyServerUnavailable)
+                .await;
+        }
         match command {
             Command::Answer { participant } => self.answer(id, &participant).await,
             Command::Reject {
@@ -1544,30 +2067,41 @@ impl Conversation {
                 };
                 member.removed_by_us = true;
                 let channel = member.channel.clone();
-                self.ask(Pending::Internal, "DELETE", &format!("channels/{channel}"));
+                self.ask(
+                    Pending::Step(participant, Step::HangUp),
+                    "DELETE",
+                    &format!("channels/{channel}"),
+                );
                 self.accept(id).await
             }
             Command::Dial {
                 number,
                 line,
                 answer_limit_ms,
-            } => self.dial(Some(id), &number, &line, answer_limit_ms).await,
+            } => self
+                .dial(Some(id), &number, &line, answer_limit_ms)
+                .await
+                .map(|_| ()),
             Command::SendDigits {
                 participant,
                 digits,
             } => self.send_digits(id, &participant, digits.as_str()).await,
             Command::End => {
                 self.ended_by_handler = true;
-                let channels: Vec<String> = self
+                let channels: Vec<(ParticipantId, String)> = self
                     .members
                     .iter_mut()
                     .map(|member| {
                         member.removed_by_us = true;
-                        member.channel.clone()
+                        (member.id.clone(), member.channel.clone())
                     })
                     .collect();
-                for channel in channels {
-                    self.ask(Pending::Internal, "DELETE", &format!("channels/{channel}"));
+                for (participant, channel) in channels {
+                    self.ask(
+                        Pending::Step(participant, Step::HangUp),
+                        "DELETE",
+                        &format!("channels/{channel}"),
+                    );
                 }
                 self.accept(id).await
             }
@@ -1588,10 +2122,40 @@ impl Conversation {
             Command::FlushPlayback { participant } => self.flush_playback(id, &participant).await,
             Command::Connect { participants } => self.connect(id, &participants).await,
             Command::Separate { participant } => self.separate(id, &participant).await,
-            Command::HoldFor { .. } => Err(Fault::NotImplemented("hold_for")),
+            Command::HoldFor {
+                participant,
+                limit_ms,
+            } => self.hold_for(id, &participant, limit_ms).await,
             Command::StartRecording { .. } => Err(Fault::NotImplemented("start_recording")),
             Command::StopRecording { .. } => Err(Fault::NotImplemented("stop_recording")),
         }
+    }
+
+    /// How long a participant whose audio is lost stays held before they
+    /// count as gone. One already held whose new limit has passed is gone
+    /// now.
+    async fn hold_for(
+        &mut self,
+        id: u64,
+        participant: &ParticipantId,
+        limit_ms: u64,
+    ) -> Result<(), Fault> {
+        let answered = |member: &Member| member.state == ParticipantState::InConversation;
+        let expired = match self.member_who(participant, answered) {
+            Ok(member) => {
+                member.watch.hold_limit = Duration::from_millis(limit_ms);
+                member
+                    .watch
+                    .held_since
+                    .is_some_and(|since| Instant::now() >= since + member.watch.hold_limit)
+            }
+            Err(reason) => return self.reject(id, reason).await,
+        };
+        self.accept(id).await?;
+        if expired {
+            self.did_not_return(participant);
+        }
+        Ok(())
     }
 
     /// The participant a command is about, if they are in the state the
@@ -1616,7 +2180,7 @@ impl Conversation {
             Err(reason) => return self.reject(id, reason).await,
         };
         self.ask(
-            Pending::Internal,
+            Pending::Step(participant.clone(), Step::Answer),
             "POST",
             &format!("channels/{channel}/answer"),
         );
@@ -1643,7 +2207,7 @@ impl Conversation {
             RejectReason::RateLimited => "congestion",
         };
         self.ask(
-            Pending::Internal,
+            Pending::Step(participant.clone(), Step::TurnAway),
             "DELETE",
             &format!("channels/{channel}?reason={said}"),
         );
@@ -1663,7 +2227,7 @@ impl Conversation {
             Err(reason) => return self.reject(id, reason).await,
         };
         self.ask(
-            Pending::Internal,
+            Pending::Step(participant.clone(), Step::SendDigits),
             "POST",
             &format!("channels/{channel}/dtmf?dtmf={}", ari::query(digits)),
         );
@@ -2144,7 +2708,7 @@ impl Conversation {
         number: &PhoneNumber,
         line: &LineId,
         answer_limit_ms: u64,
-    ) -> Result<(), Fault> {
+    ) -> Result<Option<CommandRejection>, Fault> {
         let applied = self.node.applied();
         let refused = match destination::judge(&applied.settings, line, number) {
             Ok(route) => match self.node.lines.take(route.line) {
@@ -2156,10 +2720,10 @@ impl Conversation {
         let (route, place) = match refused {
             Ok(placed) => placed,
             Err(reason) => {
-                return match command {
-                    Some(id) => self.reject(id, reason).await,
-                    None => Ok(()),
-                };
+                if let Some(id) = command {
+                    self.reject(id, reason).await?;
+                }
+                return Ok(Some(reason));
             }
         };
 
@@ -2188,6 +2752,9 @@ impl Conversation {
         let body = serde_json::json!({ "variables": notes }).to_string();
         self.asterisk.own(&channel);
         self.members.push(Member {
+            name: None,
+            watch: Watch::new(),
+            leaving: None,
             id: participant.id.clone(),
             number: participant.number.clone(),
             channel: channel.clone(),
@@ -2218,7 +2785,7 @@ impl Conversation {
             ari::query(&channel),
         );
         self.ask_with(Pending::Dial(command, participant), "POST", &uri, body);
-        Ok(())
+        Ok(None)
     }
 
     /// Asterisk answered the request to place a call. Only now does the
@@ -2233,14 +2800,23 @@ impl Conversation {
     ) -> Result<(), Fault> {
         let waiting = self.unannounced.remove(&participant.id).unwrap_or_default();
         if !(200..=299).contains(&status_code) {
-            // Asterisk could not even begin: the operator's trunk is not
-            // there for it. Nobody was called.
+            // Asterisk did not begin the call; nobody was called. Only its
+            // "no such endpoint" says the operator's trunk is not there for
+            // it — any other refusal, or no answer from it at all, is a call
+            // the node did not place.
             self.members.retain(|member| member.id != participant.id);
+            let why = if status_code == 404 {
+                CommandRejection::NoOperatorForDestination
+            } else {
+                CommandRejection::CallNotPlaced
+            };
+            if matches!(&self.fallback, FallbackProgress::Calling(dialled) if *dialled == participant.id)
+            {
+                self.fallback_failure
+                    .get_or_insert(FallbackFailure::Refused { rejection: why });
+            }
             return match command {
-                Some(id) => {
-                    self.reject(id, CommandRejection::NoOperatorForDestination)
-                        .await
-                }
+                Some(id) => self.reject(id, why).await,
                 None => Ok(()),
             };
         }
@@ -2439,12 +3015,22 @@ impl Conversation {
 
     /// The conversation cannot go on: nobody may be left on a line that no
     /// one controls, and the application is told why its connection closes.
+    ///
+    /// With no instance owning the conversation, nobody is told by a closing
+    /// connection: each participant dropped here is then something the node
+    /// did on its own, and is reported as [`Self::hang_up`] reports it.
     async fn abandon(&mut self, fault: &Fault) {
+        let unowned = self.application.is_none();
         for member in &self.members {
             self.asterisk
                 .ask("abandon", "DELETE", &format!("channels/{}", member.channel));
             if let Some(sound) = &member.sound {
                 self.close_sound(sound);
+            }
+            if unowned && !member.removed_by_us {
+                let participant = member.id.clone();
+                let being_called = member.awaiting_answer;
+                self.report_dropped(participant, being_called);
             }
         }
         let mut groups: Vec<u64> = self

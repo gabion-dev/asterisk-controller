@@ -1,7 +1,7 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "Gabion node protocol",
-  "description": "The single source of the message types exchanged between a Gabion application and the Asterisk controller: the conversation connection, the service connection, and the settings the application gives the node. Types for both sides are generated from this file; neither side keeps a hand-written copy. Audio does not travel as these messages: its binary frames are described in audio-frames.md.",
+  "description": "The single source of the message types exchanged between a Gabion application and the Asterisk controller: the conversation connection, the service connection, and the settings the application gives the node. Types for both sides are generated from this file; neither side keeps a hand-written copy. Audio does not travel as these messages: its binary frames are described in audio-frames.md. Every integer is a signed 64-bit one: an integer beyond that range is not this protocol, whatever its field allows.",
   "definitions": {
     "ConversationId": {
       "type": "string",
@@ -13,7 +13,8 @@
       "type": "string",
       "minLength": 1,
       "maxLength": 128,
-      "description": "Identifier of a participant within its conversation."
+      "pattern": "^[!-~]+$",
+      "description": "Identifier of a participant within its conversation. Printable ASCII: it travels in audio frames, which hold an identifier in at most 128 bytes."
     },
     "RecordingId": {
       "type": "string",
@@ -25,7 +26,8 @@
       "type": "string",
       "minLength": 1,
       "maxLength": 128,
-      "description": "Identifier of a playback segment, chosen by the application."
+      "pattern": "^[!-~]+$",
+      "description": "Identifier of a playback segment, chosen by the application. Printable ASCII: it travels in audio frames, which hold an identifier in at most 128 bytes."
     },
     "LineId": {
       "type": "string",
@@ -261,9 +263,9 @@
       ]
     },
     "CommandRejection": {
+      "description": "Why a command is refused. There is no refusal for a command after the conversation has ended: the conversation connection closes with the conversation, so no command can come after its end. call_not_placed: the node's telephony server did not begin the call the command asked for. telephony_server_unavailable: the node has lost its telephony server, and nothing is carried out until it is back.",
       "type": "string",
       "enum": [
-        "conversation_ended",
         "unknown_participant",
         "participant_not_in_required_state",
         "too_few_participants",
@@ -272,8 +274,9 @@
         "no_operator_for_destination",
         "outbound_limit_reached",
         "unknown_recording",
-        "unknown_segment",
-        "segment_already_queued"
+        "segment_already_queued",
+        "call_not_placed",
+        "telephony_server_unavailable"
       ]
     },
     "Retention": {
@@ -736,7 +739,20 @@
             "medium_code"
           ],
           "additionalProperties": false,
-          "description": "The code is the medium's, kept as it came."
+          "description": "The Q.850 cause of the end of the call as the node's telephony server gives it: the cause the network put in its answer where the server reads it, otherwise the server's translation of the network's answer. Kept as given, not interpreted."
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "lost"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "additionalProperties": false,
+          "description": "The call ended while the node had lost its telephony server; how it ended is not known."
         }
       ]
     },
@@ -1101,6 +1117,32 @@
           ],
           "additionalProperties": false,
           "description": "The owner instance is being taken out of service."
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "telephony_server_lost"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "additionalProperties": false,
+          "description": "The node has lost its telephony server. Its calls may go on or may have ended: nothing is known of the participants until it is back, and no command is carried out meanwhile."
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "telephony_server_back"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "additionalProperties": false,
+          "description": "The node has its telephony server again. Participants whose calls ended meanwhile have left, with the departure `lost`, before this event; the others are as they were."
         },
         {
           "type": "object",
@@ -1615,6 +1657,84 @@
         "message"
       ]
     },
+    "FallbackFailure": {
+      "description": "Why a fallback could not be carried out.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "refused"
+            },
+            "rejection": {
+              "$ref": "#/definitions/CommandRejection"
+            }
+          },
+          "required": [
+            "type",
+            "rejection"
+          ],
+          "additionalProperties": false,
+          "description": "The call of the transfer was not placed, for the reason a dial command would have been refused."
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "not_connected"
+            },
+            "departure": {
+              "$ref": "#/definitions/Departure"
+            }
+          },
+          "required": [
+            "type",
+            "departure"
+          ],
+          "additionalProperties": false,
+          "description": "The one called for the transfer left before being connected to the caller."
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "caller_left"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "additionalProperties": false,
+          "description": "The caller left before the transfer connected them."
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "prompt_missing"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "additionalProperties": false,
+          "description": "The node does not have the prompt of the message."
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "not_played"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "additionalProperties": false,
+          "description": "The node's telephony server refused to give the caller the message."
+        }
+      ]
+    },
     "Report": {
       "description": "What the node did while no instance owned a conversation. Nothing the node does on its own goes unreported.",
       "oneOf": [
@@ -1670,6 +1790,41 @@
             "at_unix_ms"
           ],
           "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "fallback_failed"
+            },
+            "conversation": {
+              "$ref": "#/definitions/ConversationId"
+            },
+            "origin": {
+              "$ref": "#/definitions/Origin"
+            },
+            "fallback": {
+              "$ref": "#/definitions/FallbackKind"
+            },
+            "failure": {
+              "$ref": "#/definitions/FallbackFailure"
+            },
+            "at_unix_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Milliseconds since the Unix epoch."
+            }
+          },
+          "required": [
+            "type",
+            "conversation",
+            "origin",
+            "fallback",
+            "failure",
+            "at_unix_ms"
+          ],
+          "additionalProperties": false,
+          "description": "The fallback of the caller's entry was begun and could not be carried out. Whoever the node hung up then is reported on their own."
         },
         {
           "type": "object",

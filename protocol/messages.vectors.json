@@ -1625,6 +1625,241 @@
      }
     ]
    }
+  },
+  {
+   "name": "command whose identifier is the largest signed 64-bit integer",
+   "type": "ApplicationMessage",
+   "accept": true,
+   "json": {
+    "type": "command",
+    "id": 9223372036854775807,
+    "command": {
+     "type": "stop_listening",
+     "participant": "p-1"
+    }
+   }
+  },
+  {
+   "name": "command whose identifier is beyond a signed 64-bit integer",
+   "type": "ApplicationMessage",
+   "accept": false,
+   "json": {
+    "type": "command",
+    "id": 9223372036854775808,
+    "command": {
+     "type": "stop_listening",
+     "participant": "p-1"
+    }
+   }
+  },
+  {
+   "name": "play of a segment named outside printable ASCII",
+   "type": "ApplicationMessage",
+   "accept": false,
+   "json": {
+    "type": "command",
+    "id": 4,
+    "command": {
+     "type": "play",
+     "participant": "p-1",
+     "segment": "сегмент"
+    }
+   }
+  },
+  {
+   "name": "play of a segment named in printable ASCII",
+   "type": "ApplicationMessage",
+   "accept": true,
+   "json": {
+    "type": "command",
+    "id": 4,
+    "command": {
+     "type": "play",
+     "participant": "p-1",
+     "segment": "greeting-1"
+    }
+   }
+  },
+  {
+   "name": "command result: a call the node did not place",
+   "type": "ControllerMessage",
+   "accept": true,
+   "json": {
+    "type": "command_result",
+    "id": 3,
+    "outcome": {
+     "type": "rejected",
+     "reason": "call_not_placed"
+    }
+   }
+  },
+  {
+   "name": "command result: a refusal for a conversation that ended is not the protocol",
+   "type": "ControllerMessage",
+   "accept": false,
+   "json": {
+    "type": "command_result",
+    "id": 3,
+    "outcome": {
+     "type": "rejected",
+     "reason": "conversation_ended"
+    }
+   }
+  },
+  {
+   "name": "report: a fallback's transfer refused as a dial would be",
+   "type": "NodeMessage",
+   "accept": true,
+   "json": {
+    "type": "report",
+    "id": "7f1c2a8e-3b4d-4e5f-9a6b-1c2d3e4f5a6b",
+    "report": {
+     "type": "fallback_failed",
+     "conversation": "c-1",
+     "origin": {
+      "type": "dialed_number",
+      "dialed": "+19715870051"
+     },
+     "fallback": "transfer",
+     "failure": {
+      "type": "refused",
+      "rejection": "outbound_limit_reached"
+     },
+     "at_unix_ms": 1759900000000
+    }
+   }
+  },
+  {
+   "name": "report: a fallback's transfer whose number failed",
+   "type": "NodeMessage",
+   "accept": true,
+   "json": {
+    "type": "report",
+    "id": "7f1c2a8e-3b4d-4e5f-9a6b-1c2d3e4f5a6b",
+    "report": {
+     "type": "fallback_failed",
+     "conversation": "c-1",
+     "origin": {
+      "type": "dialed_number",
+      "dialed": "+19715870051"
+     },
+     "fallback": "transfer",
+     "failure": {
+      "type": "not_connected",
+      "departure": {
+       "type": "dial_failed",
+       "medium_code": 34
+      }
+     },
+     "at_unix_ms": 1759900000000
+    }
+   }
+  },
+  {
+   "name": "report: a fallback's message without its prompt",
+   "type": "NodeMessage",
+   "accept": true,
+   "json": {
+    "type": "report",
+    "id": "7f1c2a8e-3b4d-4e5f-9a6b-1c2d3e4f5a6b",
+    "report": {
+     "type": "fallback_failed",
+     "conversation": "c-1",
+     "origin": {
+      "type": "dialed_number",
+      "dialed": "+19715870051"
+     },
+     "fallback": "message",
+     "failure": {
+      "type": "prompt_missing"
+     },
+     "at_unix_ms": 1759900000000
+    }
+   }
+  },
+  {
+   "name": "report: a fallback failure the description does not know",
+   "type": "NodeMessage",
+   "accept": false,
+   "json": {
+    "type": "report",
+    "id": "7f1c2a8e-3b4d-4e5f-9a6b-1c2d3e4f5a6b",
+    "report": {
+     "type": "fallback_failed",
+     "conversation": "c-1",
+     "origin": {
+      "type": "dialed_number",
+      "dialed": "+19715870051"
+     },
+     "fallback": "transfer",
+     "failure": {
+      "type": "nobody_knows"
+     },
+     "at_unix_ms": 1759900000000
+    }
+   }
+  },
+  {
+   "name": "event: the telephony server is lost",
+   "type": "ControllerMessage",
+   "accept": true,
+   "json": {
+    "type": "event",
+    "event": {
+     "type": "telephony_server_lost"
+    }
+   }
+  },
+  {
+   "name": "event: the telephony server is back",
+   "type": "ControllerMessage",
+   "accept": true,
+   "json": {
+    "type": "event",
+    "event": {
+     "type": "telephony_server_back"
+    }
+   }
+  },
+  {
+   "name": "event: a participant whose call ended while the server was lost",
+   "type": "ControllerMessage",
+   "accept": true,
+   "json": {
+    "type": "event",
+    "event": {
+     "type": "participant_left",
+     "participant": "p-1",
+     "departure": {
+      "type": "lost"
+     }
+    }
+   }
+  },
+  {
+   "name": "command result: rejected while the telephony server is lost",
+   "type": "ControllerMessage",
+   "accept": true,
+   "json": {
+    "type": "command_result",
+    "id": 5,
+    "outcome": {
+     "type": "rejected",
+     "reason": "telephony_server_unavailable"
+    }
+   }
+  },
+  {
+   "name": "event: the telephony server is lost carries nothing more",
+   "type": "ControllerMessage",
+   "accept": false,
+   "json": {
+    "type": "event",
+    "event": {
+     "type": "telephony_server_lost",
+     "since_unix_ms": 1
+    }
+   }
   }
  ]
 }

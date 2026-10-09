@@ -175,17 +175,56 @@ fn application(value: &str) -> Result<String, String> {
 /// argument, `&` separates files, `$` and brackets begin an expression and
 /// a semicolon a comment: a path with any of them would be read as
 /// something else.
+///
+/// The path is absolute: Asterisk's configuration names its directories by
+/// it, and a relative one would be read from wherever Asterisk was started.
+/// And it is short enough for the socket of Asterisk's console inside it
+/// ([`CONSOLE_SOCKET`]): Asterisk cuts a longer socket path to what a Unix
+/// socket address holds and makes the socket at the cut path — outside the
+/// state directory.
 fn state_directory(value: &str) -> Result<PathBuf, String> {
     if value
         .chars()
         .any(|character| character.is_control() || ",&;$()[]{}\\\"'|".contains(character))
     {
         return Err(format!(
-            "--state {value:?}: the path may not hold control characters or any of              , & ; $ ( ) [ ] {{ }} \\ \" ' | — Asterisk plays prompts from it, and would read              such a path as something else"
+            "--state {value:?}: the path may not hold control characters or any of \
+             , & ; $ ( ) [ ] {{ }} \\ \" ' | — Asterisk plays prompts from it, and would read \
+             such a path as something else"
         ));
     }
-    Ok(PathBuf::from(value))
+    let path = PathBuf::from(value);
+    if !path.is_absolute() {
+        return Err(format!(
+            "--state {value:?}: the path must be absolute — Asterisk's configuration names \
+             its directories by it, and Asterisk would read a relative one from wherever it \
+             was started"
+        ));
+    }
+    let socket = path.join(CONSOLE_SOCKET);
+    let length = socket.as_os_str().len();
+    if length > LONGEST_SOCKET_PATH {
+        return Err(format!(
+            "--state {value:?}: the socket of Asterisk's console, {}, would be {length} bytes \
+             long; a Unix socket path holds at most {LONGEST_SOCKET_PATH} here, and Asterisk \
+             would cut it and make the socket outside the state directory",
+            socket.display()
+        ));
+    }
+    Ok(path)
 }
+
+/// Where Asterisk makes the socket of its console: its run directory inside
+/// the state directory, and the socket's default name.
+const CONSOLE_SOCKET: &str = "run/asterisk.ctl";
+
+/// The longest path a Unix socket address holds: the size of `sun_path`
+/// less its terminating zero — 108 bytes on Linux (unix(7)), 104 on macOS
+/// (`sys/un.h`).
+#[cfg(target_os = "linux")]
+const LONGEST_SOCKET_PATH: usize = 107;
+#[cfg(not(target_os = "linux"))]
+const LONGEST_SOCKET_PATH: usize = 103;
 
 /// An address that must be on the loopback interface.
 fn loopback(name: &str, value: &str) -> Result<SocketAddr, String> {
@@ -233,7 +272,9 @@ fn port_range(value: &str) -> Result<(u16, u16), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{application, node_name, port_range, state_directory};
+    use super::{
+        CONSOLE_SOCKET, LONGEST_SOCKET_PATH, application, node_name, port_range, state_directory,
+    };
 
     #[test]
     fn a_state_directory_asterisk_would_misread_is_refused() {
@@ -241,6 +282,20 @@ mod tests {
         for path in ["/a,b", "/a&b", "/a$b", "/a;b", "/a(b)", "/a\nb"] {
             assert!(state_directory(path).is_err(), "{path:?}");
         }
+    }
+
+    #[test]
+    fn a_state_directory_is_absolute() {
+        assert!(state_directory("state").is_err());
+        assert!(state_directory("./state").is_err());
+    }
+
+    #[test]
+    fn a_state_directory_leaves_room_for_the_console_socket() {
+        let room = LONGEST_SOCKET_PATH - "/".len() - CONSOLE_SOCKET.len();
+        let longest = format!("/{}", "s".repeat(room - 1));
+        assert!(state_directory(&longest).is_ok());
+        assert!(state_directory(&format!("{longest}s")).is_err());
     }
 
     #[test]

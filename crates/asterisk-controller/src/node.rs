@@ -34,6 +34,9 @@ pub struct Node {
     pub door: media::Door,
     /// How busy each outbound line is.
     pub lines: Lines,
+    /// Told when another connection has taken the node's application in
+    /// Asterisk from this controller, which then stops.
+    pub replaced: tokio::sync::Notify,
 }
 
 impl Node {

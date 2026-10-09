@@ -18,7 +18,7 @@ use std::{collections::HashSet, fs, io::ErrorKind, net::IpAddr, path::Path};
 
 use node_protocol::messages::{EntryKey, Fallback, Operator, Settings, SipTransport};
 
-use crate::destination;
+use crate::{destination, state_files};
 
 /// The file of the state directory that holds the settings last applied.
 pub const FILE: &str = "settings.json";
@@ -43,10 +43,21 @@ pub struct Applied {
 ///
 /// A file that cannot be read, is not what the protocol describes, or fails
 /// [`check`] is an error with the reason: a node does not start on settings
-/// it would have refused.
+/// it would have refused. Nor on a file others than its owner may read: it
+/// carries the operators' passwords, and the controller writes it readable
+/// by its owner alone — whoever puts it there instead does the same.
 pub fn stored(state: &Path) -> Result<Applied, String> {
     let path = state.join(FILE);
-    let bytes = match fs::read(&path) {
+    let bytes = match fs::metadata(&path).and_then(|metadata| {
+        if state_files::open_to_others(&metadata) {
+            Err(std::io::Error::other(
+                "others than its owner may read it, and it carries the operators' passwords; \
+                 make it readable by its owner alone",
+            ))
+        } else {
+            fs::read(&path)
+        }
+    }) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == ErrorKind::NotFound => {
             return Ok(Applied {
@@ -88,9 +99,8 @@ pub fn store(state: &Path, settings: &Settings) -> Result<(), String> {
     // Encoding holds the settings to the description.
     node_protocol::encode(settings).map_err(|error| failed(&error))?;
     let value = serde_json::to_value(settings).map_err(|error| failed(&error))?;
-    let written = state.join(format!(".{FILE}.new"));
-    fs::write(&written, node_protocol::canonical(&value)).map_err(|error| failed(&error))?;
-    fs::rename(&written, &path).map_err(|error| failed(&error))
+    state_files::replace(&path, node_protocol::canonical(&value).as_bytes())
+        .map_err(|error| failed(&error))
 }
 
 /// Judge what the protocol description cannot.
@@ -237,17 +247,15 @@ fn is_network(text: &str) -> bool {
 /// Whether a free-form value can be written into Asterisk's configuration
 /// and be read back as itself.
 ///
-/// A value there is the rest of a line. So it cannot span lines; Asterisk
-/// drops the spaces around it; and one that begins with `>` loses that
-/// character, because `=>` is another way to write `=`. A semicolon is
-/// written escaped ([`crate::asterisk_files`]) and is no obstacle.
+/// A value there is the rest of a line. So it cannot span lines, and
+/// Asterisk drops the spaces around it. A semicolon is written escaped and
+/// a leading `>` is kept by writing the value after `= `
+/// ([`crate::asterisk_files`]); neither is an obstacle.
 fn writable(value: &str) -> Result<(), String> {
     if value.chars().any(char::is_control) {
         Err("contains a control character".into())
     } else if value.trim() != value {
         Err("begins or ends with a space, which Asterisk's configuration would drop".into())
-    } else if value.starts_with('>') {
-        Err("begins with '>', which Asterisk's configuration would drop".into())
     } else {
         Ok(())
     }
@@ -389,11 +397,6 @@ mod tests {
                 "/operators/0/credentials/password",
                 json!("ab "),
                 "begins or ends with a space",
-            ),
-            (
-                "/operators/0/credentials/username",
-                json!(">ab"),
-                "begins with '>'",
             ),
         ] {
             let problem = problem_after(pointer, value)?;

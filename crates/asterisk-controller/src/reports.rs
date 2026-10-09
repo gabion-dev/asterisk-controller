@@ -17,8 +17,8 @@
 //! message.
 
 use std::{
-    fs::{self, OpenOptions},
-    io::{ErrorKind, Write as _},
+    fs,
+    io::ErrorKind,
     path::{Path, PathBuf},
     sync::{Mutex, PoisonError},
     time::{SystemTime, UNIX_EPOCH},
@@ -26,6 +26,8 @@ use std::{
 
 use node_protocol::messages::{NodeMessage, Report};
 use tokio::sync::Notify;
+
+use crate::state_files;
 
 /// The file of the state directory that holds reports not yet received.
 const FILE: &str = "reports.jsonl";
@@ -65,11 +67,7 @@ impl Journal {
             })
             .and_then(|line| {
                 let _turn = self.turn.lock().unwrap_or_else(PoisonError::into_inner);
-                OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&self.path)
-                    .and_then(|mut file| writeln!(file, "{line}"))
+                state_files::append_line(&self.path, &line)
                     .map_err(|error| format!("{}: {error}", self.path.display()))
             });
         match written {
@@ -140,9 +138,7 @@ impl Journal {
             kept.push_str(&line);
             kept.push('\n');
         }
-        let written = self.path.with_extension("jsonl.new");
-        fs::write(&written, kept).map_err(failed)?;
-        fs::rename(&written, &self.path).map_err(failed)
+        state_files::replace(&self.path, kept.as_bytes()).map_err(failed)
     }
 
     /// Wait until a report is kept.

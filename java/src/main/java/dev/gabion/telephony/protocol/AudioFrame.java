@@ -3,9 +3,6 @@
 package dev.gabion.telephony.protocol;
 
 import java.nio.ByteBuffer;
-import java.nio.CharBuffer;
-import java.nio.charset.CharacterCodingException;
-import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.Objects;
@@ -198,25 +195,31 @@ public sealed interface AudioFrame {
         if (frame.remaining() < length) {
             throw new Refused(Refusal.TRUNCATED);
         }
-        ByteBuffer slice = frame.slice(frame.position(), length);
-        frame.position(frame.position() + length);
-        try {
-            CharBuffer text = StandardCharsets.UTF_8.newDecoder()
-                    .onMalformedInput(CodingErrorAction.REPORT)
-                    .onUnmappableCharacter(CodingErrorAction.REPORT)
-                    .decode(slice);
-            return text.toString();
-        } catch (CharacterCodingException e) {
+        byte[] bytes = new byte[length];
+        frame.get(bytes);
+        if (!printableAscii(bytes)) {
             throw new Refused(Refusal.BAD_IDENTIFIER);
         }
+        return new String(bytes, StandardCharsets.US_ASCII);
     }
 
     private static byte[] identifier(String identifier) throws Refused {
-        byte[] bytes = identifier.getBytes(StandardCharsets.UTF_8);
-        if (bytes.length == 0 || bytes.length > 128) {
+        byte[] bytes = identifier.getBytes(StandardCharsets.US_ASCII);
+        boolean sameText = new String(bytes, StandardCharsets.US_ASCII).equals(identifier);
+        if (bytes.length == 0 || bytes.length > 128 || !sameText || !printableAscii(bytes)) {
             throw new Refused(Refusal.BAD_IDENTIFIER);
         }
         return bytes;
+    }
+
+    /** Whether every byte is a printable ASCII character, {@code !} to {@code ~}: the identifiers of the protocol. */
+    private static boolean printableAscii(byte[] bytes) {
+        for (byte b : bytes) {
+            if (b < '!' || b > '~') {
+                return false;
+            }
+        }
+        return true;
     }
 
     private static byte[] rest(ByteBuffer frame) {

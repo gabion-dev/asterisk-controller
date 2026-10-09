@@ -34,7 +34,10 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Stdio,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -44,9 +47,9 @@ use node_protocol::{
     audio::AudioFrame,
     messages::{
         ApplicationMessage, ApplicationServiceMessage, Command, CommandOutcome, CommandRejection,
-        ControllerMessage, DeclineReason, Departure, EndReason, Event, NodeMessage, Opening,
-        Origin, ParticipantId, ParticipantMedium, ParticipantSnapshot, ParticipantState,
-        RejectReason, Report, SegmentId, Settings,
+        ControllerMessage, DeclineReason, Departure, EndReason, Event, FallbackFailure,
+        FallbackKind, NodeMessage, Opening, Origin, ParticipantId, ParticipantMedium,
+        ParticipantSnapshot, ParticipantState, RejectReason, Report, SegmentId, Settings,
     },
 };
 use tokio::{
@@ -57,7 +60,7 @@ use tokio::{
     time::timeout,
 };
 use tokio_tungstenite::{
-    WebSocketStream, accept_hdr_async, connect_async,
+    MaybeTlsStream, WebSocketStream, accept_hdr_async, connect_async,
     tungstenite::{
         Message as Frame,
         client::IntoClientRequest,
@@ -92,12 +95,15 @@ const DIALED: &str = "+19715870050";
 /// The same, as it is written inside an address.
 const DIALED_IN_URL: &str = "%2B19715870050";
 /// The password the node presents to its operator: everything Asterisk's
-/// configuration format treats specially inside a value.
-const OPERATOR_PASSWORD: &str = "pass;word #1 = [x], \\>";
+/// configuration format treats specially inside a value, beginning with the
+/// `>` that `=>` would swallow.
+const OPERATOR_PASSWORD: &str = ">pass;word #1 = [x], \\>";
 /// The number of the node's other entry, whose fallback is a transfer.
 const DIALED_WITH_TRANSFER: &str = "+19715870051";
 /// The number of an entry the application adds while the node runs.
 const DIALED_LATER: &str = "+19715870052";
+/// The number of an entry whose fallback transfers to a busy number.
+const DIALED_TO_BUSY: &str = "+19715870053";
 /// The number the operator's caller calls from.
 const CALLER: &str = "+15035550100";
 const CALLER_IN_URL: &str = "%2B15035550100";
@@ -113,6 +119,8 @@ const FAILS_WITH: i64 = 34;
 /// A Stasis application of the test's own. The far end of a call that only
 /// rings waits in it, so that the call stays up until the test ends it.
 const FAR_END: &str = "the-far-end";
+/// The node's own Stasis application, which the controller subscribes to.
+const NODE_APPLICATION: &str = "gabion";
 /// An address of this machine that is not the operator's. The stranger of
 /// the test calls from it.
 const STRANGER_ADDRESS: &str = "127.0.0.2";
@@ -137,7 +145,7 @@ async fn free_port() -> TestResult<u16> {
     Ok(TcpListener::bind("127.0.0.1:0").await?.local_addr()?.port())
 }
 
-/// The settings the node of the test starts on: two entries, and the
+/// The settings the node of the test starts on: three entries, and the
 /// operator whose trunk is the test's telephone network, with lines through
 /// it.
 fn settings(operator_port: u16) -> serde_json::Value {
@@ -166,7 +174,8 @@ fn settings(operator_port: u16) -> serde_json::Value {
             "allowed_countries": ["US"],
             "concurrent_outbound_limit": 2
         }],
-        // Two entries, for the two things a fallback can be.
+        // Entries for the two things a fallback can be, and a transfer that
+        // cannot connect the caller.
         "entries": [
             {
                 "key": { "type": "dialed_number", "number": DIALED },
@@ -176,6 +185,13 @@ fn settings(operator_port: u16) -> serde_json::Value {
                 "key": { "type": "dialed_number", "number": DIALED_WITH_TRANSFER },
                 "fallback": {
                     "type": "transfer", "number": ANSWERS, "line": "main",
+                    "answer_limit_ms": 5000
+                }
+            },
+            {
+                "key": { "type": "dialed_number", "number": DIALED_TO_BUSY },
+                "fallback": {
+                    "type": "transfer", "number": BUSY, "line": "main",
                     "answer_limit_ms": 5000
                 }
             }
@@ -293,6 +309,12 @@ fn network_dialplan() -> String {
 /// The network's two sides towards the node: the operator, at the address
 /// the node's settings accept, and the stranger at another one. To both the
 /// node is a customer reached at the node's address.
+///
+/// A real network sends audio for as long as a call lasts, packets of
+/// silence included; a channel of this test network that nobody speaks into
+/// sends nothing. So the operator's calls keep their audio alive with a
+/// packet a second (`rtp_keepalive`) — except through `the-node-quiet`, the
+/// same operator's side for a call whose audio is to stop.
 fn network_sides(ports: &NetworkPorts) -> String {
     let side = |name: &str, transport: &str, more: &str| {
         format!(
@@ -306,7 +328,7 @@ fn network_sides(ports: &NetworkPorts) -> String {
         "[global]\ntype = global\nendpoint_identifier_order = ip\n\n\
          [operator]\ntype = transport\nprotocol = udp\nbind = 127.0.0.1:{}\n\n\
          [stranger]\ntype = transport\nprotocol = udp\nbind = {STRANGER_ADDRESS}:{}\n\n\
-         {}{}\
+         {}{}{}\
          [the-node]\ntype = identify\nendpoint = the-node\nmatch = 127.0.0.1/32\n\n\
          [the-node-credentials]\ntype = auth\nauth_type = userpass\nusername = node\n\
          password = {}\n",
@@ -314,8 +336,13 @@ fn network_sides(ports: &NetworkPorts) -> String {
         ports.stranger,
         // The operator asks the node who it is, and knows the same password
         // the node's settings carry.
-        side("the-node", "operator", "auth = the-node-credentials\n"),
+        side(
+            "the-node",
+            "operator",
+            "auth = the-node-credentials\nrtp_keepalive = 1\n"
+        ),
         side("the-node-from-elsewhere", "stranger", ""),
+        side("the-node-quiet", "operator", ""),
         OPERATOR_PASSWORD.replace(';', "\\;"),
     )
 }
@@ -477,13 +504,15 @@ struct ControlInterface {
     /// Channels of the test's own application that have ended, each with
     /// the telephone network's reason for its end.
     ended: Arc<Mutex<Vec<(String, i64)>>>,
+    /// Tone digits channels of the test's own application have received.
+    digits: Arc<Mutex<Vec<(String, String)>>>,
 }
 
 impl ControlInterface {
     /// The control interface of the Asterisk whose state directory this is,
-    /// as its user `user`. The password is read from the configuration: the
-    /// node's is made by the controller anew for every start and lives only
-    /// in the file it wrote for Asterisk.
+    /// as its user `user`. The password is read from the configuration
+    /// written for Asterisk: the node's is the controller's control secret,
+    /// kept in the state directory and written into that file.
     fn of(port: u16, state: &Path, user: &str) -> TestResult<Self> {
         let written = fs::read_to_string(state.join("etc/ari.conf"))?;
         let password = written
@@ -495,6 +524,7 @@ impl ControlInterface {
             port,
             authorization: format!("Basic {}", BASE64.encode(credentials.as_bytes())),
             ended: Arc::default(),
+            digits: Arc::default(),
         })
     }
 
@@ -582,33 +612,79 @@ impl ControlInterface {
     /// application, and keep it open: the application exists for as long as
     /// the connection does.
     async fn serve_far_ends(&self) -> TestResult {
-        let credentials = self
-            .authorization
-            .strip_prefix("Basic ")
-            .map(|encoded| BASE64.decode(encoded.as_bytes()))
-            .ok_or("no credentials")??;
-        let url = format!(
-            "ws://127.0.0.1:{}/ari/events?app={FAR_END}&api_key={}",
-            self.port,
-            String::from_utf8(credentials)?,
-        );
-        let (mut events, _response) = connect_async(url).await?;
+        let mut events = self.events_of(FAR_END).await?;
         let ended = Arc::clone(&self.ended);
+        let digits = Arc::clone(&self.digits);
         tokio::spawn(async move {
             while let Some(Ok(frame)) = events.next().await {
                 let Frame::Text(text) = frame else { continue };
                 let Ok(event) = read_asterisk(text.as_str()) else {
                     continue;
                 };
-                if event.get("type").and_then(serde_json::Value::as_str) == Some("ChannelDestroyed")
-                    && let Some(channel) = event.pointer("/channel/id").and_then(|id| id.as_str())
+                let kind = event.get("type").and_then(serde_json::Value::as_str);
+                let channel = event.pointer("/channel/id").and_then(|id| id.as_str());
+                if kind == Some("ChannelDestroyed")
+                    && let Some(channel) = channel
                     && let Some(cause) = event.get("cause").and_then(serde_json::Value::as_i64)
                 {
                     ended.lock().await.push((channel.to_owned(), cause));
                 }
+                if kind == Some("ChannelDtmfReceived")
+                    && let Some(channel) = channel
+                    && let Some(digit) = event.get("digit").and_then(serde_json::Value::as_str)
+                {
+                    digits
+                        .lock()
+                        .await
+                        .push((channel.to_owned(), digit.to_owned()));
+                }
             }
         });
         Ok(())
+    }
+
+    /// Open the event connection of a Stasis application, as this control
+    /// interface's user — what subscribes to the application.
+    async fn events_of(
+        &self,
+        application: &str,
+    ) -> TestResult<WebSocketStream<MaybeTlsStream<TcpStream>>> {
+        let credentials = self
+            .authorization
+            .strip_prefix("Basic ")
+            .map(|encoded| BASE64.decode(encoded.as_bytes()))
+            .ok_or("no credentials")??;
+        let url = format!(
+            "ws://127.0.0.1:{}/ari/events?app={application}&api_key={}",
+            self.port,
+            String::from_utf8(credentials)?,
+        );
+        let (events, _response) = connect_async(url).await?;
+        Ok(events)
+    }
+
+    /// The tone digits a channel of the test's own application has
+    /// received, once there are `count` of them — waited for, since they
+    /// travel in real time.
+    async fn digits_heard(&self, channel: &str, count: usize) -> TestResult<String> {
+        let heard = timeout(STEP, async {
+            loop {
+                let heard: String = self
+                    .digits
+                    .lock()
+                    .await
+                    .iter()
+                    .filter(|(on, _)| on == channel)
+                    .map(|(_, digit)| digit.as_str())
+                    .collect();
+                if heard.len() >= count {
+                    return heard;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        heard.map_err(|_| format!("channel {channel} did not hear {count} digits").into())
     }
 
     /// The telephone network's reason for the end of a channel that was in
@@ -715,6 +791,8 @@ fn ulaw_decode(byte: u8) -> i16 {
 /// keeps everything it hears.
 struct Phone {
     heard: mpsc::UnboundedReceiver<Vec<u8>>,
+    /// Whether it sends its frames; a silent telephone sends none at all.
+    speaking: Arc<AtomicBool>,
 }
 
 impl Phone {
@@ -746,6 +824,8 @@ impl Phone {
             .insert(SEC_WEBSOCKET_PROTOCOL, HeaderValue::from_static("media"));
         let (mut socket, _response) = connect_async(request).await?;
         let (earpiece, heard) = mpsc::unbounded_channel();
+        let speaking = Arc::new(AtomicBool::new(true));
+        let sends = Arc::clone(&speaking);
         tokio::spawn(async move {
             // A telephone speaks in real time: one frame every twenty milliseconds.
             let mut pace = tokio::time::interval(Duration::from_millis(20));
@@ -753,6 +833,9 @@ impl Phone {
             loop {
                 tokio::select! {
                     _ = pace.tick() => {
+                        if !sends.load(Ordering::Relaxed) {
+                            continue;
+                        }
                         let frame: Vec<u8> = tone(says, Self::RATE, said, Self::FRAME)
                             .into_iter()
                             .map(ulaw_encode)
@@ -774,7 +857,13 @@ impl Phone {
                 }
             }
         });
-        Ok(Self { heard })
+        Ok(Self { heard, speaking })
+    }
+
+    /// Stop sending, or start again: a telephone whose line went dead, or
+    /// came back.
+    fn speaks(&self, speaking: bool) {
+        self.speaking.store(speaking, Ordering::Relaxed);
     }
 
     /// What the caller hears next: at least `samples` of it.
@@ -1295,6 +1384,13 @@ impl ServiceEnd {
             .map_err(|_| "the service connection is closed".into())
     }
 
+    /// Send a text as it is — one the protocol description may not allow.
+    fn send_text(&self, text: String) -> TestResult {
+        self.outgoing
+            .send(Frame::text(text))
+            .map_err(|_| "the service connection is closed".into())
+    }
+
     /// Give the node settings and return what it answered.
     async fn give(&mut self, settings: Settings) -> TestResult<NodeMessage> {
         self.send(&ApplicationServiceMessage::Settings { settings })?;
@@ -1421,7 +1517,17 @@ struct Stand {
 impl Stand {
     async fn start() -> TestResult<Self> {
         let tree = asterisk_tree()?;
-        let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("against-asterisk");
+        // The node's state directory holds the socket of Asterisk's console,
+        // whose path the controller holds to what a Unix socket address
+        // takes: a directory inside the clone's `target` is too long on a
+        // build machine. So the stand lives in the system's temporary
+        // directory, under a name of this clone's own — stands of two clones
+        // never meet; two runs in one clone still do.
+        let clone = node_protocol::sha256_hex(env!("CARGO_TARGET_TMPDIR").as_bytes());
+        let root = std::env::temp_dir().join(format!(
+            "against-asterisk-{}",
+            clone.get(..12).ok_or("a digest is shorter than 12")?
+        ));
         let _ = fs::remove_dir_all(&root);
         let state = root.join("node");
         fs::create_dir_all(&state)?;
@@ -1440,9 +1546,16 @@ impl Stand {
             audio: free_port().await? & !1,
             node: sip_port,
         };
+        // Settings carry the operators' passwords: readable by their owner
+        // alone, or the node does not start on them.
+        let stored_settings = state.join("settings.json");
         fs::write(
-            state.join("settings.json"),
+            &stored_settings,
             settings(network_ports.operator).to_string(),
+        )?;
+        fs::set_permissions(
+            &stored_settings,
+            std::os::unix::fs::PermissionsExt::from_mode(0o600),
         )?;
         // Whoever runs the node gives it its secret, readable by its owner alone.
         let secret = state.join("node-secret");
@@ -1523,6 +1636,34 @@ impl Stand {
             .as_mut()
             .ok_or("no service connection has been welcomed")?;
         service.reported(what, acknowledge, expected).await
+    }
+
+    /// Where the controller listens for Asterisk's media connections.
+    fn controller_address(&self) -> TestResult<String> {
+        let mut arguments = self.controller_arguments.iter();
+        arguments
+            .find(|argument| argument.as_os_str() == "--listen")
+            .and_then(|_| arguments.next())
+            .and_then(|address| address.to_str())
+            .map(str::to_owned)
+            .ok_or_else(|| "the controller was started without --listen".into())
+    }
+
+    /// Kill the node's Asterisk as a crash would. Its calls end with it.
+    async fn kill_asterisk(&mut self) -> TestResult {
+        self.asterisk.child.kill().await?;
+        Ok(())
+    }
+
+    /// Start the node's Asterisk again, on what the controller wrote.
+    async fn start_asterisk_again(&mut self) -> TestResult {
+        self.asterisk = start_asterisk(
+            &asterisk_tree()?,
+            &self.state.join("etc/asterisk.conf"),
+            "Asterisk",
+        )
+        .await?;
+        Ok(())
     }
 
     /// Kill the controller as a crash would. Asterisk goes on running.
@@ -1646,6 +1787,18 @@ impl Stand {
     /// The controller answers a command at once and Asterisk does what was
     /// asked a moment later, so this waits for the state itself.
     async fn expect_a_group_of(&self, size: usize, after: &str) -> TestResult {
+        if size == 0 {
+            self.expect_groups(&[], after).await
+        } else {
+            self.expect_groups(&[size], after).await
+        }
+    }
+
+    /// Wait until the groups of the node are of exactly these sizes, in any
+    /// order.
+    async fn expect_groups(&self, sizes: &[usize], after: &str) -> TestResult {
+        let mut wanted = sizes.to_vec();
+        wanted.sort_unstable();
         let mut groups = Vec::new();
         let arranged = timeout(STEP, async {
             loop {
@@ -1667,7 +1820,8 @@ impl Stand {
                             .map_or(0, Vec::len)
                     })
                     .collect();
-                if (size == 0 && groups.is_empty()) || groups == [size] {
+                groups.sort_unstable();
+                if groups == wanted {
                     return Ok::<(), Box<dyn Error>>(());
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1677,7 +1831,7 @@ impl Stand {
         match arranged {
             Ok(result) => result,
             Err(_) => Err(format!(
-                "{after}: Asterisk has groups of {groups:?} channels, not one of {size}"
+                "{after}: Asterisk has groups of {groups:?} channels, not {wanted:?}"
             )
             .into()),
         }
@@ -1856,19 +2010,41 @@ async fn the_owner_breaks_the_protocol(stand: &Stand) -> TestResult {
     owner.closed().await?;
     stand
         .expect_no_channels("after the owner broke the protocol")
+        .await?;
+
+    // Neither is a command identifier used twice on one connection: the
+    // answers would be told apart by it.
+    let (_caller, mut owner) = stand.call().await?;
+    let first = hello(&mut owner).await?.first.id;
+    owner.send(&ApplicationMessage::Accept)?;
+    let once = Command::StopListening { participant: first };
+    owner.command(1, once.clone())?;
+    let (outcome, _) = owner.outcome_of(1).await?;
+    assert!(
+        matches!(outcome, CommandOutcome::Accepted),
+        "`stop_listening` was {outcome:?}"
+    );
+    owner.command(1, once)?;
+    owner.closed().await?;
+    stand
+        .expect_no_channels("after the owner used a command identifier twice")
         .await
 }
 
 /// The application hears what the caller says, as frames of twenty
 /// milliseconds in the one format of the protocol.
-async fn hears_the_caller(owner: &mut Owner, participant: &ParticipantId) -> TestResult {
+async fn hears_the_caller(
+    owner: &mut Owner,
+    participant: &ParticipantId,
+    first_id: u64,
+) -> TestResult {
     owner.command(
-        3,
+        first_id,
         Command::Listen {
             participant: participant.clone(),
         },
     )?;
-    let (outcome, _) = owner.outcome_of(3).await?;
+    let (outcome, _) = owner.outcome_of(first_id).await?;
     assert!(
         matches!(outcome, CommandOutcome::Accepted),
         "`listen` was {outcome:?}"
@@ -1908,12 +2084,12 @@ async fn hears_the_caller(owner: &mut Owner, participant: &ParticipantId) -> Tes
     );
 
     owner.command(
-        4,
+        first_id + 1,
         Command::StopListening {
             participant: participant.clone(),
         },
     )?;
-    let (outcome, _) = owner.outcome_of(4).await?;
+    let (outcome, _) = owner.outcome_of(first_id + 1).await?;
     assert!(
         matches!(outcome, CommandOutcome::Accepted),
         "`stop_listening` was {outcome:?}"
@@ -1930,10 +2106,11 @@ async fn plays_to_the_caller(
     owner: &mut Owner,
     phone: &mut Phone,
     participant: &ParticipantId,
+    id: u64,
 ) -> TestResult {
     let greeting: SegmentId = "greeting".parse()?;
     owner.command(
-        5,
+        id,
         Command::Play {
             participant: participant.clone(),
             segment: greeting.clone(),
@@ -1944,7 +2121,7 @@ async fn plays_to_the_caller(
     let (first, second) = audio.split_at(5000);
     owner.audio(participant, &greeting, first, false)?;
     owner.audio(participant, &greeting, second, true)?;
-    let (outcome, mut events) = owner.outcome_of(5).await?;
+    let (outcome, mut events) = owner.outcome_of(id).await?;
     assert!(
         matches!(outcome, CommandOutcome::Accepted),
         "`play` was {outcome:?}"
@@ -2081,8 +2258,8 @@ async fn the_application_hears_and_speaks(stand: &Stand) -> TestResult {
     };
     let participant = first.id;
     owner.send(&ApplicationMessage::Accept)?;
-    hears_the_caller(&mut owner, &participant).await?;
-    plays_to_the_caller(&mut owner, &mut phone, &participant).await?;
+    hears_the_caller(&mut owner, &participant, 3).await?;
+    plays_to_the_caller(&mut owner, &mut phone, &participant, 5).await?;
     flushes_the_queue(&mut owner, &participant).await?;
 
     // A name still in the queue cannot be queued again.
@@ -2148,7 +2325,7 @@ async fn a_call_arrives_from_the_operator(stand: &Stand) -> TestResult {
         ))
         .await?;
     let mut owner = Owner::accept(&stand.application).await?;
-    let ControlMessageHello { dialed, first } = hello(&mut owner).await?;
+    let ControlMessageHello { dialed, first, .. } = hello(&mut owner).await?;
     assert_eq!(dialed, DIALED);
     assert_eq!(first.medium, ParticipantMedium::TelephoneNetwork);
     assert_eq!(
@@ -2180,8 +2357,9 @@ async fn a_call_arrives_from_the_operator(stand: &Stand) -> TestResult {
     // The caller speaks and listens through the trunk: the application
     // hears them and they hear the application, as on any other call.
     let (telephone, mut phone) = stand.network.give_a_phone(&caller).await?;
-    hears_the_caller(&mut owner, &first.id).await?;
-    plays_to_the_caller(&mut owner, &mut phone, &first.id).await?;
+    hears_the_caller(&mut owner, &first.id, 3).await?;
+    plays_to_the_caller(&mut owner, &mut phone, &first.id, 5).await?;
+    digits_go_both_ways(stand, &mut owner, &caller, &first.id, 6).await?;
 
     // The caller hangs up, on the network's side.
     for gone in [
@@ -2432,8 +2610,8 @@ async fn a_dialled_number_answers(stand: &Stand, owner: &mut Owner) -> TestResul
     );
 
     let (telephone, mut phone) = stand.network.give_a_phone(&network_end).await?;
-    hears_the_caller(owner, &second).await?;
-    plays_to_the_caller(owner, &mut phone, &second).await?;
+    hears_the_caller(owner, &second, 20).await?;
+    plays_to_the_caller(owner, &mut phone, &second, 22).await?;
 
     owner.command(
         8,
@@ -3207,8 +3385,8 @@ async fn connected_people_outlive_their_owner(stand: &Stand) -> TestResult {
 
 /// The instance that owns a conversation is lost while the caller is alone
 /// with it. The one instance that is there will not take the conversation —
-/// it is leaving — and the fallback of the entry is a message the node
-/// cannot say yet: the caller is hung up, not left on a line nobody controls.
+/// it is leaving — and the fallback of the entry is a message: the caller
+/// hears it and is hung up, not left on a line nobody controls.
 async fn a_caller_alone_loses_the_application(stand: &Stand) -> TestResult {
     let (_caller, mut owner) = stand.call().await?;
     let first = hello(&mut owner).await?.first.id;
@@ -3244,6 +3422,7 @@ async fn a_caller_alone_loses_the_application(stand: &Stand) -> TestResult {
 
 /// What a hello says about a new conversation.
 struct ControlMessageHello {
+    conversation: String,
     dialed: String,
     first: node_protocol::messages::Participant,
 }
@@ -3251,6 +3430,7 @@ struct ControlMessageHello {
 /// Read the hello of a conversation that has just been opened.
 async fn hello(owner: &mut Owner) -> TestResult<ControlMessageHello> {
     let ControllerMessage::Hello {
+        conversation,
         opening: Opening::Started { origin, first },
         ..
     } = owner.next().await?
@@ -3261,6 +3441,7 @@ async fn hello(owner: &mut Owner) -> TestResult<ControlMessageHello> {
         return Err("the call did not arrive as a dialed number".into());
     };
     Ok(ControlMessageHello {
+        conversation: conversation.as_str().to_owned(),
         dialed: dialed.as_str().to_owned(),
         first,
     })
@@ -3274,13 +3455,413 @@ async fn calls_are_carried_from_their_first_ring_to_their_end() -> TestResult {
         outcome = the_node_without_the_application(&mut stand).await;
     }
     if outcome.is_ok() {
-        // Last, because here the controller and Asterisk do lose each other.
+        outcome = a_fallback_transfer_finds_the_number_busy(&mut stand).await;
+    }
+    if outcome.is_ok() {
+        // Late, because here the controller and Asterisk do lose each other.
         outcome = the_node_without_its_controller(&mut stand).await;
+    }
+    if outcome.is_ok() {
+        outcome = the_telephony_server_restarts_under_a_conversation(&mut stand).await;
+    }
+    if outcome.is_ok() {
+        // Last, because the controller stops.
+        outcome = a_second_controller_takes_the_application(&mut stand).await;
     }
     if outcome.is_err() {
         stand.report().await;
     }
     outcome
+}
+
+/// The node's Asterisk dies under a conversation and is started again.
+/// The owner is told the telephony server is lost, and nothing is carried
+/// out meanwhile; when it is back, the participant whose call ended with it
+/// has left — how is not known — before the word that it is back, and the
+/// conversation ends.
+async fn the_telephony_server_restarts_under_a_conversation(stand: &mut Stand) -> TestResult {
+    let (_caller, _phone, mut owner) = stand.call_from_a_phone().await?;
+    let first = hello(&mut owner).await?.first.id;
+    owner.send(&ApplicationMessage::Accept)?;
+
+    stand.kill_asterisk().await?;
+    let lost = owner.next_event().await?;
+    assert!(
+        matches!(lost, Event::TelephonyServerLost),
+        "the owner was told {lost:?} when Asterisk died"
+    );
+    owner.command(
+        1,
+        Command::StopListening {
+            participant: first.clone(),
+        },
+    )?;
+    let (outcome, _) = owner.outcome_of(1).await?;
+    assert!(
+        matches!(
+            outcome,
+            CommandOutcome::Rejected {
+                reason: CommandRejection::TelephonyServerUnavailable
+            }
+        ),
+        "a command without Asterisk was {outcome:?}"
+    );
+
+    stand.start_asterisk_again().await?;
+    let mut told = Vec::new();
+    for _ in 0..3 {
+        told.push(owner.next_event().await?);
+    }
+    assert!(
+        matches!(
+            told.as_slice(),
+            [
+                Event::ParticipantLeft { participant, departure: Departure::Lost },
+                Event::TelephonyServerBack,
+                Event::ConversationEnded { reason: EndReason::LastParticipantLeft },
+            ] if *participant == first
+        ),
+        "after Asterisk was back the owner was told {told:?}"
+    );
+    owner.closed().await?;
+    stand
+        .expect_no_channels("after Asterisk was started again")
+        .await
+}
+
+/// A call from the operator through its side whose audio stops when its
+/// telephone does, answered, with a telephone at the caller's end of the
+/// network. Returns the caller's end, their participant, the
+/// telephone and the owner.
+async fn an_answered_call_from_the_operator(
+    stand: &Stand,
+) -> TestResult<(String, ParticipantId, Phone, Owner)> {
+    let caller = stand
+        .network
+        .control
+        .create_channel(&format!(
+            "endpoint=PJSIP/{DIALED_IN_URL}@the-node-quiet&app={FAR_END}&callerId={CALLER_IN_URL}"
+        ))
+        .await?;
+    let mut owner = Owner::accept(&stand.application).await?;
+    let first = hello(&mut owner).await?.first.id;
+    owner.send(&ApplicationMessage::Accept)?;
+    let participant = first.clone();
+    let mut events = accepted(&mut owner, 1, Command::Answer { participant }).await?;
+    if events.is_empty() {
+        events.push(owner.next_event().await?);
+    }
+    let (_telephone, phone) = stand.network.give_a_phone(&caller).await?;
+    Ok((caller, first, phone, owner))
+}
+
+/// The next event, or none within `wait`.
+async fn event_within(owner: &mut Owner, wait: Duration) -> TestResult<Option<Event>> {
+    match timeout(wait, owner.next_event()).await {
+        Ok(event) => Ok(Some(event?)),
+        Err(_) => Ok(None),
+    }
+}
+
+/// Audio that stops arriving while the call goes on. While the far end has
+/// the call on hold nothing is judged; then five seconds without audio is
+/// audio lost: the participant is held for as long as `hold_for` allows and
+/// returns when audio comes back — and with no limit, the default, they are
+/// gone at once, as one who did not return.
+async fn audio_that_stops_arriving(stand: &Stand) -> TestResult {
+    let (caller, first, phone, mut owner) = an_answered_call_from_the_operator(stand).await?;
+    let participant = first.clone();
+    accepted(
+        &mut owner,
+        2,
+        Command::HoldFor {
+            participant,
+            limit_ms: 20_000,
+        },
+    )
+    .await?;
+
+    // The caller's side puts the call on hold and sends nothing.
+    stand
+        .network
+        .control
+        .request("POST", &format!("channels/{caller}/hold"))
+        .await?;
+    phone.speaks(false);
+    let told = event_within(&mut owner, Duration::from_secs(7)).await?;
+    assert!(told.is_none(), "audio on hold was judged: {told:?}");
+
+    // Off hold, still silent: lost, held — then back.
+    stand
+        .network
+        .control
+        .request("DELETE", &format!("channels/{caller}/hold"))
+        .await?;
+    let mut told = Vec::new();
+    for _ in 0..2 {
+        told.push(owner.next_event().await?);
+    }
+    assert!(
+        matches!(
+            told.as_slice(),
+            [Event::MediumLost { participant: lost }, Event::ParticipantHeld { participant: held }]
+                if *lost == first && *held == first
+        ),
+        "silence off hold was told as {told:?}"
+    );
+    phone.speaks(true);
+    let back = owner.next_event().await?;
+    assert!(
+        matches!(&back, Event::ParticipantReturned { participant } if *participant == first),
+        "audio that came back was told as {back:?}"
+    );
+    ends_it(&mut owner, 3, 1).await?;
+
+    // With no limit, lost is gone.
+    let (_caller, first, phone, mut owner) = an_answered_call_from_the_operator(stand).await?;
+    phone.speaks(false);
+    let mut told = Vec::new();
+    for _ in 0..4 {
+        told.push(owner.next_event().await?);
+    }
+    assert!(
+        matches!(
+            told.as_slice(),
+            [
+                Event::MediumLost { .. },
+                Event::ParticipantHeld { .. },
+                Event::ParticipantLeft { participant, departure: Departure::DidNotReturn },
+                Event::ConversationEnded { reason: EndReason::LastParticipantLeft },
+            ] if *participant == first
+        ),
+        "audio lost with no limit was told as {told:?}"
+    );
+    owner.closed().await?;
+    stand
+        .expect_no_channels("after audio stopped arriving")
+        .await
+}
+
+/// Asterisk does not begin a call the application asks for — here because
+/// the name the node gives the call's channel is already taken — and the
+/// `dial` command is refused as `call_not_placed`; the line's place is given
+/// back, so the next call on it is placed.
+async fn a_call_asterisk_does_not_place(stand: &Stand) -> TestResult {
+    let (_caller, _phone, mut owner) = stand.call_from_a_phone().await?;
+    let opened = hello(&mut owner).await?;
+    owner.send(&ApplicationMessage::Accept)?;
+    // The caller is participant "p-<run>-1"; the call the node places next
+    // is participant 2, its channel "<conversation>.<run>.participant-2".
+    let run = opened
+        .first
+        .id
+        .as_str()
+        .strip_prefix("p-")
+        .and_then(|rest| rest.rsplit_once('-'))
+        .map(|(run, _)| run.to_owned())
+        .ok_or("a participant identifier without the controller's run")?;
+    let taken = format!("{}.{run}.participant-2", opened.conversation);
+    let blocker = stand
+        .control
+        .create_channel(&format!(
+            "endpoint=WebSocket/INCOMING/c(ulaw)&app={FAR_END}&channelId={taken}"
+        ))
+        .await?;
+    let (outcome, _) = dial(&mut owner, 1, ANSWERS, "main", 5000).await?;
+    assert!(
+        matches!(
+            outcome,
+            CommandOutcome::Rejected {
+                reason: CommandRejection::CallNotPlaced
+            }
+        ),
+        "a call Asterisk would not begin was {outcome:?}"
+    );
+    stand
+        .control
+        .request("DELETE", &format!("channels/{blocker}"))
+        .await?;
+    let (outcome, mut events) = dial(&mut owner, 2, ANSWERS, "main", 5000).await?;
+    assert!(
+        matches!(outcome, CommandOutcome::AcceptedParticipant { .. }),
+        "the next call on the line was {outcome:?}"
+    );
+    while events.len() < 2 {
+        events.push(owner.next_event().await?);
+    }
+    ends_it(&mut owner, 3, 2).await?;
+    stand
+        .expect_no_channels("after a call Asterisk did not place")
+        .await
+}
+
+/// Two groups become one when the application connects someone of each:
+/// the caller and three the node called, two by two, then all four.
+async fn two_groups_are_merged(stand: &Stand) -> TestResult {
+    let (_caller, _phone, mut owner) = stand.call_from_a_phone().await?;
+    let first = hello(&mut owner).await?.first.id;
+    owner.send(&ApplicationMessage::Accept)?;
+    let mut called = Vec::new();
+    for (id, line) in [(1, "main"), (2, "wide"), (3, "wide")] {
+        let (outcome, mut events) = dial(&mut owner, id, ANSWERS, line, 5000).await?;
+        let CommandOutcome::AcceptedParticipant { participant } = outcome else {
+            return Err(format!("dialling on {line} was {outcome:?}").into());
+        };
+        while events.len() < 2 {
+            events.push(owner.next_event().await?);
+        }
+        called.push(participant);
+    }
+    let [a, b, c] = called.as_slice() else {
+        return Err("three were not called".into());
+    };
+    let connect = |participants: &[&ParticipantId]| Command::Connect {
+        participants: participants.iter().map(|&who| who.clone()).collect(),
+    };
+    accepted(&mut owner, 4, connect(&[&first, a])).await?;
+    accepted(&mut owner, 5, connect(&[b, c])).await?;
+    stand
+        .expect_groups(&[2, 2], "after two pairs were connected")
+        .await?;
+    accepted(&mut owner, 6, connect(&[a, b])).await?;
+    stand
+        .expect_groups(&[4], "after one of each pair was connected")
+        .await?;
+    ends_it(&mut owner, 7, 4).await?;
+    stand
+        .expect_no_channels("after two groups were merged")
+        .await
+}
+
+/// Tone digits travel both ways through the trunk: what the caller presses
+/// reaches the application, and what the application sends reaches the
+/// caller's network.
+async fn digits_go_both_ways(
+    stand: &Stand,
+    owner: &mut Owner,
+    caller: &str,
+    participant: &ParticipantId,
+    id: u64,
+) -> TestResult {
+    stand
+        .network
+        .control
+        .request("POST", &format!("channels/{caller}/dtmf?dtmf=5"))
+        .await?;
+    let pressed = timeout(STEP, async {
+        loop {
+            if let Event::DigitReceived {
+                participant: who,
+                digit,
+            } = owner.next_event().await?
+            {
+                return Ok::<_, Box<dyn Error>>((who, digit));
+            }
+        }
+    })
+    .await
+    .map_err(|_| "the application was not told of the digit the caller pressed")??;
+    assert!(
+        pressed.0 == *participant && pressed.1.as_str() == "5",
+        "the caller pressed 5 and the application was told {pressed:?}"
+    );
+    owner.command(
+        id,
+        Command::SendDigits {
+            participant: participant.clone(),
+            digits: "12#".parse()?,
+        },
+    )?;
+    let (outcome, _) = owner.outcome_of(id).await?;
+    assert!(
+        matches!(outcome, CommandOutcome::Accepted),
+        "`send_digits` was {outcome:?}"
+    );
+    let heard = stand.network.control.digits_heard(caller, 3).await?;
+    assert_eq!(heard, "12#", "the caller's network heard other digits");
+    Ok(())
+}
+
+/// A media connection that does not present the control secret Asterisk
+/// has from its configuration is refused: the loopback address keeps the
+/// network out, and this every other process of the machine.
+async fn only_asterisk_opens_media_connections(stand: &Stand) -> TestResult {
+    let mut request =
+        format!("ws://{}/media", stand.controller_address()?).into_client_request()?;
+    request
+        .headers_mut()
+        .insert(SEC_WEBSOCKET_PROTOCOL, HeaderValue::from_static("media"));
+    match connect_async(request).await {
+        Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "a media connection without the secret was answered {}",
+                response.status()
+            );
+            Ok(())
+        }
+        Err(error) => {
+            Err(format!("a media connection without the secret failed otherwise: {error}").into())
+        }
+        Ok(_) => Err("a media connection without the secret was let in".into()),
+    }
+}
+
+/// A fallback's transfer that cannot connect the caller — the number it
+/// calls is busy — is reported failed, with the reason; the caller, with
+/// nobody to be connected to, is hung up and reported so.
+async fn a_fallback_transfer_finds_the_number_busy(stand: &mut Stand) -> TestResult {
+    stand.application.go_away().await;
+    stand
+        .control
+        .create_channel(&format!(
+            "endpoint=Local/{}@gabion-from-network&app={FAR_END}",
+            DIALED_TO_BUSY.replace('+', "%2B")
+        ))
+        .await?;
+    stand
+        .reported("a fallback's transfer to a busy number", true, |report| {
+            matches!(
+                report,
+                Report::FallbackFailed {
+                    fallback: FallbackKind::Transfer,
+                    failure: FallbackFailure::NotConnected {
+                        departure: Departure::Busy
+                    },
+                    ..
+                }
+            )
+        })
+        .await?;
+    stand
+        .reported("the caller of a transfer that failed", true, is_hang_up)
+        .await?;
+    stand
+        .expect_no_channels("after a fallback's transfer failed")
+        .await?;
+    stand.application.come_back().await
+}
+
+/// A second connection takes the node's application in Asterisk, as a
+/// second controller started next to the same Asterisk would. The
+/// controller does not take it back — that would only begin a tug of war —
+/// and does not stay on hearing nothing: it says so and stops with a
+/// failure, for whoever runs the node to see.
+async fn a_second_controller_takes_the_application(stand: &mut Stand) -> TestResult {
+    let _second = stand.control.events_of(NODE_APPLICATION).await?;
+    if !stand.controller.comes_to_say("TAKEN").await {
+        return Err("the controller did not notice its application was taken".into());
+    }
+    let status = timeout(STEP, stand.controller.child.wait())
+        .await
+        .map_err(|_| "the controller whose application was taken did not stop")??;
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "the controller whose application was taken stopped with {status}"
+    );
+    Ok(())
 }
 
 /// The network's end of the call the node has placed to the number that
@@ -3706,50 +4287,62 @@ async fn both_conversations_offered(stand: &Stand) -> TestResult<(Owner, Owner)>
 /// A call that still rings is turned away, and the caller's network is told
 /// why — here, that the line is busy.
 async fn a_ringing_call_is_turned_away(stand: &Stand) -> TestResult {
-    let caller = stand
-        .network
-        .control
-        .create_channel(&format!(
-            "endpoint=PJSIP/{DIALED_IN_URL}@the-node&app={FAR_END}&callerId={CALLER_IN_URL}"
-        ))
-        .await?;
-    let mut owner = Owner::accept(&stand.application).await?;
-    let first = hello(&mut owner).await?.first;
-    owner.send(&ApplicationMessage::Accept)?;
-    owner.command(
-        1,
-        Command::Reject {
-            participant: first.id.clone(),
-            reason: RejectReason::Busy,
-        },
-    )?;
-    let (outcome, mut events) = owner.outcome_of(1).await?;
-    while events.len() < 2 {
-        events.push(owner.next_event().await?);
+    // Each reason reaches the caller's network as its own answer — 486, 403
+    // and 503 — which that network numbers 17 ("user busy"), 21 ("call
+    // rejected") and 34 ("no circuit available").
+    for (reason, network_reason) in [
+        (RejectReason::Busy, 17),
+        (RejectReason::Declined, 21),
+        (RejectReason::RateLimited, 34),
+    ] {
+        let caller = stand
+            .network
+            .control
+            .create_channel(&format!(
+                "endpoint=PJSIP/{DIALED_IN_URL}@the-node&app={FAR_END}&callerId={CALLER_IN_URL}"
+            ))
+            .await?;
+        let mut owner = Owner::accept(&stand.application).await?;
+        let first = hello(&mut owner).await?.first;
+        owner.send(&ApplicationMessage::Accept)?;
+        owner.command(
+            1,
+            Command::Reject {
+                participant: first.id.clone(),
+                reason,
+            },
+        )?;
+        let (outcome, mut events) = owner.outcome_of(1).await?;
+        while events.len() < 2 {
+            events.push(owner.next_event().await?);
+        }
+        assert!(
+            matches!(outcome, CommandOutcome::Accepted)
+                && matches!(
+                    events.as_slice(),
+                    [
+                        Event::ParticipantLeft {
+                            departure: Departure::Removed,
+                            ..
+                        },
+                        Event::ConversationEnded {
+                            reason: EndReason::LastParticipantLeft
+                        },
+                    ]
+                ),
+            "turning a ringing call away as {reason:?} was {outcome:?}, then {events:?}"
+        );
+        owner.closed().await?;
+        let told = stand.network.control.reason_it_ended(&caller).await?;
+        assert_eq!(
+            told, network_reason,
+            "the caller's network was told another reason for {reason:?}"
+        );
+        stand
+            .expect_no_channels("after a call was turned away")
+            .await?;
     }
-    assert!(
-        matches!(outcome, CommandOutcome::Accepted)
-            && matches!(
-                events.as_slice(),
-                [
-                    Event::ParticipantLeft {
-                        departure: Departure::Removed,
-                        ..
-                    },
-                    Event::ConversationEnded {
-                        reason: EndReason::LastParticipantLeft
-                    },
-                ]
-            ),
-        "turning a ringing call away was {outcome:?}, then {events:?}"
-    );
-    owner.closed().await?;
-    // 17 is the telephone network's number for "user busy".
-    let reason = stand.network.control.reason_it_ended(&caller).await?;
-    assert_eq!(reason, 17, "the caller's network was told another reason");
-    stand
-        .expect_no_channels("after a call was turned away")
-        .await
+    Ok(())
 }
 
 /// The settings of the test with one more entry: the number the
@@ -3765,6 +4358,65 @@ fn settings_with_a_later_entry(operator_port: u16) -> TestResult<Settings> {
             "fallback": { "type": "message", "prompt": "closed" }
         }));
     Ok(node_protocol::decode_value(value)?)
+}
+
+/// Settings the node refuses, each with the reason — and keeps the ones
+/// it had: whose parts disagree, that the protocol does not allow, and
+/// with a prompt nobody serves.
+async fn settings_that_are_refused(stand: &Stand, service: &mut ServiceEnd) -> TestResult {
+    let mut disagreeing = settings(stand.operator_port);
+    *disagreeing
+        .pointer_mut("/lines/0/operator")
+        .ok_or("the settings have no line")? = serde_json::json!("nobody");
+    let disagreeing: Settings = node_protocol::decode_value(disagreeing)?;
+    let disagreeing_fingerprint = node_protocol::fingerprint(&disagreeing)?;
+    let answer = service.give(disagreeing).await?;
+    assert!(
+        matches!(&answer, NodeMessage::SettingsRefused { fingerprint, problem }
+            if fingerprint.as_str() == disagreeing_fingerprint
+                && problem.as_str().contains("not among the operators")),
+        "settings whose parts disagree were answered {answer:?}"
+    );
+
+    // Settings that are not what the protocol allows are refused with the
+    // reason and the fingerprint of what was sent, on a connection that
+    // goes on — the steps below take place on it.
+    let mut malformed = settings(stand.operator_port);
+    *malformed
+        .pointer_mut("/operators/0/port")
+        .ok_or("the settings have no operator")? = serde_json::json!("five thousand");
+    let malformed_fingerprint =
+        node_protocol::sha256_hex(node_protocol::canonical(&malformed).as_bytes());
+    service
+        .send_text(serde_json::json!({ "type": "settings", "settings": malformed }).to_string())?;
+    let answer = service.next().await?;
+    assert!(
+        matches!(&answer, NodeMessage::SettingsRefused { fingerprint, problem }
+            if fingerprint.as_str() == malformed_fingerprint
+                && problem.as_str().contains("not what the protocol allows")),
+        "settings the protocol does not allow were answered {answer:?}"
+    );
+
+    // A prompt the application does not serve: the settings are refused.
+    let mut unfetchable = settings(stand.operator_port);
+    *unfetchable
+        .pointer_mut("/prompts/0/id")
+        .ok_or("the settings have no prompt")? = serde_json::json!("nowhere");
+    // Other audio than the node has: the node must fetch it.
+    *unfetchable
+        .pointer_mut("/prompts/0/sha256")
+        .ok_or("the settings have no prompt")? = serde_json::json!("1".repeat(64));
+    *unfetchable
+        .pointer_mut("/entries/0/fallback/prompt")
+        .ok_or("the settings have no message fallback")? = serde_json::json!("nowhere");
+    let unfetchable: Settings = node_protocol::decode_value(unfetchable)?;
+    let answer = service.give(unfetchable).await?;
+    assert!(
+        matches!(&answer, NodeMessage::SettingsRefused { problem, .. }
+            if problem.as_str().contains("cannot be fetched")),
+        "settings with a prompt nobody serves were answered {answer:?}"
+    );
+    Ok(())
 }
 
 /// The application gives the node its settings on the service connection,
@@ -3809,39 +4461,7 @@ async fn the_application_gives_the_node_its_settings(stand: &Stand) -> TestResul
         "the same settings again were answered {answer:?}"
     );
 
-    let mut disagreeing = settings(stand.operator_port);
-    *disagreeing
-        .pointer_mut("/lines/0/operator")
-        .ok_or("the settings have no line")? = serde_json::json!("nobody");
-    let disagreeing: Settings = node_protocol::decode_value(disagreeing)?;
-    let disagreeing_fingerprint = node_protocol::fingerprint(&disagreeing)?;
-    let answer = service.give(disagreeing).await?;
-    assert!(
-        matches!(&answer, NodeMessage::SettingsRefused { fingerprint, problem }
-            if fingerprint.as_str() == disagreeing_fingerprint
-                && problem.as_str().contains("not among the operators")),
-        "settings whose parts disagree were answered {answer:?}"
-    );
-
-    // A prompt the application does not serve: the settings are refused.
-    let mut unfetchable = settings(stand.operator_port);
-    *unfetchable
-        .pointer_mut("/prompts/0/id")
-        .ok_or("the settings have no prompt")? = serde_json::json!("nowhere");
-    // Other audio than the node has: the node must fetch it.
-    *unfetchable
-        .pointer_mut("/prompts/0/sha256")
-        .ok_or("the settings have no prompt")? = serde_json::json!("1".repeat(64));
-    *unfetchable
-        .pointer_mut("/entries/0/fallback/prompt")
-        .ok_or("the settings have no message fallback")? = serde_json::json!("nowhere");
-    let unfetchable: Settings = node_protocol::decode_value(unfetchable)?;
-    let answer = service.give(unfetchable).await?;
-    assert!(
-        matches!(&answer, NodeMessage::SettingsRefused { problem, .. }
-            if problem.as_str().contains("cannot be fetched")),
-        "settings with a prompt nobody serves were answered {answer:?}"
-    );
+    settings_that_are_refused(stand, &mut service).await?;
 
     let later = settings_with_a_later_entry(stand.operator_port)?;
     let later_fingerprint = node_protocol::fingerprint(&later)?;
@@ -3888,8 +4508,8 @@ async fn the_application_gives_the_node_its_settings(stand: &Stand) -> TestResul
 ///
 /// The controller pings it every ten seconds, gives up on it when the
 /// protocol's thirty seconds of silence have passed, and gives the caller
-/// the fallback of the entry: a message, which the node cannot say yet, so
-/// the caller is hung up rather than left waiting for nobody.
+/// the fallback of the entry: a message, after which the caller is hung up
+/// rather than left waiting for nobody.
 async fn a_silent_instance_is_no_owner(stand: &Stand) -> TestResult {
     stand
         .control
@@ -3931,6 +4551,7 @@ async fn a_silent_instance_is_no_owner(stand: &Stand) -> TestResult {
 
 async fn every_scenario(stand: &Stand) -> TestResult {
     stand.expect_the_operator_as_it_was_given().await?;
+    only_asterisk_opens_media_connections(stand).await?;
     the_application_gives_the_node_its_settings(stand).await?;
     answered_then_the_caller_hangs_up(stand).await?;
     ended_by_the_handler(stand).await?;
@@ -3942,6 +4563,9 @@ async fn every_scenario(stand: &Stand) -> TestResult {
     a_ringing_call_is_turned_away(stand).await?;
     the_application_dials(stand).await?;
     the_application_connects_participants(stand).await?;
+    two_groups_are_merged(stand).await?;
+    audio_that_stops_arriving(stand).await?;
+    a_call_asterisk_does_not_place(stand).await?;
     a_step_refused_for_one_who_stays(stand).await?;
     connected_people_outlive_their_owner(stand).await?;
     a_caller_alone_loses_the_application(stand).await?;

@@ -91,11 +91,23 @@ public final class ProtocolJson {
     /**
      * Encode a protocol message as JSON text.
      *
+     * <p>What is sent is held to the description as what is received is: a message the other side
+     * would refuse is never sent, and the refusal names the place, as on arrival.</p>
+     *
      * @param message a value of a type generated from the description
+     * @param type    the type the message is sent as; its simple name is the definition's
      * @return the text
+     * @throws ProtocolViolation when the message is not one the description allows
      */
-    public static String encode(Object message) {
-        return MAPPER.writeValueAsString(message);
+    public static <T> String encode(T message, Class<T> type) throws ProtocolViolation {
+        JsonNode schema = DEFINITIONS.get(type.getSimpleName());
+        if (schema == null) {
+            throw new IllegalArgumentException(
+                    type.getSimpleName() + " is not a type of the protocol description");
+        }
+        JsonNode value = MAPPER.valueToTree(message);
+        check(schema, value, "");
+        return MAPPER.writeValueAsString(value);
     }
 
     /**

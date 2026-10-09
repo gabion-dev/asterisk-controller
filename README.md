@@ -88,12 +88,12 @@ asterisk-controller --node <name> --listen 127.0.0.1:<port> \
   without `?` or `#`. `ws://` is accepted only for a loopback address or
   `localhost`.
 - `--asterisk-tree` — the Asterisk tree.
-- `--state` — the node's state directory. Its path may not hold control
-  characters or any of `, & ; $ ( ) [ ] { } \ " ' |`. Keep it short:
-  Asterisk's console socket, `<state>/run/asterisk.ctl`, must fit the limit
-  of a Unix socket path — 108 bytes on Linux, 104 on macOS. With a longer
-  path Asterisk runs, but `asterisk -rx` cannot connect to it (seen on
-  Linux); the controller does not check the length.
+- `--state` — the node's state directory, an absolute path. It may not hold
+  control characters or any of `, & ; $ ( ) [ ] { } \ " ' |`. Keep it short:
+  Asterisk's console socket, `<state>/run/asterisk.ctl`, must fit a Unix
+  socket path — at most 107 bytes on Linux, 103 on macOS. Asterisk would cut
+  a longer one and make its socket outside the state directory, so the
+  controller does not start with such a path.
 - `--asterisk-http` — where Asterisk's HTTP server and control interface
   listen; the controller writes it into Asterisk's configuration and
   connects there. A loopback address only.
@@ -148,12 +148,15 @@ them on the service connection. The node applies them while it runs — it
 rewrites the dialplan and the operators' file and has Asterisk reload those
 two — and keeps the last settings it applied in `<state>/settings.json`, on
 which it starts next time. Settings it cannot take it refuses with the
-reason, and keeps the ones it had.
+reason, and keeps the ones it had — settings the protocol description does
+not allow included: they are refused the same way, with the fingerprint of
+what was sent, and the connection goes on.
 
 Without `settings.json` the node has no settings, and no call enters or
 leaves it. You may put a `settings.json` there yourself: the controller
 starts on any file that passes the protocol description and the node's own
-checks, and does not start with one that fails them.
+checks and that only its owner may read (it carries the operators'
+passwords), and does not start with one that fails them.
 
 ### The state directory
 
@@ -171,7 +174,8 @@ The controller writes:
   Asterisk's control interface, made once for the state directory and kept,
   mode 0600. A controller started next to a running Asterisk must present
   the password that Asterisk read when it started: keep this file while
-  Asterisk runs;
+  Asterisk runs. The controller does not start with an empty one or one that
+  others may read — it never writes it so;
 - `etc/` — every configuration file of Asterisk, mode 0700, rewritten on
   every start;
 - `settings.json` — the settings last applied;
@@ -181,17 +185,19 @@ The controller writes:
   application and checked against their SHA-256; a prompt the settings no
   longer name is removed.
 
-It also creates `db/`, `keys/keys/`, `spool/`, `run/` and `log/` for
-Asterisk, and names them in `etc/asterisk.conf`.
+It also creates `db/`, `keys/keys/`, `spool/`, `run/`, `log/` and `cache/`
+for Asterisk, and names them in `etc/asterisk.conf`. Every file the
+controller writes is readable by its owner alone (mode 0600).
 
 The state directory holds secrets: the control password in `control-secret`
 and `etc/ari.conf`, the operators' passwords in `etc/pjsip.conf` and
 `settings.json`. Keep the state directory accessible to the node's user only
 (for example, `chmod 700`).
 
-A file that changes while the node runs is written under a temporary name
-and renamed, so it is never found half written; `reports.jsonl` is appended
-to.
+Every file is written under a temporary name, flushed to the disk and
+renamed, and the rename is flushed too, so a file is never found half
+written and survives a power loss once written; `reports.jsonl` is appended
+to and flushed line by line.
 
 ### Output
 
@@ -222,7 +228,8 @@ Lines that say something is wrong:
   cannot be reached, or it refused the node;
 - `asterisk-controller: settings <fingerprint> are refused — <reason>`;
 - `asterisk-controller: prompt "<identifier>" is not here; …` — until it is
-  fetched, a message fallback plays nothing;
+  fetched, a message fallback with it does not answer the caller and turns
+  them away as a temporary failure (cause 41);
 - `conversation <id>: FAILED — <reason>` — a conversation could not go on.
 
 While the controller keeps trying to reach Asterisk, the application or an
@@ -278,22 +285,28 @@ asks; reports it left unconfirmed are sent again.
 
 ### When Asterisk stops
 
-When Asterisk stops — on SIGTERM or SIGINT it hangs up every call before it
-exits — the node's calls end. The controller says `LOST`, tells the
-application, on the connection of each conversation an instance owns, that
-every participant has left and the conversation has ended, and looks for
-Asterisk again every 250 milliseconds.
+When the connection to Asterisk is lost, the controller says `LOST` and looks
+for Asterisk again every 250 milliseconds. It cannot tell at once whether
+Asterisk stopped (on SIGTERM or SIGINT it hangs up every call before it exits)
+or only the connection broke, so conversations wait: each owner is told the
+telephony server is lost, audio paths end, and commands are refused until
+it is back. When Asterisk is found again, a participant whose call ended
+meanwhile leaves with the departure `lost`, the owner is told the server is
+back, and a conversation with nobody left ends.
 
 ### Other cases
 
 - The controller warns of a missing prompt when it starts, and fetches it
-  when the application welcomes the node.
+  when the application welcomes the node; the dialplan is rewritten then, so
+  the message is played from that moment.
 - When the application breaks the protocol, the conversation ends.
 
 ## Stopping
 
-On SIGINT the controller exits with status 0. It catches no other signal:
-SIGTERM ends it by the signal's default action. Either way nothing is cleaned
+On SIGTERM or SIGINT the controller exits with status 0. Run one controller
+for one Asterisk: when another connection takes the node's application in
+Asterisk — a second controller started next to it — the controller says its
+application was `TAKEN` and exits with status 1. Nothing is cleaned
 up — calls stay in Asterisk, people connected to each other go on talking,
 and the next controller carries the calls on; reports not yet confirmed stay
 in `reports.jsonl`.
@@ -313,8 +326,8 @@ The machine needs:
   and access to github.com;
 - for the tests: the Asterisk tree (from the script, or `ASTERISK_TREE`
   pointing at one) and `127.0.0.2` as an address of the machine; the path of
-  the clone may not hold the characters `--state` refuses, because the tests
-  keep a state directory under `target/`;
+  the system's temporary directory may not hold the characters `--state`
+  refuses, because the tests keep a node's state directory there;
 - for the Java side: a JDK 21, and `cargo` on the `PATH` — the Java message
   types are generated by `cargo run -p protocol-java`. The Gradle wrapper
   downloads Gradle 9.3.0 and the libraries, which are checked against pinned
@@ -337,7 +350,9 @@ operator at `127.0.0.1` and a stranger at `127.0.0.2`. The test itself plays
 the application, over `ws://` on the loopback address. Without an Asterisk
 tree the test fails and says how to get one. A separate test, without Asterisk,
 has the controller reach an application over TLS with a certificate made for
-the test.
+the test. The Java side's check runs the library through the shared vectors
+and plays the application on the service connection of the controller built
+from this repository, without Asterisk.
 
 `.github/workflows/checks.yml` runs the same checks on every push and pull
 request.

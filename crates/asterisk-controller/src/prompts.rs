@@ -25,7 +25,7 @@ use std::{
 
 use node_protocol::messages::{Prompt, Settings};
 
-use crate::{application::Application, ari};
+use crate::{application::Application, ari, state_files};
 
 /// The directory of the state directory that holds prompts.
 const DIRECTORY: &str = "prompts";
@@ -45,12 +45,17 @@ fn file(state: &Path, prompt: &Prompt) -> PathBuf {
     playable(state, prompt).with_extension(EXTENSION)
 }
 
+/// Whether the node has the audio of a prompt.
+pub fn is_here(state: &Path, prompt: &Prompt) -> bool {
+    file(state, prompt).is_file()
+}
+
 /// The prompts the settings name that the node does not have.
 pub fn missing<'a>(state: &Path, settings: &'a Settings) -> Vec<&'a Prompt> {
     settings
         .prompts
         .iter()
-        .filter(|prompt| !file(state, prompt).is_file())
+        .filter(|prompt| !is_here(state, prompt))
         .collect()
 }
 
@@ -84,10 +89,7 @@ pub async fn fetch_missing(
         }
         let failed = |error: std::io::Error| format!("{}: {error}", directory.display());
         fs::create_dir_all(&directory).map_err(failed)?;
-        let path = file(state, prompt);
-        let written = path.with_extension("new");
-        fs::write(&written, &audio).map_err(failed)?;
-        fs::rename(&written, &path).map_err(failed)?;
+        state_files::replace(&file(state, prompt), &audio).map_err(failed)?;
     }
     Ok(())
 }
