@@ -2,7 +2,7 @@
 
 [package]
 name = "asterisk-controller"
-version = "0.1.0"
+version = "0.1.0-dev.1"
 description = "Runs next to Asterisk on a Gabion telephony node and controls it on behalf of the application."
 edition.workspace = true
 license.workspace = true
