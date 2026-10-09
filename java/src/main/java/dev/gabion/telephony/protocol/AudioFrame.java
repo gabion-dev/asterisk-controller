@@ -7,6 +7,8 @@ import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.Objects;
 
+import org.jspecify.annotations.Nullable;
+
 /**
  * One binary frame of a conversation connection.
  *
@@ -47,7 +49,7 @@ public sealed interface AudioFrame {
 
         /** Frames are equal when they say the same: the audio is compared by its bytes. */
         @Override
-        public boolean equals(Object other) {
+        public boolean equals(@Nullable Object other) {
             return other instanceof Heard heard
                     && participant.equals(heard.participant)
                     && positionMs == heard.positionMs
@@ -94,7 +96,7 @@ public sealed interface AudioFrame {
 
         /** Frames are equal when they say the same: the audio is compared by its bytes. */
         @Override
-        public boolean equals(Object other) {
+        public boolean equals(@Nullable Object other) {
             return other instanceof Playback playback
                     && participant.equals(playback.participant)
                     && segment.equals(playback.segment)
