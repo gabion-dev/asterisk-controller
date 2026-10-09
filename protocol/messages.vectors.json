@@ -70,7 +70,55 @@
         "id": "p-1",
         "medium": "browser"
        },
-       "state": "in_conversation"
+       "state": "in_conversation",
+       "hold_limit_ms": 30000
+      },
+      {
+       "participant": {
+        "id": "p-2",
+        "medium": "telephone_network",
+        "number": "+15035550100"
+       },
+       "state": "held",
+       "hold_limit_ms": 0
+      }
+     ],
+     "connected": [
+      [
+       "p-1",
+       "p-2"
+      ]
+     ],
+     "recordings": [
+      "r-1"
+     ]
+    }
+   }
+  },
+  {
+   "name": "hello for a resumed conversation without the hold limit of a participant",
+   "type": "ControllerMessage",
+   "accept": false,
+   "json": {
+    "type": "hello",
+    "protocol": 1,
+    "node": "node-1",
+    "controller_version": "0.1.0",
+    "conversation": "c-1",
+    "opening": {
+     "type": "resumed",
+     "origin": {
+      "type": "web_pass",
+      "pass": "pass-1"
+     },
+     "participants": [
+      {
+       "participant": {
+        "id": "p-1",
+        "medium": "browser"
+       },
+       "state": "in_conversation",
+       "hold_limit_ms": 30000
       },
       {
        "participant": {
@@ -858,6 +906,19 @@
    }
   },
   {
+   "name": "request result: a call the node did not place",
+   "type": "NodeMessage",
+   "accept": true,
+   "json": {
+    "type": "request_result",
+    "id": 4,
+    "outcome": {
+     "type": "rejected",
+     "reason": "call_not_placed"
+    }
+   }
+  },
+  {
    "name": "welcome",
    "type": "ApplicationServiceMessage",
    "accept": true,
@@ -952,6 +1013,19 @@
    "name": "request: start a conversation",
    "type": "Request",
    "accept": true,
+   "json": {
+    "type": "start_conversation",
+    "request": "callback-7f3a",
+    "handler": "secretary",
+    "number": "+15035550101",
+    "line": "main",
+    "answer_limit_ms": 20000
+   }
+  },
+  {
+   "name": "request: start a conversation without the request identifier",
+   "type": "Request",
+   "accept": false,
    "json": {
     "type": "start_conversation",
     "handler": "secretary",

@@ -86,13 +86,20 @@
         },
         "state": {
           "$ref": "#/definitions/ParticipantState"
+        },
+        "hold_limit_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Milliseconds. How long the node keeps this participant held, when their connection is lost, before they are counted as gone: the limit an owner last set with hold_for — it stays with the participant when the owner changes — and zero when none has."
         }
       },
       "required": [
         "participant",
-        "state"
+        "state",
+        "hold_limit_ms"
       ],
-      "additionalProperties": false
+      "additionalProperties": false,
+      "description": "A participant as they are when a conversation is handed to a new owner."
     },
     "Origin": {
       "description": "How the conversation came to exist.",
@@ -1483,6 +1490,12 @@
             "type": {
               "const": "start_conversation"
             },
+            "request": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "description": "Chosen by the application: names the request beyond this connection. The conversation's origin carries it to its owner, which may be another instance than the one that asked."
+            },
             "handler": {
               "$ref": "#/definitions/HandlerId"
             },
@@ -1500,6 +1513,7 @@
           },
           "required": [
             "type",
+            "request",
             "handler",
             "number",
             "line",
@@ -1573,6 +1587,7 @@
       ]
     },
     "RequestRejection": {
+      "description": "Why a request is refused. call_not_placed: the node's telephony server did not begin the call the request asked for.",
       "type": "string",
       "enum": [
         "node_not_ready",
@@ -1582,7 +1597,8 @@
         "outbound_limit_reached",
         "no_usable_audio_address",
         "leg_already_exists",
-        "unknown_leg"
+        "unknown_leg",
+        "call_not_placed"
       ]
     },
     "RequestOutcome": {

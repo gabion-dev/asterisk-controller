@@ -28,10 +28,10 @@
 //!
 //! A conversation outlives the controller too. What only the controller
 //! knows of a participant — which conversation they are in, who they are
-//! in it, where it came from — it writes on their channel in Asterisk as
-//! it learns it; a controller that starts beside a running Asterisk reads
-//! it back and carries the conversation on from there, as one without an
-//! application.
+//! in it, where it came from, how long they are held when their audio is
+//! lost — it writes on their channel in Asterisk as it learns it; a
+//! controller that starts beside a running Asterisk reads it back and
+//! carries the conversation on from there, as one without an application.
 //!
 //! A conversation outlives the application's connection. When the instance
 //! that owns it is lost — or none takes it to begin with — the controller
@@ -59,7 +59,7 @@ use node_protocol::{
         ConversationId, Departure, EndReason, EntryKey, Event, Fallback, FallbackFailure,
         FallbackKind, LineId, Opening, Origin, Participant, ParticipantId, ParticipantMedium,
         ParticipantSnapshot, ParticipantState as StateTold, PhoneNumber, RejectReason, Report,
-        SegmentId,
+        RequestOutcome, RequestRejection, SegmentId,
     },
 };
 use tokio::{sync::mpsc, time::Instant};
@@ -241,13 +241,14 @@ struct Watch {
 }
 
 impl Watch {
-    fn new() -> Self {
+    /// Watching begins, with the hold limit the participant has.
+    fn new(hold_limit: Duration) -> Self {
         Self {
             received: None,
             grew_at: Instant::now(),
             far_end_on_hold: false,
             held_since: None,
-            hold_limit: Duration::ZERO,
+            hold_limit,
             asking: false,
             unwatchable: false,
         }
@@ -334,20 +335,31 @@ struct Tap {
 
 /// What the controller writes on a participant's channel in Asterisk, for a
 /// controller that comes after it: which conversation the participant is
-/// in, who they are in it, where the conversation came from, their number
-/// and the line they were called on.
+/// in, who they are in it, where the conversation came from — for one the
+/// application asked for, its request and handler too — their number, the
+/// line they were called on and how long they are held when their audio is
+/// lost.
 pub const NOTES: &[&str] = &[
     NOTE_CONVERSATION,
     NOTE_PARTICIPANT,
     NOTE_ORIGIN,
     NOTE_NUMBER,
     NOTE_LINE,
+    NOTE_HOLD_LIMIT,
+    NOTE_REQUEST,
+    NOTE_HANDLER,
 ];
 const NOTE_CONVERSATION: &str = "GABION_CONVERSATION";
 const NOTE_PARTICIPANT: &str = "GABION_PARTICIPANT";
 const NOTE_ORIGIN: &str = "GABION_ORIGIN";
 const NOTE_NUMBER: &str = "GABION_NUMBER";
 const NOTE_LINE: &str = "GABION_LINE";
+const NOTE_HOLD_LIMIT: &str = "GABION_HOLD_LIMIT_MS";
+const NOTE_REQUEST: &str = "GABION_REQUEST";
+const NOTE_HANDLER: &str = "GABION_HANDLER";
+/// How a conversation the application asked for is written as its origin;
+/// its request and handler are notes of their own, whatever they hold.
+const STARTED_BY_CODE: &str = "started_by_code";
 
 /// A conversation found in Asterisk by a controller that started beside it.
 pub struct Found {
@@ -388,6 +400,9 @@ pub struct FoundMember {
     pub line: Option<String>,
     /// The bridge of the group they are in.
     pub group: Option<String>,
+    /// How long they are held when their audio is lost: the limit an owner
+    /// set, kept on their channel.
+    pub hold_limit: Duration,
 }
 
 /// A channel of the node's application, as a participant of a conversation
@@ -398,12 +413,17 @@ pub fn found(
 ) -> Option<(String, Origin, FoundMember)> {
     let conversation = notes.get(NOTE_CONVERSATION)?.clone();
     let participant = notes.get(NOTE_PARTICIPANT)?.parse().ok()?;
-    let arguments: Vec<String> = notes
-        .get(NOTE_ORIGIN)?
-        .split(',')
-        .map(str::to_owned)
-        .collect();
-    let origin = entry(&arguments).ok()?;
+    let origin = match notes.get(NOTE_ORIGIN)?.as_str() {
+        STARTED_BY_CODE => Origin::StartedByCode {
+            request: notes.get(NOTE_REQUEST)?.parse().ok()?,
+            handler: notes.get(NOTE_HANDLER)?.parse().ok()?,
+        },
+        // The words of the dialplan.
+        arguments => {
+            let arguments: Vec<String> = arguments.split(',').map(str::to_owned).collect();
+            entry(&arguments).ok()?
+        }
+    };
     let in_application = channel.is_in(APPLICATION);
     let member = FoundMember {
         participant,
@@ -417,6 +437,12 @@ pub fn found(
         awaiting_answer: !in_application,
         line: notes.get(NOTE_LINE).cloned(),
         group: None,
+        // Written by a controller only as a count of milliseconds; with none
+        // written, no owner set a limit.
+        hold_limit: notes
+            .get(NOTE_HOLD_LIMIT)
+            .and_then(|ms| ms.parse().ok())
+            .map_or(Duration::ZERO, Duration::from_millis),
     };
     Some((conversation, origin, member))
 }
@@ -443,6 +469,101 @@ pub async fn carry_on(found: Found, asterisk: Line, node: Arc<Node>) {
     }
 }
 
+/// A conversation the application asks the node to start by dialling its
+/// first participant, and where the answer to the request goes.
+pub struct Asked {
+    /// How the conversation comes to exist: the request and its handler.
+    pub origin: Origin,
+    /// The number of the first participant.
+    pub number: PhoneNumber,
+    /// The line they are called on.
+    pub line: LineId,
+    /// How long they may take to answer.
+    pub answer_limit_ms: u64,
+    /// Where the answer to the request goes.
+    pub answer: tokio::sync::oneshot::Sender<RequestOutcome>,
+}
+
+/// Start the conversation the application asked for, and carry it to its
+/// end.
+///
+/// The request is answered once Asterisk has said whether the call to the
+/// first participant is placed: with the conversation, or with why there is
+/// none. Only then is the conversation offered — opened as one started by
+/// code, its first participant ringing — to whichever instance takes it,
+/// not necessarily the one that asked.
+pub async fn carry_by_code(id: String, asterisk: Line, asked: Asked, node: Arc<Node>) {
+    let Asked {
+        origin,
+        number,
+        line,
+        answer_limit_ms,
+        answer,
+    } = asked;
+    let refused = |reason| RequestOutcome::Rejected { reason };
+    let Ok(started) = id.parse() else {
+        eprintln!("conversation {id}: FAILED — the conversation's identifier is not valid");
+        let _ = answer.send(refused(RequestRejection::CallNotPlaced));
+        return;
+    };
+    let mut conversation = Conversation::blank(id.clone(), asterisk, node, origin.clone());
+    let outcome = match conversation
+        .place_first(&number, &line, answer_limit_ms)
+        .await
+    {
+        Ok(Ok(first)) => {
+            // The one who asked may be gone by now; the conversation is
+            // offered all the same.
+            let _ = answer.send(RequestOutcome::ConversationStarted {
+                conversation: started,
+            });
+            let result = conversation
+                .live(Some(Opening::Started { origin, first }))
+                .await;
+            if let Err(fault) = &result {
+                conversation.abandon(fault).await;
+            }
+            result
+        }
+        // Nobody was called: there is no conversation.
+        Ok(Err(rejection)) => {
+            let _ = answer.send(refused(request_rejection(rejection)));
+            return;
+        }
+        // Whoever was being called is dropped with the conversation: for
+        // the one who asked, the call was not placed.
+        Err(fault) => {
+            let _ = answer.send(refused(RequestRejection::CallNotPlaced));
+            conversation.abandon(&fault).await;
+            Err(fault)
+        }
+    };
+    match outcome {
+        Ok(()) => eprintln!("conversation {id}: ended"),
+        Err(fault) => eprintln!("conversation {id}: FAILED — {fault}"),
+    }
+}
+
+/// Why a request to start a conversation is refused, from why the call to
+/// its first participant was not placed.
+fn request_rejection(reason: CommandRejection) -> RequestRejection {
+    match reason {
+        CommandRejection::UnknownLine => RequestRejection::UnknownLine,
+        CommandRejection::DestinationNotAllowed => RequestRejection::DestinationNotAllowed,
+        CommandRejection::NoOperatorForDestination => RequestRejection::NoOperatorForDestination,
+        CommandRejection::OutboundLimitReached => RequestRejection::OutboundLimitReached,
+        // A call is refused for none of the others; were one, the call was
+        // not placed all the same.
+        CommandRejection::CallNotPlaced
+        | CommandRejection::UnknownParticipant
+        | CommandRejection::ParticipantNotInRequiredState
+        | CommandRejection::TooFewParticipants
+        | CommandRejection::UnknownRecording
+        | CommandRejection::SegmentAlreadyQueued
+        | CommandRejection::TelephonyServerUnavailable => RequestRejection::CallNotPlaced,
+    }
+}
+
 /// A step of putting a participant and their audio path where they should
 /// be, as asked of Asterisk.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -457,6 +578,7 @@ enum Step {
     TurnAway,
     HangUp,
     SendDigits,
+    Note,
 }
 
 impl fmt::Display for Step {
@@ -472,6 +594,7 @@ impl fmt::Display for Step {
             Self::TurnAway => "turn the call away",
             Self::HangUp => "hang up the participant",
             Self::SendDigits => "send tone digits to the participant",
+            Self::Note => "write on the participant's channel what the controller knows of them",
         })
     }
 }
@@ -484,9 +607,8 @@ impl fmt::Display for Step {
 /// with the one exception below.
 enum Pending {
     /// A call the node places: Asterisk's word that it is being placed
-    /// makes the participant known to the application — to the `dial`
-    /// command of this number, when a command is waiting for it.
-    Dial(Option<u64>, Participant),
+    /// makes the participant known to whoever asked for the call.
+    Dial(Asker, Participant),
     /// A step of putting a participant and their audio path in place.
     Step(ParticipantId, Step),
     /// Whether a participant's channel is still in the node's application:
@@ -503,6 +625,20 @@ enum Pending {
     Medium(ParticipantId),
     /// Housekeeping of the controller; nobody waits for the answer.
     Internal,
+}
+
+/// Who a call the node places is for: who learns of its participant when
+/// Asterisk says it is being placed.
+#[derive(Clone, Copy)]
+enum Asker {
+    /// The owner's `dial` command of this number, waiting for its answer.
+    Command(u64),
+    /// The application's request to start the conversation: the call is
+    /// its first participant.
+    Request,
+    /// Nobody: the call is the controller's own, or the instance that
+    /// asked is gone.
+    Nobody,
 }
 
 /// A request to Asterisk that is still to be made: what its answer is for,
@@ -569,6 +705,9 @@ struct Conversation {
     /// The description makes each unique on a connection: answers are told
     /// apart by them, and one used twice would make two answers alike.
     command_ids: HashSet<u64>,
+    /// For a conversation the application asked for: Asterisk's word on the
+    /// call to its first participant, once it has come.
+    first_placed: Option<Result<Participant, CommandRejection>>,
 }
 
 /// The channel a call arrived on.
@@ -629,7 +768,7 @@ fn begin(
         id: participant_id(&node, 1)?,
         number: channel.caller.number.parse().ok(),
         name: Some(channel.name),
-        watch: Watch::new(),
+        watch: Watch::new(Duration::ZERO),
         leaving: None,
         channel: channel.id,
         state: if channel.state == ari::STATE_UP {
@@ -649,47 +788,28 @@ fn begin(
         first: first.known(),
     };
 
-    let caller = first.id.clone();
-    let names = format!("{id}.{}", node.run);
-    let (media_inbox, from_media) = mpsc::channel(MEDIA_BACKLOG);
-    let conversation = Conversation {
-        id: id.to_owned(),
-        node,
-        asterisk,
-        application: None,
-        heard_at: Instant::now(),
-        ping_at: Instant::now(),
-        pings: 0,
-        origin,
-        fallback: FallbackProgress::NotBegun,
-        fallback_failure: None,
-        server_lost: false,
-        medium_read_at: Instant::now(),
-        members: vec![first],
-        pending: HashMap::new(),
-        next_request: 0,
-        ended_by_handler: false,
-        from_media,
-        media_inbox,
-        sounds_opened: 0,
-        taps_made: 0,
-        groups_made: 0,
-        group_bridges: HashMap::new(),
-        participants: 1,
-        caller: Some(caller),
-        names,
-        unannounced: HashMap::new(),
-        command_ids: HashSet::new(),
-    };
+    let mut conversation = Conversation::blank(id.to_owned(), asterisk, node, origin);
+    conversation.caller = Some(first.id.clone());
+    conversation.members.push(first);
+    conversation.participants = 1;
     Ok((conversation, opening))
 }
 
-/// What a controller writes on a participant's channel: how the
-/// conversation came to exist, in the words of the dialplan.
-fn origin_note(origin: &Origin) -> Option<String> {
+/// What a controller writes on a participant's channel about how the
+/// conversation came to exist: for a call that arrived, its entry in the
+/// words of the dialplan; for one the application asked for, its request
+/// and handler.
+fn origin_notes(origin: &Origin) -> Vec<(&'static str, String)> {
     match origin {
-        Origin::DialedNumber { dialed } => Some(format!("dialed_number,{}", dialed.as_str())),
-        Origin::UserEndpoint { .. } | Origin::WebPass { .. } | Origin::StartedByCode { .. } => None,
+        Origin::DialedNumber { dialed } => {
+            vec![(NOTE_ORIGIN, format!("dialed_number,{}", dialed.as_str()))]
+        }
+        Origin::StartedByCode { request, handler } => vec![
+            (NOTE_ORIGIN, STARTED_BY_CODE.to_owned()),
+            (NOTE_REQUEST, request.as_str().to_owned()),
+            (NOTE_HANDLER, handler.as_str().to_owned()),
+        ],
+        Origin::UserEndpoint { .. } | Origin::WebPass { .. } => Vec::new(),
     }
 }
 
@@ -705,6 +825,42 @@ async fn next_frame(
 }
 
 impl Conversation {
+    /// A conversation with nobody in it yet.
+    fn blank(id: String, asterisk: Line, node: Arc<Node>, origin: Origin) -> Self {
+        let names = format!("{id}.{}", node.run);
+        let (media_inbox, from_media) = mpsc::channel(MEDIA_BACKLOG);
+        Self {
+            id,
+            node,
+            asterisk,
+            application: None,
+            heard_at: Instant::now(),
+            ping_at: Instant::now(),
+            pings: 0,
+            origin,
+            fallback: FallbackProgress::NotBegun,
+            fallback_failure: None,
+            server_lost: false,
+            medium_read_at: Instant::now(),
+            members: Vec::new(),
+            pending: HashMap::new(),
+            next_request: 0,
+            ended_by_handler: false,
+            from_media,
+            media_inbox,
+            sounds_opened: 0,
+            taps_made: 0,
+            groups_made: 0,
+            group_bridges: HashMap::new(),
+            participants: 0,
+            caller: None,
+            names,
+            unannounced: HashMap::new(),
+            command_ids: HashSet::new(),
+            first_placed: None,
+        }
+    }
+
     /// A conversation as a controller that started beside a running Asterisk
     /// found it there.
     fn resume(found: Found, asterisk: Line, node: Arc<Node>) -> Self {
@@ -737,7 +893,7 @@ impl Conversation {
                     id: member.participant,
                     number: member.number,
                     name: Some(member.name),
-                    watch: Watch::new(),
+                    watch: Watch::new(member.hold_limit),
                     leaving: None,
                     channel: member.channel,
                     state: if member.answered {
@@ -755,37 +911,11 @@ impl Conversation {
             })
             .collect();
         let groups: Vec<u64> = group_bridges.keys().copied().collect();
-        let names = format!("{}.{}", found.id, node.run);
-        let (media_inbox, from_media) = mpsc::channel(MEDIA_BACKLOG);
-        let mut conversation = Self {
-            id: found.id,
-            node,
-            asterisk,
-            application: None,
-            heard_at: Instant::now(),
-            ping_at: Instant::now(),
-            pings: 0,
-            origin: found.origin,
-            fallback: FallbackProgress::NotBegun,
-            fallback_failure: None,
-            server_lost: false,
-            medium_read_at: Instant::now(),
-            members,
-            pending: HashMap::new(),
-            next_request: 0,
-            ended_by_handler: false,
-            from_media,
-            media_inbox,
-            sounds_opened: 0,
-            taps_made: 0,
-            groups_made: u64::try_from(group_bridges.len()).unwrap_or(u64::MAX),
-            group_bridges,
-            participants: 0,
-            caller,
-            names,
-            unannounced: HashMap::new(),
-            command_ids: HashSet::new(),
-        };
+        let mut conversation = Self::blank(found.id, asterisk, node, found.origin);
+        conversation.members = members;
+        conversation.groups_made = u64::try_from(group_bridges.len()).unwrap_or(u64::MAX);
+        conversation.group_bridges = group_bridges;
+        conversation.caller = caller;
         // A group that has lost all but one of its people is no group.
         for group in groups {
             conversation.settle_group(group);
@@ -819,19 +949,27 @@ impl Conversation {
             (NOTE_CONVERSATION, self.id.clone()),
             (NOTE_PARTICIPANT, participant.as_str().to_owned()),
         ];
-        notes.extend(origin_note(&self.origin).map(|origin| (NOTE_ORIGIN, origin)));
+        notes.extend(origin_notes(&self.origin));
         notes.extend(number.map(|number| (NOTE_NUMBER, number.as_str().to_owned())));
         for (name, value) in notes {
-            self.ask(
-                Pending::Internal,
-                "POST",
-                &format!(
-                    "channels/{}/variable?variable={name}&value={}",
-                    ari::query(&channel),
-                    ari::query(&value),
-                ),
-            );
+            self.write_note(participant, &channel, name, &value);
         }
+    }
+
+    /// Write one note on a participant's channel. A note Asterisk refuses
+    /// for one who stays would be missed by a controller that comes after —
+    /// which would remove their call as a leftover — so a refusal is judged
+    /// like any step about them.
+    fn write_note(&mut self, participant: &ParticipantId, channel: &str, name: &str, value: &str) {
+        self.ask(
+            Pending::Step(participant.clone(), Step::Note),
+            "POST",
+            &format!(
+                "channels/{}/variable?variable={name}&value={}",
+                ari::query(channel),
+                ari::query(value),
+            ),
+        );
     }
 
     /// Carry the conversation to its end: with an instance of the
@@ -846,8 +984,14 @@ impl Conversation {
                 if let Some(first) = self.caller.clone() {
                     self.note(&first);
                 }
+                // What Asterisk said meanwhile of a participant the opening
+                // made known comes after the opening.
+                let owned = match self.find_owner(opening).await {
+                    Ok(()) => self.announce_waiting().await,
+                    not_taken => not_taken,
+                };
                 // A conversation nobody took has just had its one look.
-                (self.find_owner(opening).await, false)
+                (owned, false)
             }
             None => (
                 Err(Fault::Owner(
@@ -915,6 +1059,54 @@ impl Conversation {
         offered
     }
 
+    /// Tell a new owner what waited for it: what Asterisk said of a
+    /// participant before the owner knew them.
+    async fn announce_waiting(&mut self) -> Result<(), Fault> {
+        let waiting: Vec<Event> = self
+            .unannounced
+            .drain()
+            .flat_map(|(_, events)| events)
+            .collect();
+        for event in waiting {
+            self.event(event).await?;
+        }
+        Ok(())
+    }
+
+    /// Place the call to the first participant of a conversation the
+    /// application asked for, and wait for Asterisk's word on it: the
+    /// participant, or why there is none. What Asterisk says of the call
+    /// meanwhile waits for the owner with them.
+    async fn place_first(
+        &mut self,
+        number: &PhoneNumber,
+        line: &LineId,
+        answer_limit_ms: u64,
+    ) -> Result<Result<Participant, CommandRejection>, Fault> {
+        if let Some(rejection) = self
+            .dial(Asker::Request, number, line, answer_limit_ms)
+            .await?
+        {
+            return Ok(Err(rejection));
+        }
+        loop {
+            if let Some(placed) = self.first_placed.take() {
+                return Ok(placed);
+            }
+            match self.asterisk.next().await {
+                FromAsterisk::Gone => {
+                    return Err(Fault::Asterisk(
+                        "the conversation's line closed before the call was placed".into(),
+                    ));
+                }
+                said @ (FromAsterisk::Said(_)
+                | FromAsterisk::Answered { .. }
+                | FromAsterisk::Lost
+                | FromAsterisk::Back(_)) => self.asterisk_said(said).await?,
+            }
+        }
+    }
+
     /// The first message of a conversation connection.
     fn hello(&self, opening: Opening) -> Result<ControllerMessage, Fault> {
         let config = &self.node.config;
@@ -951,6 +1143,8 @@ impl Conversation {
                     }
                     ParticipantState::InConversation => StateTold::InConversation,
                 },
+                hold_limit_ms: u64::try_from(member.watch.hold_limit.as_millis())
+                    .unwrap_or(u64::MAX),
             })
             .collect();
         let mut groups: Vec<u64> = self
@@ -1196,8 +1390,8 @@ impl Conversation {
         self.application = None;
         self.unannounced.clear();
         for pending in self.pending.values_mut() {
-            if let Pending::Dial(command, _) = pending {
-                *command = None;
+            if let Pending::Dial(asker @ Asker::Command(_), _) = pending {
+                *asker = Asker::Nobody;
             }
         }
         let mut sounds = Vec::new();
@@ -1557,7 +1751,10 @@ impl Conversation {
                 answer_limit_ms,
             }) if is_here => {
                 self.hang_up(|member| member.id != *caller);
-                match self.dial(None, number, line, *answer_limit_ms).await? {
+                match self
+                    .dial(Asker::Nobody, number, line, *answer_limit_ms)
+                    .await?
+                {
                     None => {
                         eprintln!(
                             "conversation {}: the caller is being transferred to {}, the fallback of their entry",
@@ -1831,8 +2028,8 @@ impl Conversation {
         // a call that was to be placed is known now: it was not.
         if status_code == 0 {
             return match pending {
-                Some(Pending::Dial(id, participant)) => {
-                    self.call_placed(id, participant, status_code).await
+                Some(Pending::Dial(asker, participant)) => {
+                    self.call_placed(asker, participant, status_code).await
                 }
                 Some(Pending::Medium(participant)) => {
                     self.medium_read(&participant, status_code, body).await
@@ -1849,8 +2046,8 @@ impl Conversation {
             };
         }
         match pending {
-            Some(Pending::Dial(id, participant)) => {
-                self.call_placed(id, participant, status_code).await
+            Some(Pending::Dial(asker, participant)) => {
+                self.call_placed(asker, participant, status_code).await
             }
             Some(Pending::Medium(participant)) => {
                 self.medium_read(&participant, status_code, body).await
@@ -2079,7 +2276,7 @@ impl Conversation {
                 line,
                 answer_limit_ms,
             } => self
-                .dial(Some(id), &number, &line, answer_limit_ms)
+                .dial(Asker::Command(id), &number, &line, answer_limit_ms)
                 .await
                 .map(|_| ()),
             Command::SendDigits {
@@ -2134,6 +2331,10 @@ impl Conversation {
     /// How long a participant whose audio is lost stays held before they
     /// count as gone. One already held whose new limit has passed is gone
     /// now.
+    ///
+    /// The limit is the participant's, not the owner's: it stays when the
+    /// owner changes, and is written on their channel, so a controller
+    /// started again holds them as long.
     async fn hold_for(
         &mut self,
         id: u64,
@@ -2141,16 +2342,23 @@ impl Conversation {
         limit_ms: u64,
     ) -> Result<(), Fault> {
         let answered = |member: &Member| member.state == ParticipantState::InConversation;
-        let expired = match self.member_who(participant, answered) {
+        let (expired, channel) = match self.member_who(participant, answered) {
             Ok(member) => {
                 member.watch.hold_limit = Duration::from_millis(limit_ms);
-                member
+                let expired = member
                     .watch
                     .held_since
-                    .is_some_and(|since| Instant::now() >= since + member.watch.hold_limit)
+                    .is_some_and(|since| Instant::now() >= since + member.watch.hold_limit);
+                (expired, member.channel.clone())
             }
             Err(reason) => return self.reject(id, reason).await,
         };
+        self.write_note(
+            participant,
+            &channel,
+            NOTE_HOLD_LIMIT,
+            &limit_ms.to_string(),
+        );
         self.accept(id).await?;
         if expired {
             self.did_not_return(participant);
@@ -2696,15 +2904,15 @@ impl Conversation {
         }
     }
 
-    /// Add a participant by dialling: for the `dial` command `command` of
-    /// the application, or — with none — for the controller itself, which
-    /// carries out the transfer of a fallback.
+    /// Add a participant by dialling: for the application's `dial` command
+    /// or its request to start the conversation, or for the controller
+    /// itself, which carries out the transfer of a fallback.
     ///
     /// Whoever asks, the node judges the number the same way and counts the
     /// call against its line.
     async fn dial(
         &mut self,
-        command: Option<u64>,
+        asker: Asker,
         number: &PhoneNumber,
         line: &LineId,
         answer_limit_ms: u64,
@@ -2720,7 +2928,7 @@ impl Conversation {
         let (route, place) = match refused {
             Ok(placed) => placed,
             Err(reason) => {
-                if let Some(id) = command {
+                if let Asker::Command(id) = asker {
                     self.reject(id, reason).await?;
                 }
                 return Ok(Some(reason));
@@ -2742,18 +2950,17 @@ impl Conversation {
             (NOTE_PARTICIPANT, participant.id.as_str().to_owned()),
             (NOTE_NUMBER, number.as_str().to_owned()),
             (NOTE_LINE, line.as_str().to_owned()),
-        ] {
+        ]
+        .into_iter()
+        .chain(origin_notes(&self.origin))
+        {
             notes.insert(name.to_owned(), serde_json::Value::String(value));
         }
-        notes.extend(
-            origin_note(&self.origin)
-                .map(|origin| (NOTE_ORIGIN.to_owned(), serde_json::Value::String(origin))),
-        );
         let body = serde_json::json!({ "variables": notes }).to_string();
         self.asterisk.own(&channel);
         self.members.push(Member {
             name: None,
-            watch: Watch::new(),
+            watch: Watch::new(Duration::ZERO),
             leaving: None,
             id: participant.id.clone(),
             number: participant.number.clone(),
@@ -2766,7 +2973,7 @@ impl Conversation {
             group: None,
             put: Put::Nowhere,
         });
-        if command.is_some() {
+        if matches!(asker, Asker::Command(_) | Asker::Request) {
             self.unannounced.insert(participant.id.clone(), Vec::new());
         }
 
@@ -2784,17 +2991,17 @@ impl Conversation {
             ari::query(route.line.number.as_str()),
             ari::query(&channel),
         );
-        self.ask_with(Pending::Dial(command, participant), "POST", &uri, body);
+        self.ask_with(Pending::Dial(asker, participant), "POST", &uri, body);
         Ok(None)
     }
 
-    /// Asterisk answered the request to place a call. Only now does the
-    /// application learn of the participant — or that there is none. With
-    /// no command waiting — the call is the controller's own, or the
-    /// instance that asked is gone — there is nobody to tell.
+    /// Asterisk answered the request to place a call. Only now does whoever
+    /// asked for it learn of the participant — or that there is none. With
+    /// nobody asking — the call is the controller's own, or the instance
+    /// that asked is gone — there is nobody to tell.
     async fn call_placed(
         &mut self,
-        command: Option<u64>,
+        asker: Asker,
         participant: Participant,
         status_code: u16,
     ) -> Result<(), Fault> {
@@ -2815,13 +3022,24 @@ impl Conversation {
                 self.fallback_failure
                     .get_or_insert(FallbackFailure::Refused { rejection: why });
             }
-            return match command {
-                Some(id) => self.reject(id, why).await,
-                None => Ok(()),
+            return match asker {
+                Asker::Command(id) => self.reject(id, why).await,
+                Asker::Request => {
+                    self.first_placed = Some(Err(why));
+                    Ok(())
+                }
+                Asker::Nobody => Ok(()),
             };
         }
-        let Some(id) = command else {
-            return Ok(());
+        let id = match asker {
+            Asker::Command(id) => id,
+            // The conversation is offered with them; what Asterisk says of
+            // them meanwhile waits for its owner.
+            Asker::Request => {
+                self.first_placed = Some(Ok(participant));
+                return Ok(());
+            }
+            Asker::Nobody => return Ok(()),
         };
         let outcome = CommandOutcome::AcceptedParticipant {
             participant: participant.id.clone(),

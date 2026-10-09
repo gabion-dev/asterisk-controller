@@ -294,6 +294,23 @@ it is back. When Asterisk is found again, a participant whose call ended
 meanwhile leaves with the departure `lost`, the owner is told the server is
 back, and a conversation with nobody left ends.
 
+### Calls the application places
+
+The application can ask the node to call a number on one of the node's
+lines. Such a call is judged and limited like any other outbound call of
+that line — the countries it allows, its limit of simultaneous calls — and
+shows the line's number.
+
+### When a participant's audio stops arriving
+
+Audio keeps arriving while a call lasts, in quiet moments too. When a
+participant who reaches the node over SIP sends no audio for five seconds,
+the controller tells the application, and hangs the call up unless the
+application has asked to keep that participant longer. While the far end has
+the call on hold, this is not judged. Asterisk's own RTP timeout is not set:
+the controller alone decides. A call for which Asterisk keeps no audio count
+is not watched, and the controller says so once on standard error.
+
 ### Other cases
 
 - The controller warns of a missing prompt when it starts, and fetches it
@@ -360,9 +377,9 @@ request.
 ## Status
 
 Early development; no release has been published. Not built yet: recording;
-holding a participant whose audio is lost; the application's requests on the
-service connection; calls from user endpoints and web passes; TLS towards an
-operator and operators that require registration.
+the application's requests for browser call legs and device facts; calls
+from user endpoints and web passes; TLS towards an operator and operators
+that require registration.
 
 ## License
 

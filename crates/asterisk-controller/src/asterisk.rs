@@ -538,6 +538,19 @@ fn pass_on(node: &Arc<Node>, asterisk: &Arc<Asterisk>, message: ari::Message) {
     }
 }
 
+/// The application asked the node to start a conversation: it is named now,
+/// and carried from its first call to its end.
+pub fn start_by_code(node: &Arc<Node>, asterisk: &Arc<Asterisk>, asked: conversation::Asked) {
+    let id = uuid::Uuid::new_v4().to_string();
+    let line = asterisk.open_line(&id, &[]);
+    tokio::spawn(conversation::carry_by_code(
+        id,
+        line,
+        asked,
+        Arc::clone(node),
+    ));
+}
+
 /// A channel nobody owns entered the node's application: a call arrived.
 fn arrived(
     node: &Arc<Node>,

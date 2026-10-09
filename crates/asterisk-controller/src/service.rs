@@ -11,6 +11,12 @@
 //! and one order, so "settings changed" can never arrive without the
 //! settings.
 //!
+//! On it, too, the application asks the node to start a conversation by
+//! dialling its first participant. The request is answered on this
+//! connection once Asterisk has said whether the call is placed; the
+//! conversation itself is offered on a connection of its own, to whichever
+//! instance takes it.
+//!
 //! Settings are applied while calls go on. The files of Asterisk's
 //! configuration that follow from settings are replaced and the modules
 //! that read them are reloaded; the node answers with the fingerprint of
@@ -20,9 +26,11 @@
 
 use std::{collections::HashSet, num::NonZeroU64, sync::Arc, time::Duration};
 
-use futures_util::{SinkExt, StreamExt};
-use node_protocol::messages::{ApplicationServiceMessage, NodeMessage, Request, Settings};
-use tokio::time::Instant;
+use futures_util::{SinkExt, StreamExt, future::BoxFuture, stream::FuturesUnordered};
+use node_protocol::messages::{
+    ApplicationServiceMessage, NodeMessage, Origin, Request, RequestOutcome, Settings,
+};
+use tokio::{sync::oneshot, time::Instant};
 use tokio_tungstenite::tungstenite::{
     Message as Frame,
     protocol::{CloseFrame, frame::coding::CloseCode},
@@ -30,9 +38,10 @@ use tokio_tungstenite::tungstenite::{
 
 use crate::{
     application::{Endpoint, PING_EVERY, SILENCE_LIMIT, Socket},
-    asterisk::Asterisk,
+    asterisk::{self, Asterisk},
     asterisk_files::{self, FROM_SETTINGS},
     config::PROTOCOL_VERSION,
+    conversation::Asked,
     node::Node,
     prompts,
     settings::{self, Applied},
@@ -45,6 +54,21 @@ const OPEN_AGAIN: Duration = Duration::from_secs(1);
 
 /// The longest problem a refusal of settings may carry.
 const PROBLEM_LENGTH: usize = 2000;
+
+/// The answer to a request of the application, once it has come: the
+/// request's identifier, and the answer — none when the one who was to give
+/// it ended without.
+type Answer = (u64, Result<RequestOutcome, oneshot::error::RecvError>);
+
+/// What the service connection waits for.
+enum Next {
+    /// The application said something.
+    Heard(ApplicationServiceMessage),
+    /// A report was kept.
+    Report,
+    /// A request was answered.
+    Answered(Answer),
+}
 
 /// Keep the service connection open for as long as the controller runs.
 pub async fn run(node: Arc<Node>, asterisk: Arc<Asterisk>) {
@@ -176,19 +200,37 @@ impl<'a> Service<'a> {
     /// Reports the node kept are sent at once, those from before this
     /// connection first; each is sent once on a connection, and forgotten
     /// when the application says it has it.
-    async fn serve(&mut self, asterisk: &Asterisk) -> String {
+    async fn serve(&mut self, asterisk: &Arc<Asterisk>) -> String {
         let node = self.node;
         let mut sent = HashSet::new();
+        // The description makes a request's identifier unique on its
+        // connection: answers are told apart by it.
+        let mut request_ids = HashSet::new();
+        let mut answers: FuturesUnordered<BoxFuture<'static, Answer>> = FuturesUnordered::new();
         loop {
             if let Err(why) = self.send_reports(&mut sent).await {
                 return why;
             }
-            let heard = tokio::select! {
+            let next = tokio::select! {
                 heard = self.hear() => match heard {
-                    Ok(heard) => heard,
+                    Ok(heard) => Next::Heard(heard),
                     Err(why) => return why,
                 },
-                () = node.reports.changed() => continue,
+                () = node.reports.changed() => Next::Report,
+                Some(answer) = answers.next(), if !answers.is_empty() => Next::Answered(answer),
+            };
+            let heard = match next {
+                Next::Heard(heard) => heard,
+                Next::Report => continue,
+                Next::Answered((id, Ok(outcome))) => {
+                    if let Err(why) = self.tell(&NodeMessage::RequestResult { id, outcome }).await {
+                        return why;
+                    }
+                    continue;
+                }
+                Next::Answered((id, Err(_))) => {
+                    return format!("request {id} was left without an answer");
+                }
             };
             let answered = match heard {
                 ApplicationServiceMessage::Settings { settings } => {
@@ -206,17 +248,17 @@ impl<'a> Service<'a> {
                     sent.remove(id.as_str());
                     node.reports.forget(id.as_str())
                 }
-                // A request this build cannot carry out ends the connection
-                // with its name: none is accepted and ignored.
-                ApplicationServiceMessage::Request { request, .. } => Err(format!(
-                    "not implemented in this build: {}",
-                    match request {
-                        Request::StartConversation { .. } => "start_conversation",
-                        Request::BrowserLegBegin { .. } => "browser_leg_begin",
-                        Request::BrowserLegEnd { .. } => "browser_leg_end",
-                        Request::DeviceFact { .. } => "device_fact",
-                    }
-                )),
+                ApplicationServiceMessage::Request { id, .. } if !request_ids.insert(id) => {
+                    Err(format!(
+                        "protocol: the request identifier {id} was used a second time on this \
+                         connection"
+                    ))
+                }
+                ApplicationServiceMessage::Request { id, request } => {
+                    start(node, asterisk, request).map(|answer| {
+                        answers.push(Box::pin(async move { (id, answer.await) }));
+                    })
+                }
             };
             if let Err(why) = answered {
                 return why;
@@ -308,6 +350,60 @@ impl<'a> Service<'a> {
         };
         let _ = self.socket.close(Some(close)).await;
     }
+}
+
+/// Begin what the application asks for: a conversation, started by dialling
+/// its first participant. Returns where the answer will come from.
+///
+/// # Errors
+///
+/// A request this build cannot carry out ends the connection with its name:
+/// none is accepted and ignored.
+fn start(
+    node: &Arc<Node>,
+    asterisk: &Arc<Asterisk>,
+    request: Request,
+) -> Result<oneshot::Receiver<RequestOutcome>, String> {
+    match request {
+        Request::StartConversation {
+            request,
+            handler,
+            number,
+            line,
+            answer_limit_ms,
+        } => {
+            // The origin's request and handler are described as the
+            // request's are: what passed one passes the other.
+            let carried = |what: &str| format!("the request's {what} does not fit an origin");
+            let origin = Origin::StartedByCode {
+                request: request
+                    .as_str()
+                    .parse()
+                    .map_err(|_| carried("identifier"))?,
+                handler: handler.as_str().parse().map_err(|_| carried("handler"))?,
+            };
+            let (answer, answered) = oneshot::channel();
+            asterisk::start_by_code(
+                node,
+                asterisk,
+                Asked {
+                    origin,
+                    number,
+                    line,
+                    answer_limit_ms,
+                    answer,
+                },
+            );
+            Ok(answered)
+        }
+        Request::BrowserLegBegin { .. } => Err(not_implemented("browser_leg_begin")),
+        Request::BrowserLegEnd { .. } => Err(not_implemented("browser_leg_end")),
+        Request::DeviceFact { .. } => Err(not_implemented("device_fact")),
+    }
+}
+
+fn not_implemented(request: &str) -> String {
+    format!("not implemented in this build: {request}")
 }
 
 /// The refusal of settings the protocol description does not allow — when

@@ -49,7 +49,8 @@ use node_protocol::{
         ApplicationMessage, ApplicationServiceMessage, Command, CommandOutcome, CommandRejection,
         ControllerMessage, DeclineReason, Departure, EndReason, Event, FallbackFailure,
         FallbackKind, NodeMessage, Opening, Origin, ParticipantId, ParticipantMedium,
-        ParticipantSnapshot, ParticipantState, RejectReason, Report, SegmentId, Settings,
+        ParticipantSnapshot, ParticipantState, RejectReason, Report, Request as ApplicationRequest,
+        RequestOutcome, RequestRejection, SegmentId, Settings,
     },
 };
 use tokio::{
@@ -1466,9 +1467,20 @@ impl Network {
             ))
             .await?;
         let phone = Phone::connect(&self.control, &channel, says).await?;
-        self.control
+        // A bridge of that name still there is a telephone a scenario before
+        // left behind, still saying its tone: joined to it, this caller would
+        // send the node audio that is not theirs.
+        let (status, body) = self
+            .control
             .request("POST", &format!("bridges?type=mixing&bridgeId={bridge}"))
             .await?;
+        if status != 200 {
+            return Err(format!(
+                "the network could not make the bridge {bridge} for a telephone — one left \
+                 behind by a scenario before? {status} {body}"
+            )
+            .into());
+        }
         // Both ends enter the test's application a moment after they are
         // answered; Asterisk joins them only once they are there.
         let joined = timeout(STEP, async {
@@ -1638,6 +1650,31 @@ impl Stand {
             .as_mut()
             .ok_or("no service connection has been welcomed")?;
         service.reported(what, acknowledge, expected).await
+    }
+
+    /// Ask the node something on the service connection, and wait for the
+    /// answer.
+    async fn ask(&self, id: u64, request: ApplicationRequest) -> TestResult<RequestOutcome> {
+        let mut service = self.service.lock().await;
+        let service = service
+            .as_mut()
+            .ok_or("no service connection has been welcomed")?;
+        service.send(&ApplicationServiceMessage::Request { id, request })?;
+        match service.next().await? {
+            NodeMessage::RequestResult {
+                id: answered,
+                outcome,
+            } if answered == id => Ok(outcome),
+            other @ (NodeMessage::Hello { .. }
+            | NodeMessage::SettingsApplied { .. }
+            | NodeMessage::SettingsRefused { .. }
+            | NodeMessage::RequestResult { .. }
+            | NodeMessage::Report { .. }
+            | NodeMessage::Ping { .. }
+            | NodeMessage::Pong { .. }) => {
+                Err(format!("request {id} was answered with {other:?}").into())
+            }
+        }
     }
 
     /// Where the controller listens for Asterisk's media connections.
@@ -2522,6 +2559,148 @@ async fn the_application_dials(stand: &Stand) -> TestResult {
         .await
 }
 
+/// The request with which the test asks the node to start a conversation.
+const REQUEST: &str = "callback-1";
+/// The handler the test names in it.
+const HANDLER: &str = "secretary";
+
+/// A request to start a conversation by dialling `number` on `line`.
+fn start_request(number: &str, line: &str, answer_limit_ms: u64) -> TestResult<ApplicationRequest> {
+    Ok(ApplicationRequest::StartConversation {
+        request: REQUEST.parse()?,
+        handler: HANDLER.parse()?,
+        number: number.parse()?,
+        line: line.parse()?,
+        answer_limit_ms,
+    })
+}
+
+/// Ask the node to start a conversation with `number`, take the
+/// conversation it offers and see it opened as one started by code, its
+/// first participant ringing. Returns the owner and that participant.
+async fn a_started_conversation(
+    stand: &Stand,
+    id: u64,
+    number: &str,
+    answer_limit_ms: u64,
+) -> TestResult<(Owner, ParticipantId)> {
+    let outcome = stand
+        .ask(id, start_request(number, "main", answer_limit_ms)?)
+        .await?;
+    let RequestOutcome::ConversationStarted { conversation } = outcome else {
+        return Err(format!("a request to call {number} was answered {outcome:?}").into());
+    };
+    let mut owner = Owner::accept(&stand.application).await?;
+    let ControllerMessage::Hello {
+        conversation: offered,
+        opening:
+            Opening::Started {
+                origin: Origin::StartedByCode { request, handler },
+                first,
+            },
+        ..
+    } = owner.next().await?
+    else {
+        return Err("the conversation was not offered as one started by code".into());
+    };
+    assert!(
+        offered == conversation
+            && request.as_str() == REQUEST
+            && handler.as_str() == HANDLER
+            && first.number.as_ref().map(|number| number.as_str()) == Some(number),
+        "the conversation {conversation:?} was offered as {offered:?}, for {request:?} and \
+         {handler:?}, with {first:?}"
+    );
+    owner.send(&ApplicationMessage::Accept)?;
+    Ok((owner, first.id))
+}
+
+/// The application asks the node to start a conversation by dialling its
+/// first participant. The node judges the number as it judges a `dial`, and
+/// answers the request once Asterisk has placed the call; the conversation
+/// is offered as one started by code, its first participant ringing, to
+/// whichever instance takes it. A call nobody answers ends it.
+async fn the_application_starts_a_conversation(stand: &Stand) -> TestResult {
+    for (id, number, line, reason) in [
+        (1, ANSWERS, "nowhere", RequestRejection::UnknownLine),
+        (
+            2,
+            "+442071838750",
+            "main",
+            RequestRejection::DestinationNotAllowed,
+        ),
+    ] {
+        let outcome = stand.ask(id, start_request(number, line, 5000)?).await?;
+        assert!(
+            matches!(outcome, RequestOutcome::Rejected { reason: given } if given == reason),
+            "a request to call {number} on {line} was answered {outcome:?}"
+        );
+    }
+
+    let (mut owner, first) = a_started_conversation(stand, 3, ANSWERS, 5000).await?;
+    let answered = owner.next_event().await?;
+    assert!(
+        matches!(&answered, Event::ParticipantAnswered { participant } if *participant == first),
+        "the first participant of a started conversation answered as {answered:?}"
+    );
+    ends_it(&mut owner, 1, 1).await?;
+
+    let (mut owner, first) = a_started_conversation(stand, 4, RINGS, 1000).await?;
+    let told = [owner.next_event().await?, owner.next_event().await?];
+    assert!(
+        matches!(
+            &told,
+            [
+                Event::ParticipantLeft { participant, departure: Departure::NotAnswered },
+                Event::ConversationEnded { reason: EndReason::LastParticipantLeft },
+            ] if *participant == first
+        ),
+        "a started conversation nobody answered was told as {told:?}"
+    );
+    owner.closed().await?;
+    stand
+        .expect_no_channels("after conversations the application started")
+        .await?;
+    stand
+        .network
+        .control
+        .expect_none("channels", "after conversations the application started")
+        .await
+}
+
+/// A request identifier used twice on the service connection breaks the
+/// protocol, as a command identifier does on a conversation's: the node
+/// ends the connection, and opens it again.
+async fn a_request_identifier_used_twice(stand: &Stand) -> TestResult {
+    let mut kept = stand.service.lock().await;
+    let service = kept
+        .as_mut()
+        .ok_or("no service connection has been welcomed")?;
+    service.send(&ApplicationServiceMessage::Request {
+        id: 3,
+        request: start_request(ANSWERS, "main", 5000)?,
+    })?;
+    if service.next().await.is_ok() {
+        return Err("a request identifier used twice was answered".into());
+    }
+    let mut again = ServiceEnd::accept(&stand.application).await?;
+    let NodeMessage::Hello { .. } = again.next().await? else {
+        return Err("the service connection opened again without a hello".into());
+    };
+    again.send(&ApplicationServiceMessage::Welcome)?;
+    *kept = Some(again);
+    if !stand
+        .controller
+        .comes_to_say("the request identifier 3 was used a second time")
+        .await
+    {
+        return Err("the controller did not say why it ended the service connection".into());
+    }
+    stand
+        .expect_no_channels("after a request identifier was used twice")
+        .await
+}
+
 /// Numbers the node does not dial, each for its own reason.
 async fn refuses_numbers_it_may_not_dial(owner: &mut Owner) -> TestResult {
     for (id, number, line, reason) in [
@@ -2697,6 +2876,9 @@ async fn the_dialled_one_outlives_the_caller(
 
 /// The tone the second participant of a connected conversation says, Hz.
 const SECOND_SAYS: u32 = 700;
+/// How long the second participant is held when their audio is lost, as an
+/// owner sets it before it is lost — or the controller is.
+const SECOND_HOLD_LIMIT_MS: u64 = 15_000;
 
 /// Send a command that only names participants and expect it accepted.
 async fn accepted(owner: &mut Owner, id: u64, command: Command) -> TestResult<Vec<Event>> {
@@ -3302,13 +3484,24 @@ async fn connected_people_outlive_their_owner(stand: &Stand) -> TestResult {
     let participants = vec![first.clone(), second.clone()];
     accepted(&mut owner, 12, Command::Connect { participants }).await?;
     phone.hears(SECOND_SAYS, true).await?;
+    // How long the second is held is theirs, not the instance's.
+    let participant = second.clone();
+    accepted(
+        &mut owner,
+        13,
+        Command::HoldFor {
+            participant,
+            limit_ms: SECOND_HOLD_LIMIT_MS,
+        },
+    )
+    .await?;
 
     // The instance dies: its connection is gone with nothing said.
     drop(owner);
     let mut owner = Owner::accept(&stand.application).await?;
     let (dialed, participants, connected) = handed_over(&mut owner).await?;
     assert_eq!(dialed, DIALED);
-    let mut there: Vec<(&str, &ParticipantState, Option<&str>)> = participants
+    let mut there: Vec<(&str, &ParticipantState, Option<&str>, u64)> = participants
         .iter()
         .map(|snapshot| {
             (
@@ -3319,6 +3512,7 @@ async fn connected_people_outlive_their_owner(stand: &Stand) -> TestResult {
                     .number
                     .as_ref()
                     .map(|number| number.as_str()),
+                snapshot.hold_limit_ms,
             )
         })
         .collect();
@@ -3327,8 +3521,8 @@ async fn connected_people_outlive_their_owner(stand: &Stand) -> TestResult {
         matches!(
             there.as_slice(),
             [
-                (one, ParticipantState::InConversation, None),
-                (other, ParticipantState::InConversation, Some(ANSWERS)),
+                (one, ParticipantState::InConversation, None, 0),
+                (other, ParticipantState::InConversation, Some(ANSWERS), SECOND_HOLD_LIMIT_MS),
             ] if *one == first.as_str() && *other == second.as_str()
         ),
         "the conversation was handed over with {participants:?}"
@@ -3405,7 +3599,7 @@ async fn a_caller_alone_loses_the_application(stand: &Stand) -> TestResult {
     assert!(
         matches!(
             participants.as_slice(),
-            [ParticipantSnapshot { participant, state: ParticipantState::InConversation }]
+            [ParticipantSnapshot { participant, state: ParticipantState::InConversation, .. }]
                 if participant.id == first
         ) && connected.is_empty(),
         "a caller alone was offered as {participants:?}, connected {connected:?}"
@@ -3533,11 +3727,11 @@ async fn the_telephony_server_restarts_under_a_conversation(stand: &mut Stand) -
 
 /// A call from the operator through its side whose audio stops when its
 /// telephone does, answered, with a telephone at the caller's end of the
-/// network. Returns the caller's end, their participant, the
-/// telephone and the owner.
+/// network. Returns the caller's end, their participant, the telephone's
+/// channel, the telephone and the owner.
 async fn an_answered_call_from_the_operator(
     stand: &Stand,
-) -> TestResult<(String, ParticipantId, Phone, Owner)> {
+) -> TestResult<(String, ParticipantId, String, Phone, Owner)> {
     let caller = stand
         .network
         .control
@@ -3553,8 +3747,21 @@ async fn an_answered_call_from_the_operator(
     if events.is_empty() {
         events.push(owner.next_event().await?);
     }
-    let (_telephone, phone) = stand.network.give_a_phone(&caller).await?;
-    Ok((caller, first, phone, owner))
+    let (telephone, phone) = stand.network.give_a_phone(&caller).await?;
+    Ok((caller, first, telephone, phone, owner))
+}
+
+/// The network lets go of a caller's telephone and the bridge that joined
+/// it to the caller's end — once that end is gone, or the telephone would
+/// go on saying its tone to whoever is joined to it next.
+async fn the_telephone_is_put_down(stand: &Stand, telephone: &str) -> TestResult {
+    for gone in [
+        format!("channels/{telephone}"),
+        "bridges/the-callers-phone".to_owned(),
+    ] {
+        stand.network.control.request("DELETE", &gone).await?;
+    }
+    Ok(())
 }
 
 /// The next event, or none within `wait`.
@@ -3571,7 +3778,8 @@ async fn event_within(owner: &mut Owner, wait: Duration) -> TestResult<Option<Ev
 /// returns when audio comes back — and with no limit, the default, they are
 /// gone at once, as one who did not return.
 async fn audio_that_stops_arriving(stand: &Stand) -> TestResult {
-    let (caller, first, phone, mut owner) = an_answered_call_from_the_operator(stand).await?;
+    let (caller, first, telephone, phone, mut owner) =
+        an_answered_call_from_the_operator(stand).await?;
     let participant = first.clone();
     accepted(
         &mut owner,
@@ -3618,9 +3826,11 @@ async fn audio_that_stops_arriving(stand: &Stand) -> TestResult {
         "audio that came back was told as {back:?}"
     );
     ends_it(&mut owner, 3, 1).await?;
+    the_telephone_is_put_down(stand, &telephone).await?;
 
     // With no limit, lost is gone.
-    let (_caller, first, phone, mut owner) = an_answered_call_from_the_operator(stand).await?;
+    let (_caller, first, telephone, phone, mut owner) =
+        an_answered_call_from_the_operator(stand).await?;
     phone.speaks(false);
     let mut told = Vec::new();
     for _ in 0..4 {
@@ -3639,8 +3849,14 @@ async fn audio_that_stops_arriving(stand: &Stand) -> TestResult {
         "audio lost with no limit was told as {told:?}"
     );
     owner.closed().await?;
+    the_telephone_is_put_down(stand, &telephone).await?;
     stand
         .expect_no_channels("after audio stopped arriving")
+        .await?;
+    stand
+        .network
+        .control
+        .expect_none("channels", "after audio stopped arriving")
         .await
 }
 
@@ -4051,6 +4267,17 @@ async fn the_node_without_its_controller(stand: &mut Stand) -> TestResult {
     let participants = vec![first.clone(), second.clone()];
     accepted(&mut owner, 3, Command::Connect { participants }).await?;
     phone.hears(SECOND_SAYS, true).await?;
+    // Kept on the second's channel, for the controller that comes next.
+    let participant = second.clone();
+    accepted(
+        &mut owner,
+        4,
+        Command::HoldFor {
+            participant,
+            limit_ms: SECOND_HOLD_LIMIT_MS,
+        },
+    )
+    .await?;
 
     let named_before = audio_path_names(stand).await?;
     stand.kill_the_controller().await?;
@@ -4074,7 +4301,17 @@ async fn the_node_without_its_controller(stand: &mut Stand) -> TestResult {
     let waited = network.create_channel(&from_the_operator(DIALED)).await?;
     stand.start_the_controller().await?;
     let network = &stand.network.control;
-    let (mut carried_on, mut new) = both_conversations_offered(stand).await?;
+    let (mut carried_on, found, mut new) = both_conversations_offered(stand).await?;
+    let mut limits: Vec<(&str, u64)> = found
+        .iter()
+        .map(|snapshot| (snapshot.participant.id.as_str(), snapshot.hold_limit_ms))
+        .collect();
+    limits.sort_unstable();
+    assert_eq!(
+        limits,
+        [(first.as_str(), 0), (second.as_str(), SECOND_HOLD_LIMIT_MS)],
+        "the new controller did not find the hold limits the one before had"
+    );
     new.send(&ApplicationMessage::Accept)?;
     accepted(&mut new, 1, Command::End).await?;
     network.reason_it_ended(&waited).await?;
@@ -4261,8 +4498,11 @@ async fn asterisk_alone_gives_fallbacks(stand: &Stand, network_end: &str) -> Tes
 
 /// The two conversation connections a restarted controller opens: for the
 /// conversation it found in Asterisk — two people, connected — and for the
-/// call that waited for it. Either may come first.
-async fn both_conversations_offered(stand: &Stand) -> TestResult<(Owner, Owner)> {
+/// call that waited for it. Either may come first. The first comes with its
+/// participants as they were found.
+async fn both_conversations_offered(
+    stand: &Stand,
+) -> TestResult<(Owner, Vec<ParticipantSnapshot>, Owner)> {
     let (mut carried_on, mut new) = (None, None);
     for _ in 0..2 {
         let mut owner = Owner::accept(&stand.application).await?;
@@ -4284,7 +4524,7 @@ async fn both_conversations_offered(stand: &Stand) -> TestResult<(Owner, Owner)>
                         && matches!(connected.as_slice(), [group] if group.len() == 2),
                     "the conversation from before was found as {participants:?}, connected {connected:?}"
                 );
-                carried_on = Some(owner);
+                carried_on = Some((owner, participants));
             }
             ControllerMessage::Hello {
                 opening: Opening::Started { .. },
@@ -4299,7 +4539,7 @@ async fn both_conversations_offered(stand: &Stand) -> TestResult<(Owner, Owner)>
         }
     }
     match (carried_on, new) {
-        (Some(carried_on), Some(new)) => Ok((carried_on, new)),
+        (Some((carried_on, found)), Some(new)) => Ok((carried_on, found, new)),
         _ => Err("the new controller did not offer both conversations".into()),
     }
 }
@@ -4582,6 +4822,8 @@ async fn every_scenario(stand: &Stand) -> TestResult {
     a_call_from_elsewhere_is_refused(stand).await?;
     a_ringing_call_is_turned_away(stand).await?;
     the_application_dials(stand).await?;
+    the_application_starts_a_conversation(stand).await?;
+    a_request_identifier_used_twice(stand).await?;
     the_application_connects_participants(stand).await?;
     two_groups_are_merged(stand).await?;
     audio_that_stops_arriving(stand).await?;
