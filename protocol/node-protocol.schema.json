@@ -1721,7 +1721,7 @@
             "type"
           ],
           "additionalProperties": false,
-          "description": "The caller left before the transfer connected them."
+          "description": "The caller left before the fallback was carried out: before the transfer connected them, or while they were being sent to the message."
         },
         {
           "type": "object",

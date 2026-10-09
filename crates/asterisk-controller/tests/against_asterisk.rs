@@ -681,8 +681,16 @@ impl ControlInterface {
 
     /// Have Asterisk create a channel; `how` says what the channel is and
     /// where it goes. Returns the channel's identifier.
+    ///
+    /// The channel waits to be answered for as long as it takes: Asterisk's
+    /// own limit — thirty seconds unless told otherwise — would hang up a
+    /// caller the node keeps ringing just as long, the thirty seconds an
+    /// instance may be silent, and which of the two comes first would be the
+    /// machine's speed. When a call of the test ends is the scenario's to say.
     async fn create_channel(&self, how: &str) -> TestResult<String> {
-        let (status, body) = self.request("POST", &format!("channels?{how}")).await?;
+        let (status, body) = self
+            .request("POST", &format!("channels?{how}&timeout=-1"))
+            .await?;
         if status != 200 {
             return Err(format!("Asterisk refused the test call: {status} {body}").into());
         }

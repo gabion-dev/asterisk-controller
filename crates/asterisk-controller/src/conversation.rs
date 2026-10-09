@@ -621,6 +621,10 @@ enum Pending {
     /// A caller sent to the message of their entry's fallback: their
     /// channel, and who they are.
     Message(String, ParticipantId),
+    /// Whether a caller Asterisk would not send to the message is still in
+    /// the node's application: their channel, who they are, and the status
+    /// Asterisk refused with.
+    MessageVerdict(String, ParticipantId, u16),
     /// How much audio a participant has sent.
     Medium(ParticipantId),
     /// Housekeeping of the controller; nobody waits for the answer.
@@ -691,7 +695,8 @@ struct Conversation {
     /// How many participants this controller has added: numbers the next.
     participants: u64,
     /// The one who came through the entry — the one the entry's fallback is
-    /// for; `None` once they are gone, or when nobody did.
+    /// for; `None` when nobody did, or when a controller started again did
+    /// not find them. Whether they are still here is told by `members`.
     caller: Option<ParticipantId>,
     /// What every name this controller gives in Asterisk for the
     /// conversation begins with: the conversation and the controller's run.
@@ -1635,7 +1640,7 @@ impl Conversation {
     fn message_answer_awaited(&self) -> bool {
         self.pending
             .values()
-            .any(|pending| matches!(pending, Pending::Message(..)))
+            .any(|pending| matches!(pending, Pending::Message(..) | Pending::MessageVerdict(..)))
     }
 
     fn someone_is_connected(&self) -> bool {
@@ -2079,21 +2084,25 @@ impl Conversation {
                     participant.as_str()
                 ))),
             },
-            // A caller Asterisk would not send to the message is not left on
-            // a line nobody controls.
+            // Asterisk refuses to send a caller who is hanging up to the
+            // message — and its answer may come before its word that they
+            // left. So the refusal alone decides nothing: Asterisk is asked
+            // whether their channel is still in the application.
             Some(Pending::Message(channel, caller)) if !(200..=299).contains(&status_code) => {
                 eprintln!(
                     "conversation {}: Asterisk answered {status_code} when asked to play the \
-                     message of the fallback ({body}); the caller is hung up",
+                     message of the fallback ({body}); is the caller still there?",
                     self.id
                 );
-                self.ask(Pending::Internal, "DELETE", &format!("channels/{channel}"));
-                self.fallback_failed(FallbackKind::Message, FallbackFailure::NotPlayed);
-                self.keep_report(|conversation, at_unix_ms| Report::ParticipantHungUp {
-                    conversation,
-                    participant: caller,
-                    at_unix_ms,
-                });
+                self.ask(
+                    Pending::MessageVerdict(channel.clone(), caller, status_code),
+                    "GET",
+                    &format!("channels/{}", ari::query(&channel)),
+                );
+                Ok(())
+            }
+            Some(Pending::MessageVerdict(channel, caller, refused_with)) => {
+                self.message_verdict(&channel, caller, refused_with, status_code, body);
                 Ok(())
             }
             // The caller is in the dialplan's steps of the fallback: only now
@@ -2749,22 +2758,8 @@ impl Conversation {
                 participant.as_str(),
             )
         };
-        let still_here = match status_code {
-            200 => ari::is_in_application(body, APPLICATION).map_err(|error| {
-                Fault::Asterisk(format!(
-                    "{}, and described their channel unreadably: {error}",
-                    refused()
-                ))
-            })?,
-            // Their channel is no more.
-            404 => false,
-            other => {
-                return Err(Fault::Asterisk(format!(
-                    "{}, and with {other} when asked about their channel",
-                    refused()
-                )));
-            }
-        };
+        let still_here = still_in_application(status_code, body)
+            .map_err(|why| Fault::Asterisk(format!("{}, and {why}", refused())))?;
         if still_here {
             return Err(Fault::Asterisk(refused()));
         }
@@ -2774,6 +2769,45 @@ impl Conversation {
             refused()
         );
         Ok(())
+    }
+
+    /// Asterisk said whether a caller it would not send to the message is
+    /// still in the application.
+    ///
+    /// One who is not has left by themselves — hung up while being sent —
+    /// and the fallback failed because they left: the node hung up nobody.
+    /// One who is, or of whom Asterisk says nothing readable, is not left on
+    /// a line nobody controls: the node hangs them up, and the message was
+    /// not played.
+    fn message_verdict(
+        &mut self,
+        channel: &str,
+        caller: ParticipantId,
+        refused_with: u16,
+        status_code: u16,
+        body: &str,
+    ) {
+        if still_in_application(status_code, body) == Ok(false) {
+            eprintln!(
+                "conversation {}: Asterisk answered {refused_with} when asked to play the message \
+                 of the fallback: the caller has left",
+                self.id
+            );
+            self.fallback_failed(FallbackKind::Message, FallbackFailure::CallerLeft);
+            return;
+        }
+        eprintln!(
+            "conversation {}: Asterisk answered {refused_with} when asked to play the message of \
+             the fallback; the caller is hung up",
+            self.id
+        );
+        self.ask(Pending::Internal, "DELETE", &format!("channels/{channel}"));
+        self.fallback_failed(FallbackKind::Message, FallbackFailure::NotPlayed);
+        self.keep_report(|conversation, at_unix_ms| Report::ParticipantHungUp {
+            conversation,
+            participant: caller,
+            at_unix_ms,
+        });
     }
 
     /// The application connects participants to each other.
@@ -3423,6 +3457,22 @@ async fn hand_over(sink: &mut media::Sink, to_medium: Vec<ToMedium>) -> Result<(
     sink.flush().await.map_err(failed)
 }
 
+/// Whether a channel is still in the node's application, from Asterisk's
+/// answer when asked about it: a channel that is no more is not.
+///
+/// # Errors
+///
+/// An answer that says neither — another status, or a description that
+/// cannot be read — is described.
+fn still_in_application(status_code: u16, body: &str) -> Result<bool, String> {
+    match status_code {
+        200 => ari::is_in_application(body, APPLICATION)
+            .map_err(|error| format!("described their channel unreadably: {error}")),
+        404 => Ok(false),
+        other => Err(format!("with {other} when asked about their channel")),
+    }
+}
+
 /// Why a participant who was being called is gone without having answered,
 /// from the telephone network's reason for the end of their channel.
 fn unanswered(cause: Option<i64>) -> Departure {
@@ -3442,4 +3492,50 @@ fn participant_id(node: &Node, number: u64) -> Result<ParticipantId, Fault> {
     format!("p-{}-{number}", node.run)
         .parse()
         .map_err(|_| Fault::Asterisk("participant identifier is not valid".into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::still_in_application;
+
+    /// A channel as Asterisk describes it, doing `app_name(app_data)`.
+    fn doing(app_name: &str, app_data: &str) -> String {
+        serde_json::json!({
+            "id": "1759792000.7",
+            "name": "PJSIP/operator-00000007",
+            "state": "Ring",
+            "caller": { "name": "", "number": "" },
+            "dialplan": {
+                "context": "gabion-from-network", "exten": "+19715870050", "priority": 1,
+                "app_name": app_name, "app_data": app_data
+            }
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn a_channel_that_is_no_more_or_has_moved_on_is_not_still_here() {
+        // Hung up: Asterisk no longer has the channel.
+        assert_eq!(
+            still_in_application(404, "{\"message\":\"Channel not found\"}"),
+            Ok(false)
+        );
+        // On its way out: the channel is in the dialplan's steps, not in the
+        // application.
+        assert_eq!(still_in_application(200, &doing("Hangup", "")), Ok(false));
+    }
+
+    #[test]
+    fn a_channel_in_the_application_is_still_here() {
+        assert_eq!(
+            still_in_application(200, &doing("Stasis", "gabion,dialed_number,+19715870050")),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn an_answer_that_says_neither_decides_nothing() {
+        assert!(still_in_application(500, "").is_err());
+        assert!(still_in_application(200, "{\"message\":\"Channel not found\"}").is_err());
+    }
 }
