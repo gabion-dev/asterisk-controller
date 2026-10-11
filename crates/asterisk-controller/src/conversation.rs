@@ -75,7 +75,7 @@ use crate::{
     asterisk_files::{APPLICATION, FALLBACK_LABEL, NETWORK_CONTEXT, operator_name},
     config::PROTOCOL_VERSION,
     destination,
-    media::{self, FromMedia},
+    media::{self, FromMedia, Media},
     node::{Node, Place},
     playout::{FRAME_BYTES, Outcome, Playout, ToMedium},
     prompts, reports,
@@ -3161,35 +3161,43 @@ impl Conversation {
     }
 
     /// A media connection of this conversation said something.
-    async fn on_media(&mut self, said: FromMedia) -> Result<(), Fault> {
-        match said {
-            FromMedia::Connected { participant, sink } => {
+    async fn on_media(&mut self, from: FromMedia) -> Result<(), Fault> {
+        let FromMedia {
+            participant,
+            channel,
+            what,
+        } = from;
+        // Only the connection of the participant's present audio path
+        // counts. A path that was ended — its owner or Asterisk lost — and
+        // built again leaves its old connection behind:
+        // Asterisk closes it a moment later, and what it says until then is
+        // about no path of this conversation. Taken as the present one's,
+        // its closing would end the conversation of someone on the line.
+        let present = self
+            .sound(&participant)
+            .is_some_and(|sound| sound.channel == channel);
+        if !present {
+            return Ok(());
+        }
+        match what {
+            Media::Connected { sink } => {
                 if let Some(sound) = self.sound(&participant) {
                     sound.sink = Some(sink);
                 }
                 self.feed(&participant).await
             }
-            FromMedia::Audio { participant, audio } => self.heard(&participant, &audio).await,
-            FromMedia::Said { participant, event } => self.media_said(&participant, event).await,
-            FromMedia::Failed {
-                participant,
-                problem,
-            } => match self.sound(&participant) {
-                Some(_) => Err(Fault::Asterisk(format!(
-                    "the media connection of {}: {problem}",
-                    participant.as_str()
-                ))),
-                None => Ok(()),
-            },
+            Media::Audio { audio } => self.heard(&participant, &audio).await,
+            Media::Said { event } => self.media_said(&participant, event).await,
+            Media::Failed { problem } => Err(Fault::Asterisk(format!(
+                "the media connection of {}: {problem}",
+                participant.as_str()
+            ))),
             // Asterisk closes a media connection when its channel ends. For
             // a participant still on the line nobody asked for that.
-            FromMedia::Closed { participant } => match self.sound(&participant) {
-                Some(_) => Err(Fault::Asterisk(format!(
-                    "closed the media connection of {} while they are on the line",
-                    participant.as_str()
-                ))),
-                None => Ok(()),
-            },
+            Media::Closed => Err(Fault::Asterisk(format!(
+                "closed the media connection of {} while they are on the line",
+                participant.as_str()
+            ))),
         }
     }
 

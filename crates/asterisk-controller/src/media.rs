@@ -121,41 +121,46 @@ pub fn mark(id: u64) -> String {
 }
 
 /// What a media connection tells the conversation it belongs to.
-pub enum FromMedia {
+///
+/// Every message names the media channel as well as the participant: a
+/// participant whose audio path was ended and built again has a new media
+/// channel, while Asterisk closes the connection of the old one a moment
+/// later. What the old connection says until then is not about the path
+/// the participant has now.
+pub struct FromMedia {
+    /// Whose audio the connection carries.
+    pub participant: ParticipantId,
+    /// Asterisk's identifier of the media channel the connection belongs to.
+    pub channel: String,
+    /// What happened on it.
+    pub what: Media,
+}
+
+/// What happened on a media connection.
+pub enum Media {
     /// Asterisk opened the connection; this is where audio for the
     /// participant is written.
     Connected {
-        /// Whose audio the connection carries.
-        participant: ParticipantId,
         /// The writing half.
         sink: Sink,
     },
     /// What the participant says, as it came: any number of bytes.
     Audio {
-        /// Who is speaking.
-        participant: ParticipantId,
         /// The audio.
         audio: Vec<u8>,
     },
     /// A message of Asterisk.
     Said {
-        /// Whose media channel said it.
-        participant: ParticipantId,
         /// The message.
         event: Event,
     },
     /// The connection cannot be used, or said something unreadable.
     Failed {
-        /// Whose audio it was to carry.
-        participant: ParticipantId,
         /// What is wrong.
         problem: String,
     },
     /// Asterisk closed the connection.
-    Closed {
-        /// Whose audio it carried.
-        participant: ParticipantId,
-    },
+    Closed,
 }
 
 /// A conversation waiting for the media connection of one of its channels.
@@ -200,7 +205,7 @@ impl Door {
 /// closes it.
 pub async fn serve(mut socket: Socket, door: Door) {
     match first_word(&mut socket, &door).await {
-        Ok(waiter) => carry(socket, waiter).await,
+        Ok((waiter, channel)) => carry(socket, waiter, channel).await,
         Err(problem) => {
             eprintln!("asterisk-controller: a media connection was not taken — {problem}");
             // Nobody will end this channel with a request of a conversation, so
@@ -212,7 +217,7 @@ pub async fn serve(mut socket: Socket, door: Door) {
 }
 
 /// Read which channel the connection belongs to and find who waits for it.
-async fn first_word(socket: &mut Socket, door: &Door) -> Result<Waiter, String> {
+async fn first_word(socket: &mut Socket, door: &Door) -> Result<(Waiter, String), String> {
     let text = loop {
         match socket.next().await {
             Some(Ok(Frame::Text(text))) => break text,
@@ -237,41 +242,45 @@ async fn first_word(socket: &mut Socket, door: &Door) -> Result<Waiter, String> 
     if format != FORMAT || optimal_frame_size != FRAME_BYTES {
         let problem =
             format!("its audio is {format} in frames of {optimal_frame_size} bytes, not {FORMAT}");
-        let failed = FromMedia::Failed {
+        let failed = FromMedia {
             participant: waiter.participant,
-            problem: problem.clone(),
+            channel: channel_id,
+            what: Media::Failed {
+                problem: problem.clone(),
+            },
         };
         let _ = waiter.conversation.send(failed).await;
         return Err(problem);
     }
-    Ok(waiter)
+    Ok((waiter, channel_id))
 }
 
 /// Pass everything Asterisk says on to the conversation, to the end.
-async fn carry(socket: Socket, waiter: Waiter) {
+async fn carry(socket: Socket, waiter: Waiter, channel: String) {
     let Waiter {
         participant,
         conversation,
     } = waiter;
-    let (sink, mut stream) = socket.split();
-    let connected = FromMedia::Connected {
+    let from = |what| FromMedia {
         participant: participant.clone(),
-        sink,
+        channel: channel.clone(),
+        what,
     };
+    let (sink, mut stream) = socket.split();
     // A conversation that is over no longer listens; the connection is read
     // to its end all the same.
-    let mut listening = conversation.send(connected).await.is_ok();
+    let mut listening = conversation
+        .send(from(Media::Connected { sink }))
+        .await
+        .is_ok();
     while let Some(Ok(frame)) = stream.next().await {
-        let participant = participant.clone();
-        let said = match frame {
-            Frame::Binary(audio) => FromMedia::Audio {
-                participant,
+        let what = match frame {
+            Frame::Binary(audio) => Media::Audio {
                 audio: audio.to_vec(),
             },
             Frame::Text(text) => match read(text.as_str()) {
-                Ok(event) => FromMedia::Said { participant, event },
-                Err(error) => FromMedia::Failed {
-                    participant,
+                Ok(event) => Media::Said { event },
+                Err(error) => Media::Failed {
                     problem: format!("said something unreadable: {error}"),
                 },
             },
@@ -279,10 +288,10 @@ async fn carry(socket: Socket, waiter: Waiter) {
             Frame::Ping(_) | Frame::Pong(_) | Frame::Frame(_) => continue,
         };
         if listening {
-            listening = conversation.send(said).await.is_ok();
+            listening = conversation.send(from(what)).await.is_ok();
         }
     }
     if listening {
-        let _ = conversation.send(FromMedia::Closed { participant }).await;
+        let _ = conversation.send(from(Media::Closed)).await;
     }
 }
