@@ -12,9 +12,12 @@ public final class ProtocolViolation extends Exception {
 
     private static final long serialVersionUID = 1L;
 
+    /** Where in the message the problem is; part of the exception's serialized form. */
     private final String at;
 
     /**
+     * A violation at a place in a message.
+     *
      * @param at      where in the message, as a JSON pointer; empty for the message itself
      * @param problem what is wrong there
      */

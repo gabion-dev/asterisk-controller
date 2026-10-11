@@ -37,11 +37,17 @@ public sealed interface AudioFrame {
     // and equality, hashing and the text compare and show its bytes.
     @SuppressWarnings("ArrayRecordComponent")
     record Heard(ParticipantId participant, long positionMs, byte[] audio) implements AudioFrame {
+        /** Canonical constructor: the audio is copied, so the frame cannot change under its reader. */
         public Heard {
             Objects.requireNonNull(participant, "participant");
             audio = audio.clone();
         }
 
+        /**
+         * The audio, as a copy of the frame's own.
+         *
+         * @return twenty milliseconds of audio
+         */
         @Override
         public byte[] audio() {
             return audio.clone();
@@ -83,12 +89,18 @@ public sealed interface AudioFrame {
     @SuppressWarnings("ArrayRecordComponent")
     record Playback(ParticipantId participant, SegmentId segment, boolean last, byte[] audio)
             implements AudioFrame {
+        /** Canonical constructor: the audio is copied, so the frame cannot change under its reader. */
         public Playback {
             Objects.requireNonNull(participant, "participant");
             Objects.requireNonNull(segment, "segment");
             audio = audio.clone();
         }
 
+        /**
+         * The audio, as a copy of the frame's own.
+         *
+         * @return a whole number of samples
+         */
         @Override
         public byte[] audio() {
             return audio.clone();
@@ -118,7 +130,17 @@ public sealed interface AudioFrame {
 
     /** Why bytes are not an audio frame. The names are those of the shared vectors. */
     enum Refusal {
-        UNKNOWN_KIND, TRUNCATED, BAD_IDENTIFIER, WRONG_HEARD_LENGTH, WRONG_PLAYBACK_LENGTH,
+        /** The first byte names no kind of frame. */
+        UNKNOWN_KIND,
+        /** The frame ends before a field it must hold. */
+        TRUNCATED,
+        /** An identifier is empty, longer than 128 bytes or not printable ASCII. */
+        BAD_IDENTIFIER,
+        /** A heard frame holds other than twenty milliseconds of audio. */
+        WRONG_HEARD_LENGTH,
+        /** A playback frame holds half a sample, too much audio, or none while not last. */
+        WRONG_PLAYBACK_LENGTH,
+        /** The marker of the last frame is neither 0 nor 1. */
         BAD_LAST_MARKER
     }
 
@@ -127,6 +149,7 @@ public sealed interface AudioFrame {
 
         private static final long serialVersionUID = 1L;
 
+        /** Why the bytes were refused; part of the exception's serialized form. */
         private final Refusal refusal;
 
         Refused(Refusal refusal) {

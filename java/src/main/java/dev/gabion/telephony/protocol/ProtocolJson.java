@@ -46,6 +46,7 @@ public final class ProtocolJson {
     /**
      * Decode a protocol message from its JSON text.
      *
+     * @param <T>  the type of the message
      * @param json the text
      * @param type a type generated from the description; its simple name is the definition's
      * @return the message
@@ -65,6 +66,7 @@ public final class ProtocolJson {
     /**
      * Decode a protocol message from a JSON value.
      *
+     * @param <T>   the type of the message
      * @param value the value
      * @param type  a type generated from the description
      * @return the message
@@ -94,6 +96,7 @@ public final class ProtocolJson {
      * <p>What is sent is held to the description as what is received is: a message the other side
      * would refuse is never sent, and the refusal names the place, as on arrival.</p>
      *
+     * @param <T>     the type of the message
      * @param message a value of a type generated from the description
      * @param type    the type the message is sent as; its simple name is the definition's
      * @return the text
