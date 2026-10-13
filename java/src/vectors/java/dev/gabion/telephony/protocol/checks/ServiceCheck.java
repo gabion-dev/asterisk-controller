@@ -37,7 +37,10 @@ import java.util.concurrent.TimeUnit;
  * The WebSocket server is written here, a few dozen lines of RFC 6455: the JDK has a WebSocket
  * client and no server, and the check takes no library the application would not.
  *
- * Usage: java ServiceCheck <controller binary>
+ * The controller is given a tree with nothing in it but the build record of the Asterisk it is
+ * checked against — the tree {@code scripts/fetch-asterisk.sh} fetches — since it drives no other.
+ *
+ * Usage: java ServiceCheck <controller binary> <build record of the fetched Asterisk>
  */
 public final class ServiceCheck {
 
@@ -48,14 +51,20 @@ public final class ServiceCheck {
     private ServiceCheck() {}
 
     public static void main(String[] arguments) throws Exception {
-        if (arguments.length != 1) {
-            System.err.println("usage: java ServiceCheck <controller binary>");
+        if (arguments.length != 2) {
+            System.err.println(
+                    "usage: java ServiceCheck <controller binary> <build record of the fetched Asterisk>");
+            System.exit(2);
+        }
+        Path record = Path.of(arguments[1]);
+        if (!Files.isRegularFile(record)) {
+            System.err.println(record + " is not there: fetch the Asterisk the controller is checked "
+                    + "against first (scripts/fetch-asterisk.sh)");
             System.exit(2);
         }
         Path root = Files.createTempDirectory("service-check");
         Path tree = Files.createDirectories(root.resolve("tree"));
-        Files.writeString(tree.resolve("BUILD-INFO.txt"),
-                "asterisk-version: 22.11.0\nmodules:\n  res_ari.so\n");
+        Files.copy(record, tree.resolve("BUILD-INFO.txt"));
         Path state = Files.createDirectories(root.resolve("node"));
         Path secret = Files.writeString(state.resolve("node-secret"), SECRET);
         Files.setPosixFilePermissions(secret, PosixFilePermissions.fromString("rw-------"));

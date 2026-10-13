@@ -56,13 +56,14 @@ connection is opened again a second later.
 
 You need:
 
-- the controller binary — no release is published yet, so build it from
-  source ([below](#building-and-checking-from-source));
-- an Asterisk 22.11.0 tree. The controller drives only that version: it reads
-  the version and the list of modules from `<tree>/BUILD-INFO.txt` and does
-  not start with any other version, or without that file.
-  `scripts/fetch-asterisk.sh` fetches the prebuilt tree the controller is
-  checked against — release `22.11.0-r1` of
+- the controller binary — from a release of this repository (pre-releases so
+  far), or built from source
+  ([below](#building-and-checking-from-source));
+- the Asterisk 22.11.0 tree the controller is checked against. The controller
+  drives only that build: it reads the version and the list of modules from
+  `<tree>/BUILD-INFO.txt` and does not start with another version, with
+  other modules than that build's, or without that file.
+  `scripts/fetch-asterisk.sh` fetches that tree — release `22.11.0-r2` of
   [gabion-dev/asterisk-server](https://github.com/gabion-dev/asterisk-server),
   for Linux (x86_64, aarch64) and macOS (arm64, x86_64) — checks its pinned
   SHA-256 and unpacks it into `target/asterisk-server`. The tree is only read;

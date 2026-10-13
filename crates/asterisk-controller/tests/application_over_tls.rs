@@ -5,7 +5,9 @@
 //!
 //! No Asterisk is needed: the service connection is opened whether Asterisk
 //! is there or not, so the controller is started on a tree that is nothing
-//! but its build record. The application of the test serves TLS with a
+//! but its build record — the record of the Asterisk the controller is
+//! checked against, as `scripts/fetch-asterisk.sh` fetched it, since the
+//! controller drives no other build. The application of the test serves TLS with a
 //! certificate made for the test, and the controller is told to trust it
 //! the way any program on the machine is told of roots other than the
 //! system's: `SSL_CERT_FILE`. Started with another root there, it must
@@ -138,16 +140,31 @@ impl Controller {
     }
 }
 
+/// The build record of the Asterisk the controller is checked against.
+fn build_record() -> TestResult<PathBuf> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let tree = std::env::var_os("ASTERISK_TREE")
+        .map_or_else(|| root.join("target/asterisk-server"), PathBuf::from);
+    let record = tree.join("BUILD-INFO.txt");
+    if record.is_file() {
+        Ok(record)
+    } else {
+        Err(format!(
+            "no Asterisk build record at {}: run scripts/fetch-asterisk.sh, or point \
+             ASTERISK_TREE at a tree",
+            record.display()
+        )
+        .into())
+    }
+}
+
 /// Write the state of a node with its secret, and a tree that is only its
 /// build record.
 fn prepare(root: &Path) -> TestResult {
     let _ = fs::remove_dir_all(root);
     let tree = root.join("tree");
     fs::create_dir_all(&tree)?;
-    fs::write(
-        tree.join("BUILD-INFO.txt"),
-        "asterisk-version: 22.11.0\nmodules:\n  res_ari.so\n",
-    )?;
+    fs::copy(build_record()?, tree.join("BUILD-INFO.txt"))?;
     let state = root.join("node");
     fs::create_dir_all(&state)?;
     let secret = state.join("node-secret");

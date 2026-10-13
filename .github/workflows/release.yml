@@ -243,6 +243,11 @@ jobs:
           distribution: temurin
           java-version: '21'
 
+      # The service check gives the controller the build record of the
+      # Asterisk it is pinned to: the controller drives no other.
+      - name: Asterisk the controller is pinned to
+        run: bash scripts/fetch-asterisk.sh
+
       # Every check of the library first — the shared vectors, the service
       # connection with the controller, the documentation of what is written
       # by hand — then the bundle Central takes, signed. Its version is the
@@ -324,7 +329,7 @@ jobs:
           name: asterisk-controller ${{ github.event.inputs.version }}
           prerelease: ${{ contains(github.event.inputs.version, '-') }}
           body: |
-            The controller of a Gabion telephony node, for Asterisk 22.11.0 (release `22.11.0-r1` of gabion-dev/asterisk-server). How to run it — the README in each archive.
+            The controller of a Gabion telephony node, for Asterisk 22.11.0 (release `22.11.0-r2` of gabion-dev/asterisk-server). How to run it — the README in each archive.
 
             Every archive was built on a native machine of its platform, where every check of this repository passed first — the controller against the pinned Asterisk included — and was then started on clean hosts: Linux — AlmaLinux 9 and 10, Ubuntu 22.04, 24.04 and 26.04, Debian 12 and 13, Fedora; macOS — 14, 15, 26 and 27 on Apple Silicon, 15 and 26 on Intel.
 

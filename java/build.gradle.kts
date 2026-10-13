@@ -171,7 +171,13 @@ val serviceCheck by tasks.registering(JavaExec::class) {
     dependsOn(buildController)
     classpath = vectors.runtimeClasspath
     mainClass = "dev.gabion.telephony.protocol.checks.ServiceCheck"
-    args(repositoryRoot.file("target/debug/asterisk-controller").asFile.path)
+    // The controller drives only the Asterisk build it is checked against,
+    // and tells it by the build record of its tree: the check gives it the
+    // record of the tree scripts/fetch-asterisk.sh fetched.
+    args(
+        repositoryRoot.file("target/debug/asterisk-controller").asFile.path,
+        repositoryRoot.file("target/asterisk-server/BUILD-INFO.txt").asFile.path,
+    )
 }
 
 tasks.check {

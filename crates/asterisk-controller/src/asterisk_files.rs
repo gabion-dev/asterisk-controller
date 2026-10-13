@@ -32,6 +32,101 @@ use crate::{
 /// controller would be guessing.
 const KNOWN_ASTERISK_VERSIONS: &[&str] = &["22.11.0"];
 
+/// The modules of the Asterisk build this controller is checked against —
+/// release `22.11.0-r2` of gabion-dev/asterisk-server, the one
+/// `scripts/fetch-asterisk.sh` fetches — on every platform, apart from the
+/// timer, which is each platform's own ([`TIMING_MODULE`]).
+///
+/// A build record names the Asterisk version and not the revision of the
+/// build, and two revisions of one version differ in exactly this: what they
+/// carry. Every module of a tree is loaded and required, so a module a
+/// revision adds may need configuration the controller does not write and
+/// stop Asterisk from starting, and one it takes away may be one the
+/// controller drives. A tree that carries other modules than these is not
+/// driven on a guess.
+const KNOWN_MODULES: &[&str] = &[
+    "app_dial.so",
+    "app_mixmonitor.so",
+    "app_playback.so",
+    "app_record.so",
+    "app_stasis.so",
+    "bridge_holding.so",
+    "bridge_native_rtp.so",
+    "bridge_simple.so",
+    "bridge_softmix.so",
+    "cdr_csv.so",
+    "chan_bridge_media.so",
+    "chan_pjsip.so",
+    "chan_websocket.so",
+    "codec_alaw.so",
+    "codec_resample.so",
+    "codec_ulaw.so",
+    "format_pcm.so",
+    "format_sln.so",
+    "format_wav.so",
+    "func_callerid.so",
+    "func_channel.so",
+    "func_groupcount.so",
+    "pbx_config.so",
+    "res_ari.so",
+    "res_ari_applications.so",
+    "res_ari_asterisk.so",
+    "res_ari_bridges.so",
+    "res_ari_channels.so",
+    "res_ari_events.so",
+    "res_ari_model.so",
+    "res_ari_playbacks.so",
+    "res_ari_recordings.so",
+    "res_crypto.so",
+    "res_http_websocket.so",
+    "res_pjproject.so",
+    "res_pjsip.so",
+    "res_pjsip_authenticator_digest.so",
+    "res_pjsip_caller_id.so",
+    "res_pjsip_dtmf_info.so",
+    "res_pjsip_endpoint_identifier_ip.so",
+    "res_pjsip_endpoint_identifier_user.so",
+    "res_pjsip_nat.so",
+    "res_pjsip_outbound_authenticator_digest.so",
+    "res_pjsip_outbound_registration.so",
+    "res_pjsip_pubsub.so",
+    "res_pjsip_registrar.so",
+    "res_pjsip_rfc3326.so",
+    "res_pjsip_sdp_rtp.so",
+    "res_pjsip_session.so",
+    "res_pjsip_transport_websocket.so",
+    "res_rtp_asterisk.so",
+    "res_sorcery_astdb.so",
+    "res_sorcery_config.so",
+    "res_sorcery_memory.so",
+    "res_srtp.so",
+    "res_stasis.so",
+    "res_stasis_answer.so",
+    "res_stasis_playback.so",
+    "res_stasis_recording.so",
+    "res_stasis_snoop.so",
+    "res_websocket_client.so",
+];
+
+/// The timer of the build on this platform: Linux has timerfd, macOS does
+/// not and gets the thread-based one.
+#[cfg(target_os = "linux")]
+const TIMING_MODULE: &str = "res_timing_timerfd.so";
+#[cfg(target_os = "macos")]
+const TIMING_MODULE: &str = "res_timing_pthread.so";
+
+/// Calls Asterisk carries out by itself — a fallback while the controller
+/// is away — are recorded by its call records in CSV (`cdr_csv`), in one
+/// file (`Master.csv` in [`CALL_RECORDS`] of the log directory) rather than
+/// one per account, with times in UTC and each call's unique identifier.
+/// The module refuses to load without its section, and every module is
+/// required.
+const CALL_RECORDS_CONFIG: &str = "[csv]\nusegmtime = yes\nloguniqueid = yes\naccountlogs = no\n";
+/// Where in the log directory Asterisk writes its call records. Asterisk
+/// opens the file there and does not make the directory; without it every
+/// call would end with an error in its log.
+const CALL_RECORDS: &str = "cdr-csv";
+
 /// The Stasis application every call of the node enters.
 pub const APPLICATION: &str = "gabion";
 /// The user of Asterisk's control interface the controller acts as.
@@ -66,7 +161,6 @@ const FALLBACK_STEP: &str = "(fallback)";
 const EMPTY_FILES: &[&str] = &[
     "acl.conf",
     "ccss.conf",
-    "cdr.conf",
     "cel.conf",
     "chan_websocket.conf",
     "features.conf",
@@ -118,8 +212,53 @@ impl Tree {
         if modules.is_empty() {
             return Err(format!("{} lists no modules", path.display()));
         }
+        known_modules(&path, &modules)?;
         Ok(Self { version, modules })
     }
+}
+
+/// Refuse a tree whose modules are not exactly the ones of the build the
+/// controller is checked against ([`KNOWN_MODULES`]).
+fn known_modules(record: &Path, modules: &[String]) -> Result<(), String> {
+    let known: Vec<&str> = KNOWN_MODULES
+        .iter()
+        .copied()
+        .chain([TIMING_MODULE])
+        .collect();
+    let unknown: Vec<&str> = modules
+        .iter()
+        .map(String::as_str)
+        .filter(|module| !known.contains(module))
+        .collect();
+    let missing: Vec<&str> = known
+        .iter()
+        .copied()
+        .filter(|module| !modules.iter().any(|present| present == module))
+        .collect();
+    if unknown.is_empty() && missing.is_empty() {
+        return Ok(());
+    }
+    let mut problem = format!(
+        "{} is not the Asterisk build this controller is checked against \
+         (release 22.11.0-r2 of gabion-dev/asterisk-server):",
+        record.display()
+    );
+    if !unknown.is_empty() {
+        let _ = write!(
+            problem,
+            " it carries modules the controller does not know ({})",
+            unknown.join(", ")
+        );
+    }
+    if !missing.is_empty() {
+        let _ = write!(
+            problem,
+            "{} it lacks modules the controller drives ({})",
+            if unknown.is_empty() { "" } else { ";" },
+            missing.join(", ")
+        );
+    }
+    Err(problem)
 }
 
 /// The name, in Asterisk's configuration, of everything that belongs to one
@@ -226,7 +365,16 @@ pub fn write(
         Err(error) => return Err(failed(&etc, error)),
     }
     // Asterisk looks for keys in a `keys` directory inside its key directory.
-    for directory in ["etc", "db", "keys/keys", "spool", "run", "log", "cache"] {
+    let call_records = format!("log/{CALL_RECORDS}");
+    for directory in [
+        "etc",
+        "db",
+        "keys/keys",
+        "spool",
+        "run",
+        call_records.as_str(),
+        "cache",
+    ] {
         let directory = config.state.join(directory);
         fs::create_dir_all(&directory).map_err(|error| failed(&directory, error))?;
     }
@@ -361,6 +509,7 @@ fn files(
         // The management interface is not used; said explicitly, so that its
         // absence is a setting and not a missing file.
         ("manager.conf", "[general]\nenabled = no\n".to_owned()),
+        ("cdr.conf", CALL_RECORDS_CONFIG.to_owned()),
         // Tones a caller hears. One country is required for Asterisk to have any.
         (
             "indications.conf",
@@ -753,7 +902,7 @@ mod tests {
     use node_protocol::messages::{Settings, SipTransport};
     use serde_json::json;
 
-    use super::{Tree, files, operator_name};
+    use super::{KNOWN_MODULES, TIMING_MODULE, Tree, files, operator_name};
     use crate::config::{Config, SipTls};
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -818,22 +967,85 @@ mod tests {
         Ok(read)
     }
 
+    /// A build record of the given version listing the given modules.
+    fn record(version: &str, modules: &[&str]) -> String {
+        let mut record = format!("asterisk-version: {version}\nmodules:\n");
+        for module in modules {
+            record.push_str("  ");
+            record.push_str(module);
+            record.push('\n');
+        }
+        record
+    }
+
+    /// The modules of the build the controller is checked against, here.
+    fn known() -> Vec<&'static str> {
+        KNOWN_MODULES
+            .iter()
+            .copied()
+            .chain([TIMING_MODULE])
+            .collect()
+    }
+
     #[test]
     fn only_an_asterisk_the_controller_knows_is_driven() -> TestResult {
-        let known = read_tree_with("asterisk-version: 22.11.0\nmodules:\n  res_ari.so\n")??;
-        assert_eq!(known.modules, ["res_ari.so"]);
+        let read = read_tree_with(&record("22.11.0", &known()))??;
+        assert_eq!(read.modules, known());
 
         for (record, expected) in [
+            (record("23.0.0", &known()), "drives only 22.11.0"),
             (
-                "asterisk-version: 23.0.0\nmodules:\n  res_ari.so\n",
-                "drives only 22.11.0",
+                "modules:\n  res_ari.so\n".to_owned(),
+                "names no Asterisk version",
             ),
-            ("modules:\n  res_ari.so\n", "names no Asterisk version"),
-            ("asterisk-version: 22.11.0\nmodules:\n", "lists no modules"),
+            (record("22.11.0", &[]), "lists no modules"),
         ] {
-            let problem = read_tree_with(record)?.err().unwrap_or_default();
+            let problem = read_tree_with(&record)?.err().unwrap_or_default();
             assert!(problem.contains(expected), "{record:?}: {problem:?}");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn a_build_of_the_known_version_with_other_modules_is_not_driven() -> TestResult {
+        // A revision that adds a module, and one that lacks a module the
+        // controller drives: the version alone does not tell them apart.
+        let mut added = known();
+        added.push("app_queue.so");
+        let added = read_tree_with(&record("22.11.0", &added))?
+            .err()
+            .unwrap_or_default();
+        assert!(
+            added.contains("does not know (app_queue.so)") && !added.contains("lacks"),
+            "{added:?}"
+        );
+
+        let lacking: Vec<&str> = known()
+            .into_iter()
+            .filter(|module| *module != "chan_bridge_media.so")
+            .collect();
+        let lacking = read_tree_with(&record("22.11.0", &lacking))?
+            .err()
+            .unwrap_or_default();
+        assert!(
+            lacking.contains("lacks modules the controller drives (chan_bridge_media.so)")
+                && lacking.contains("22.11.0-r2"),
+            "{lacking:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn asterisk_keeps_its_own_call_records_in_one_file() -> TestResult {
+        let nothing: Settings = node_protocol::decode_value(
+            json!({ "operators": [], "lines": [], "entries": [], "prompts": [] }),
+        )?;
+        let files = files(&config(None)?, &tree(), &nothing, "secret", None)?;
+        // Without its section the module of call records refuses to load.
+        assert_eq!(
+            file(&files, "cdr.conf"),
+            "[csv]\nusegmtime = yes\nloguniqueid = yes\naccountlogs = no\n"
+        );
         Ok(())
     }
 

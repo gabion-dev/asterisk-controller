@@ -307,7 +307,9 @@ fn write_network_configuration(
     certificates: &Certificates,
 ) -> TestResult<PathBuf> {
     let etc = state.join("etc");
-    for directory in ["etc", "db", "keys/keys", "spool", "run", "log"] {
+    // Asterisk writes its call records into `log/cdr-csv` and does not make
+    // the directory.
+    for directory in ["etc", "db", "keys/keys", "spool", "run", "log/cdr-csv"] {
         fs::create_dir_all(state.join(directory))?;
     }
     let lib = tree.join("var/lib/asterisk");
@@ -347,6 +349,9 @@ fn write_network_configuration(
             format!("[general]\nrtpstart = {}\nrtpend = {}\n", ports.audio, ports.audio.saturating_add(19)),
         ),
         ("manager.conf", "[general]\nenabled = no\n".into()),
+        // The module of call records is in the tree, so it is required, and
+        // it refuses to load without its section — an empty one included.
+        ("cdr.conf", "[csv]\nusegmtime = yes\n".into()),
         (
             "indications.conf",
             "[general]\ncountry = us\n\n[us]\ndescription = United States\nringcadence = 2000,4000\n\
@@ -368,7 +373,6 @@ fn write_network_configuration(
     for name in [
         "acl.conf",
         "ccss.conf",
-        "cdr.conf",
         "cel.conf",
         "chan_websocket.conf",
         "features.conf",
@@ -4822,7 +4826,45 @@ async fn asterisk_alone_gives_fallbacks(stand: &Stand, network_end: &str) -> Tes
     // The second is hung up on: its entry's fallback is a message, and the
     // node has no prompts to say it with.
     network.reason_it_ended(&turned_away).await?;
+    // What Asterisk did alone it keeps a record of, for the controller that
+    // comes back.
+    asterisk_recorded_it(stand, DIALED, "Hangup").await?;
     Ok(transferred)
+}
+
+/// The node's Asterisk keeps a record of a call to `dialed` whose last step
+/// was `last`, in its own call records.
+async fn asterisk_recorded_it(stand: &Stand, dialed: &str, last: &str) -> TestResult {
+    let records = stand.state.join("log/cdr-csv/Master.csv");
+    let (dialed, last) = (format!("\"{dialed}\""), format!("\"{last}\""));
+    let found = timeout(STEP, async {
+        loop {
+            match fs::read_to_string(&records) {
+                Ok(text)
+                    if text
+                        .lines()
+                        .any(|line| line.contains(&dialed) && line.contains(&last)) =>
+                {
+                    return Ok::<_, Box<dyn Error>>(());
+                }
+                // Asterisk makes the file with its first record.
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(format!("{}: {error}", records.display()).into()),
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    match found {
+        Ok(read) => read,
+        Err(_) => Err(format!(
+            "Asterisk kept no record of the call to {dialed} it ended with {last} in {}: {:?}",
+            records.display(),
+            fs::read_to_string(&records).unwrap_or_default(),
+        )
+        .into()),
+    }
 }
 
 /// The two conversation connections a restarted controller opens: for the
