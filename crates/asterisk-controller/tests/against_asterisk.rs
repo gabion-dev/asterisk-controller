@@ -1150,7 +1150,9 @@ impl Phone {
 type Connection = WebSocketStream<TcpStream>;
 
 /// The files of recordings the node sent, by recording.
-type Recordings = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
+/// The files of recordings the node sent: the recording, the conversation
+/// the node named it as being of, and the audio.
+type Recordings = Arc<Mutex<Vec<(String, String, Vec<u8>)>>>;
 
 /// The two queues connections wait in, by what they are for — and what
 /// the application keeps of the node's plain requests.
@@ -1235,11 +1237,19 @@ impl Application {
     /// since the node sends it after it says the recording is finished.
     /// Taken: asked for again, it is waited for again.
     async fn recording(&self, recording: &RecordingId) -> TestResult<Vec<u8>> {
+        Ok(self.recording_of(recording).await?.1)
+    }
+
+    /// The file of a recording and the conversation the node named it as
+    /// being of, as [`Self::recording`].
+    async fn recording_of(&self, recording: &RecordingId) -> TestResult<(String, Vec<u8>)> {
         timeout(STEP, async {
             loop {
                 let mut kept = self.queues.recordings.lock().await;
-                if let Some(position) = kept.iter().position(|(id, _)| id == recording.as_str()) {
-                    return kept.swap_remove(position).1;
+                if let Some(position) = kept.iter().position(|(id, _, _)| id == recording.as_str())
+                {
+                    let (_, conversation, audio) = kept.swap_remove(position);
+                    return (conversation, audio);
                 }
                 drop(kept);
                 tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1364,6 +1374,14 @@ async fn serve_plain(mut stream: TcpStream, head: &str, expected: &str, queues: 
             let Some(length) = header("content-length").and_then(|value| value.parse().ok()) else {
                 return answer(stream, "411 Length Required", &[]).await;
             };
+            // Nor one without its conversation: the node always names it, and
+            // an application that never saw the recording begin keeps the
+            // file by that name alone.
+            let Some(conversation) =
+                header("x-gabion-conversation").filter(|value| !value.is_empty())
+            else {
+                return answer(stream, "400 Bad Request", &[]).await;
+            };
             let mut file = vec![0_u8; length];
             if timeout(STEP, stream.read_exact(&mut file)).await.is_err() {
                 return;
@@ -1375,7 +1393,7 @@ async fn serve_plain(mut stream: TcpStream, head: &str, expected: &str, queues: 
                     .recordings
                     .lock()
                     .await
-                    .push((recording.to_owned(), file));
+                    .push((recording.to_owned(), conversation, file));
                 ("204 No Content", Vec::new())
             }
         }
@@ -4534,7 +4552,8 @@ async fn no_recording_is_left(stand: &Stand, after: &str) -> TestResult {
 /// conversation does.
 async fn the_conversation_is_recorded(stand: &Stand) -> TestResult {
     let (_caller, mut phone, mut owner) = stand.call_from_a_phone().await?;
-    let first = hello(&mut owner).await?.first.id;
+    let opened = hello(&mut owner).await?;
+    let first = opened.first.id;
     owner.send(&ApplicationMessage::Accept)?;
 
     // A recording nobody started cannot be stopped.
@@ -4566,7 +4585,11 @@ async fn the_conversation_is_recorded(stand: &Stand) -> TestResult {
     phone.hears(SECOND_SAYS, true).await?;
     second_phone.hears(Phone::SAYS, true).await?;
     let length_ms = recording_ends(&mut owner, 12, &recording).await?;
-    let audio = stand.application.recording(&recording).await?;
+    let (of, audio) = stand.application.recording_of(&recording).await?;
+    assert_eq!(
+        of, opened.conversation,
+        "the node named the recording's file as of another conversation"
+    );
     assert_eq!(
         u64::try_from(audio.len())?,
         length_ms * BYTES_PER_MS,

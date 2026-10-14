@@ -77,6 +77,11 @@ const SLOWEST_SEND: u64 = 128 * 1024;
 
 /// How much of a file is read and sent at a time.
 const SEND_CHUNK: usize = 64 * 1024;
+/// The header a recording's file names its conversation in. The application
+/// knows the conversation of every recording it saw begin; one it never saw
+/// begin — its instance lost between the node's acceptance and its record,
+/// the conversation resumed by nobody — it keeps by this name alone.
+const CONVERSATION_HEADER: &str = "X-Gabion-Conversation";
 
 /// What a connection is opened for: the end of the application it goes to.
 #[derive(Clone, Copy, Debug)]
@@ -208,14 +213,22 @@ impl Application {
 
     /// Send a file to the application, `PUT <address>/<path>`: the file's
     /// bytes as the body, with their length, within [`SILENCE_LIMIT`] plus
-    /// the time the file takes at [`SLOWEST_SEND`]. The application's 2xx
-    /// says it has the file.
+    /// the time the file takes at [`SLOWEST_SEND`]. The conversation the
+    /// file is of, when known, goes in [`CONVERSATION_HEADER`]: the
+    /// application knows it already — unless it never saw the recording
+    /// begin, and then the header is what lets it keep the file at all. The
+    /// application's 2xx says it has the file.
     ///
     /// # Errors
     ///
     /// The file cannot be read, the application cannot be reached, answers
     /// otherwise than 2xx, or takes too long; the reason, in words.
-    pub async fn put(&self, path: &str, file: &Path) -> Result<(), String> {
+    pub async fn put(
+        &self,
+        path: &str,
+        file: &Path,
+        conversation: Option<&str>,
+    ) -> Result<(), String> {
         let url = format!("{}/{path}", self.address);
         let failed = |problem: &dyn std::fmt::Display| format!("{url}: {problem}");
         let length = tokio::fs::metadata(file)
@@ -228,10 +241,14 @@ impl Application {
                 .await
                 .map_err(|error| format!("{}: {error}", file.display()))?;
             let (stream, host, target) = self.connect(path).await?;
-            let request = self
+            let mut request = self
                 .request("PUT", &host, &target)
                 .header(CONTENT_LENGTH, length)
-                .header(CONTENT_TYPE, "application/octet-stream")
+                .header(CONTENT_TYPE, "application/octet-stream");
+            if let Some(conversation) = conversation {
+                request = request.header(CONVERSATION_HEADER, conversation);
+            }
+            let request = request
                 .body(StreamBody::new(chunks_of(opened)))
                 .map_err(|error| error.to_string())?;
             let status = send(stream, request).await?.status();

@@ -334,9 +334,11 @@ to whom — into one file in the protocol's audio format, raw 16-bit linear
 PCM at 16 kHz. A recording lasts until the application stops it or the last
 participant is gone; a conversation does not end while it is being written.
 When it is written, the node sends the file to the application,
-`PUT <address>/recordings/<identifier>`, with its length and the node's
-credentials, and deletes its copy only once the application has answered
-2xx: a file the application refuses or cannot be given stays on the node and
+`PUT <address>/recordings/<identifier>`, with its length, the node's
+credentials and the conversation it is of in the `X-Gabion-Conversation`
+header (so that an application which never saw the recording begin can
+still keep the file), and deletes its copy only once the application has
+answered 2xx: a file the application refuses or cannot be given stays on the node and
 is sent again — when the application next welcomes the node, and every 10
 seconds. A controller started again carries on the recordings in progress
 and sends the ones left unsent. A file that is not on the node when it is to

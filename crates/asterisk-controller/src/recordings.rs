@@ -333,7 +333,11 @@ async fn send_or_settle(node: &Node, asterisk: &Asterisk, entry: &Entry) -> bool
     }
     let sent = node
         .application
-        .put(&format!("recordings/{recording}"), &file)
+        .put(
+            &format!("recordings/{recording}"),
+            &file,
+            entry.conversation.as_deref(),
+        )
         .await;
     match sent {
         Ok(()) => {
