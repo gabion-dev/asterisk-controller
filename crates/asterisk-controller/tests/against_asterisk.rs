@@ -49,8 +49,9 @@ use node_protocol::{
         ApplicationMessage, ApplicationServiceMessage, Command, CommandOutcome, CommandRejection,
         ControllerMessage, DeclineReason, Departure, EndReason, Event, FallbackFailure,
         FallbackKind, NodeMessage, Opening, Origin, ParticipantId, ParticipantMedium,
-        ParticipantSnapshot, ParticipantState, RejectReason, Report, Request as ApplicationRequest,
-        RequestOutcome, RequestRejection, SegmentId, Settings,
+        ParticipantSnapshot, ParticipantState, RecordingId, RejectReason, Report,
+        Request as ApplicationRequest, RequestOutcome, RequestRejection, Retention, SegmentId,
+        Settings,
     },
 };
 use tokio::{
@@ -1054,11 +1055,20 @@ impl Phone {
 /// A connection the controller opened to the application of the test.
 type Connection = WebSocketStream<TcpStream>;
 
-/// The two queues connections wait in, by what they are for.
+/// The files of recordings the node sent, by recording.
+type Recordings = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
+
+/// The two queues connections wait in, by what they are for — and what
+/// the application keeps of the node's plain requests.
 #[derive(Clone)]
 struct Queues {
     conversations: mpsc::UnboundedSender<Connection>,
     services: mpsc::UnboundedSender<Connection>,
+    /// The files of recordings the node sent, by recording.
+    recordings: Recordings,
+    /// Whether the application refuses recordings right now — its storage
+    /// down, as it were.
+    refuses_recordings: Arc<AtomicBool>,
 }
 
 /// The application of the test: the place the controller opens its
@@ -1085,6 +1095,8 @@ impl Application {
         let queues = Queues {
             conversations,
             services,
+            recordings: Arc::default(),
+            refuses_recordings: Arc::default(),
         };
         let accepting = tokio::spawn(accept_connections(listener, queues.clone()));
         Ok(Self {
@@ -1124,6 +1136,32 @@ impl Application {
             .map_err(|_| "the controller did not open a service connection")?
             .ok_or_else(|| "the application stopped taking connections".into())
     }
+
+    /// The file of a recording, once the node has sent it — waited for,
+    /// since the node sends it after it says the recording is finished.
+    /// Taken: asked for again, it is waited for again.
+    async fn recording(&self, recording: &RecordingId) -> TestResult<Vec<u8>> {
+        timeout(STEP, async {
+            loop {
+                let mut kept = self.queues.recordings.lock().await;
+                if let Some(position) = kept.iter().position(|(id, _)| id == recording.as_str()) {
+                    return kept.swap_remove(position).1;
+                }
+                drop(kept);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .map_err(|_| format!("the node did not send recording {}", recording.as_str()).into())
+    }
+
+    /// From now on the application refuses the files of recordings, or
+    /// takes them again.
+    fn refuse_recordings(&self, refuse: bool) {
+        self.queues
+            .refuses_recordings
+            .store(refuse, Ordering::Relaxed);
+    }
 }
 
 /// Take the connections the controller opens, check that each proves the
@@ -1138,12 +1176,12 @@ async fn accept_connections(listener: TcpListener, queues: Queues) {
         let expected = expected.clone();
         tokio::spawn(async move {
             // A request that is not an upgrade to WebSocket is the node
-            // fetching a prompt.
+            // fetching a prompt or sending a recording.
             let Some(head) = request_head(&stream).await else {
                 return;
             };
             if !head.to_ascii_lowercase().contains("upgrade: websocket") {
-                serve_plain(stream, &head, &expected).await;
+                serve_plain(stream, &head, &expected, &queues).await;
                 return;
             }
             let path = Arc::new(std::sync::Mutex::new(String::new()));
@@ -1204,30 +1242,63 @@ async fn request_head(stream: &TcpStream) -> Option<String> {
     }
 }
 
-/// Answer a plain request: the audio of the test's prompt to the node that
-/// proves itself, nothing to anyone else.
-async fn serve_plain(mut stream: TcpStream, head: &str, expected: &str) {
+/// Answer a plain request of the node that proves itself: the audio of the
+/// test's prompt, or the taking of a recording's file — read whole, by its
+/// stated length, and kept; nothing to anyone else.
+async fn serve_plain(mut stream: TcpStream, head: &str, expected: &str, queues: &Queues) {
     let mut taken = vec![0_u8; head.len()];
     if stream.read_exact(&mut taken).await.is_err() {
         return;
     }
-    let proved = head.lines().any(|line| {
-        line.split_once(':').is_some_and(|(name, value)| {
-            name.eq_ignore_ascii_case("authorization") && value.trim() == expected
+    let header = |name: &str| {
+        head.lines().find_map(|line| {
+            line.split_once(':')
+                .filter(|(given, _)| given.eq_ignore_ascii_case(name))
+                .map(|(_, value)| value.trim().to_owned())
         })
-    });
-    let path = head.split_whitespace().nth(1).unwrap_or_default();
-    let (status, body) = match (proved, path) {
-        (false, _) => ("401 Unauthorized", Vec::new()),
-        (true, "/prompts/closed") => ("200 OK", prompt_audio()),
-        (true, _) => ("404 Not Found", Vec::new()),
     };
-    let answer = format!(
+    let proved = header("authorization").as_deref() == Some(expected);
+    let mut request = head.split_whitespace();
+    let (method, path) = (
+        request.next().unwrap_or_default(),
+        request.next().unwrap_or_default(),
+    );
+    let (status, body) = match (proved, method, path.strip_prefix("/recordings/")) {
+        (false, _, _) => ("401 Unauthorized", Vec::new()),
+        (true, "PUT", Some(recording)) => {
+            // A file without its length is not taken: the node always says it.
+            let Some(length) = header("content-length").and_then(|value| value.parse().ok()) else {
+                return answer(stream, "411 Length Required", &[]).await;
+            };
+            let mut file = vec![0_u8; length];
+            if timeout(STEP, stream.read_exact(&mut file)).await.is_err() {
+                return;
+            }
+            if queues.refuses_recordings.load(Ordering::Relaxed) {
+                ("503 Service Unavailable", Vec::new())
+            } else {
+                queues
+                    .recordings
+                    .lock()
+                    .await
+                    .push((recording.to_owned(), file));
+                ("204 No Content", Vec::new())
+            }
+        }
+        (true, "GET", _) if path == "/prompts/closed" => ("200 OK", prompt_audio()),
+        (true, _, _) => ("404 Not Found", Vec::new()),
+    };
+    answer(stream, status, &body).await;
+}
+
+/// Answer a plain request and close the connection.
+async fn answer(mut stream: TcpStream, status: &str, body: &[u8]) {
+    let head = format!(
         "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
-    let _ = stream.write_all(answer.as_bytes()).await;
-    let _ = stream.write_all(&body).await;
+    let _ = stream.write_all(head.as_bytes()).await;
+    let _ = stream.write_all(body).await;
 }
 
 /// The audio of the test's one prompt: a second of a steady tone, in the
@@ -3364,10 +3435,10 @@ async fn begins_to_play(owner: &mut Owner, id: u64, participant: &ParticipantId)
     if events.is_empty() {
         events.push(owner.next_event().await?);
     }
-    assert!(
-        matches!(events.as_slice(), [Event::PlaybackStarted { segment: started, .. }] if *started == segment),
-        "after `play` came {events:?}"
-    );
+    if !matches!(events.as_slice(), [Event::PlaybackStarted { segment: started, .. }] if *started == segment)
+    {
+        return Err(format!("after `play` came {events:?}").into());
+    }
     Ok(())
 }
 
@@ -4012,6 +4083,10 @@ async fn the_telephony_server_restarts_under_a_conversation(stand: &mut Stand) -
     let (_caller, _phone, mut owner) = stand.call_from_a_phone().await?;
     let first = hello(&mut owner).await?.first.id;
     owner.send(&ApplicationMessage::Accept)?;
+    // A recording cut short by Asterisk's death is readable up to where it
+    // stops; the owner is told it is finished, with that length.
+    let recording = recording_begins(&mut owner, 1).await?;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
 
     stand.kill_asterisk().await?;
     let lost = owner.next_event().await?;
@@ -4020,12 +4095,12 @@ async fn the_telephony_server_restarts_under_a_conversation(stand: &mut Stand) -
         "the owner was told {lost:?} when Asterisk died"
     );
     owner.command(
-        1,
+        2,
         Command::StopListening {
             participant: first.clone(),
         },
     )?;
-    let (outcome, _) = owner.outcome_of(1).await?;
+    let (outcome, _) = owner.outcome_of(2).await?;
     assert!(
         matches!(
             outcome,
@@ -4038,21 +4113,25 @@ async fn the_telephony_server_restarts_under_a_conversation(stand: &mut Stand) -
 
     stand.start_asterisk_again().await?;
     let mut told = Vec::new();
-    for _ in 0..3 {
+    for _ in 0..4 {
         told.push(owner.next_event().await?);
     }
     assert!(
         matches!(
             told.as_slice(),
             [
+                Event::RecordingFinished { recording: finished, length_ms },
                 Event::ParticipantLeft { participant, departure: Departure::Lost },
                 Event::TelephonyServerBack,
                 Event::ConversationEnded { reason: EndReason::LastParticipantLeft },
-            ] if *participant == first
+            ] if *finished == recording && *length_ms >= 500 && *participant == first
         ),
         "after Asterisk was back the owner was told {told:?}"
     );
     owner.closed().await?;
+    let audio = stand.application.recording(&recording).await?;
+    expect_recorded(&audio, &[("the caller", Phone::SAYS)]);
+    no_recording_is_left(stand, "after Asterisk was started again").await?;
     stand
         .expect_no_channels("after Asterisk was started again")
         .await
@@ -4243,6 +4322,264 @@ async fn a_call_asterisk_does_not_place(stand: &Stand) -> TestResult {
     ends_it(&mut owner, 3, 2).await?;
     stand
         .expect_no_channels("after a call Asterisk did not place")
+        .await
+}
+
+/// Bytes of the protocol's audio in one millisecond.
+const BYTES_PER_MS: u64 = 32;
+
+/// Start a recording: accepted with its identifier, and Asterisk's word
+/// that it is being written follows.
+async fn recording_begins(owner: &mut Owner, id: u64) -> TestResult<RecordingId> {
+    owner.command(
+        id,
+        Command::StartRecording {
+            retention: Retention::UntilReleased,
+        },
+    )?;
+    let (outcome, mut events) = owner.outcome_of(id).await?;
+    let CommandOutcome::AcceptedRecording { recording } = outcome else {
+        return Err(format!("`start_recording` was {outcome:?}").into());
+    };
+    if events.is_empty() {
+        events.push(owner.next_event().await?);
+    }
+    assert!(
+        matches!(events.as_slice(), [Event::RecordingStarted { recording: started }] if *started == recording),
+        "after `start_recording` came {events:?}"
+    );
+    Ok(recording)
+}
+
+/// Stop a recording: accepted, and Asterisk's word that it is written
+/// follows, with its length.
+async fn recording_ends(owner: &mut Owner, id: u64, recording: &RecordingId) -> TestResult<u64> {
+    owner.command(
+        id,
+        Command::StopRecording {
+            recording: recording.clone(),
+        },
+    )?;
+    let (outcome, mut events) = owner.outcome_of(id).await?;
+    assert!(
+        matches!(outcome, CommandOutcome::Accepted),
+        "`stop_recording` was {outcome:?}"
+    );
+    if events.is_empty() {
+        events.push(owner.next_event().await?);
+    }
+    match events.as_slice() {
+        [
+            Event::RecordingFinished {
+                recording: finished,
+                length_ms,
+            },
+        ] if finished == recording => Ok(*length_ms),
+        other => Err(format!("after `stop_recording` came {other:?}").into()),
+    }
+}
+
+/// What the controller says of a recording the application did not take.
+fn not_with_the_application(recording: &RecordingId) -> String {
+    format!(
+        "recording {} is not with the application yet",
+        recording.as_str()
+    )
+}
+
+/// Each voice is in a recording at full level, somewhere in it: the
+/// highest level of its tone over windows of a fifth of a second.
+fn expect_recorded(audio: &[u8], voices: &[(&str, u32)]) {
+    let samples = from_bytes(audio);
+    for (who, frequency) in voices {
+        let loudest = samples
+            .chunks(3200)
+            .map(|window| level(window, 16_000, *frequency))
+            .fold(0.0_f64, f64::max);
+        assert!(
+            loudest > 6000.0,
+            "{who} saying {frequency} Hz is in the recording at {loudest:.0} at the most"
+        );
+    }
+}
+
+/// The node ends up with no recording at all: no file Asterisk keeps, no
+/// bridge of a recording and no tap of one. Waited for: the node deletes
+/// the file once the application has it, and takes the bridge and the taps
+/// down a moment after it says the recording is finished.
+async fn no_recording_is_left(stand: &Stand, after: &str) -> TestResult {
+    let mut still = String::new();
+    let emptied = timeout(STEP, async {
+        loop {
+            still = stand.control.request("GET", "recordings/stored").await?.1;
+            for kind in ["channels", "bridges"] {
+                let listed = stand.control.request("GET", kind).await?.1;
+                if listed.contains(".record-") {
+                    still = format!("{kind} {listed}");
+                }
+            }
+            if still == "[]" {
+                return Ok::<(), Box<dyn Error>>(());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    match emptied {
+        Ok(result) => result,
+        Err(_) => Err(format!("{after}: Asterisk still has of recordings {still}").into()),
+    }
+}
+
+/// The application records the conversation: every voice is in the file
+/// once — the caller's, the application's, and that of a participant who
+/// was dialled and connected while the recording ran. The file reaches the
+/// application once the recording is written, and the node deletes its
+/// copy only then: a file the application refuses is sent again. A
+/// recording ends by itself with the last participant, before the
+/// conversation does.
+async fn the_conversation_is_recorded(stand: &Stand) -> TestResult {
+    let (_caller, mut phone, mut owner) = stand.call_from_a_phone().await?;
+    let first = hello(&mut owner).await?.first.id;
+    owner.send(&ApplicationMessage::Accept)?;
+
+    // A recording nobody started cannot be stopped.
+    owner.command(
+        1,
+        Command::StopRecording {
+            recording: "nobody".parse()?,
+        },
+    )?;
+    let (outcome, _) = owner.outcome_of(1).await?;
+    assert!(
+        matches!(
+            outcome,
+            CommandOutcome::Rejected {
+                reason: CommandRejection::UnknownRecording
+            }
+        ),
+        "stopping a recording nobody started was {outcome:?}"
+    );
+
+    let recording = recording_begins(&mut owner, 2).await?;
+    begins_to_play(&mut owner, 3, &first).await?;
+    phone.hears(1000, true).await?;
+    is_delivered(&mut owner).await?;
+    let (second, _network_end, telephone, mut second_phone) =
+        a_second_participant(stand, &mut owner).await?;
+    let participants = vec![first.clone(), second.clone()];
+    accepted(&mut owner, 11, Command::Connect { participants }).await?;
+    phone.hears(SECOND_SAYS, true).await?;
+    second_phone.hears(Phone::SAYS, true).await?;
+    let length_ms = recording_ends(&mut owner, 12, &recording).await?;
+    let audio = stand.application.recording(&recording).await?;
+    assert_eq!(
+        u64::try_from(audio.len())?,
+        length_ms * BYTES_PER_MS,
+        "the recording's length is not its file's"
+    );
+    assert!(length_ms > 2000, "a recording of {length_ms} ms");
+    expect_recorded(
+        &audio,
+        &[
+            ("the caller", Phone::SAYS),
+            ("the second participant", SECOND_SAYS),
+            ("the application", 1000),
+        ],
+    );
+    if !stand
+        .controller
+        .comes_to_say(&format!(
+            "recording {} is with the application",
+            recording.as_str()
+        ))
+        .await
+    {
+        return Err("the controller did not say the application took the recording".into());
+    }
+    no_recording_is_left(stand, "after a recording was taken").await?;
+    recordings_are_sent_again_and_end_with_the_people(stand, &mut owner, &telephone).await
+}
+
+/// The rest of [`the_conversation_is_recorded`]: a file the application
+/// refuses stays on the node and is sent again; a recording ends with the
+/// last participant, and the conversation waits for its end.
+async fn recordings_are_sent_again_and_end_with_the_people(
+    stand: &Stand,
+    owner: &mut Owner,
+    telephone: &str,
+) -> TestResult {
+    stand.application.refuse_recordings(true);
+    let refused = recording_begins(owner, 13).await?;
+    // Long enough to have something in it.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    recording_ends(owner, 14, &refused).await?;
+    if !stand
+        .controller
+        .comes_to_say(&not_with_the_application(&refused))
+        .await
+    {
+        return Err("the controller did not say the application refused a recording".into());
+    }
+    stand.application.refuse_recordings(false);
+    let again = stand.application.recording(&refused).await?;
+    assert!(!again.is_empty(), "a recording sent again arrived empty");
+    no_recording_is_left(stand, "after a refused recording was sent again").await?;
+
+    // A recording ends with the last participant, and the conversation
+    // waits for its end.
+    let last = recording_begins(owner, 15).await?;
+    let mut events = accepted(owner, 16, Command::End).await?;
+    while !matches!(events.last(), Some(Event::ConversationEnded { .. })) {
+        events.push(owner.next_event().await?);
+    }
+    let left = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                Event::ParticipantLeft {
+                    departure: Departure::Removed,
+                    ..
+                }
+            )
+        })
+        .count();
+    let finished = events.iter().any(
+        |event| matches!(event, Event::RecordingFinished { recording, .. } if *recording == last),
+    );
+    assert!(
+        events.len() == 4
+            && left == 2
+            && finished
+            && matches!(
+                events.last(),
+                Some(Event::ConversationEnded {
+                    reason: EndReason::EndedByHandler
+                })
+            ),
+        "after `end` under a recording came {events:?}"
+    );
+    owner.closed().await?;
+    stand.application.recording(&last).await?;
+
+    for gone in [
+        format!("channels/{telephone}"),
+        "bridges/the-second-phone".to_owned(),
+    ] {
+        stand.network.control.request("DELETE", &gone).await?;
+    }
+    no_recording_is_left(stand, "after a recorded conversation").await?;
+    stand
+        .expect_no_channels("after a recorded conversation")
+        .await?;
+    stand
+        .expect_no_bridges("after a recorded conversation")
+        .await?;
+    stand
+        .network
+        .control
+        .expect_none("channels", "after a recorded conversation")
         .await
 }
 
@@ -4612,9 +4949,12 @@ async fn the_node_without_its_controller(stand: &mut Stand) -> TestResult {
     )
     .await?;
 
+    let (kept_recording, unsent) = recordings_before_the_restart(stand, &mut owner).await?;
+
     let named_before = audio_path_names(stand).await?;
     stand.kill_the_controller().await?;
     owner.closed().await?;
+    stand.application.refuse_recordings(false);
 
     let transferred = asterisk_alone_gives_fallbacks(stand, &network_end).await?;
 
@@ -4627,27 +4967,9 @@ async fn the_node_without_its_controller(stand: &mut Stand) -> TestResult {
     );
     phone.hears(SECOND_SAYS, true).await?;
 
-    // A call that arrives a moment before a controller is started waits
-    // for it and is served; the conversation from before is carried on.
-    // Either may reach the application first.
+    let mut carried_on =
+        the_new_controller_serves_both(stand, [&first, &second], &kept_recording).await?;
     let network = &stand.network.control;
-    let waited = network.create_channel(&from_the_operator(DIALED)).await?;
-    stand.start_the_controller().await?;
-    let network = &stand.network.control;
-    let (mut carried_on, found, mut new) = both_conversations_offered(stand).await?;
-    let mut limits: Vec<(&str, u64)> = found
-        .iter()
-        .map(|snapshot| (snapshot.participant.id.as_str(), snapshot.hold_limit_ms))
-        .collect();
-    limits.sort_unstable();
-    assert_eq!(
-        limits,
-        [(first.as_str(), 0), (second.as_str(), SECOND_HOLD_LIMIT_MS)],
-        "the new controller did not find the hold limits the one before had"
-    );
-    new.send(&ApplicationMessage::Accept)?;
-    accepted(&mut new, 1, Command::End).await?;
-    network.reason_it_ended(&waited).await?;
 
     // The two from before are controlled by their new owner, which is sent
     // nothing the old controller's owner had asked for.
@@ -4673,7 +4995,8 @@ async fn the_node_without_its_controller(stand: &mut Stand) -> TestResult {
     begins_to_play(&mut carried_on, 3, &first).await?;
     phone.hears(1000, true).await?;
     is_delivered(&mut carried_on).await?;
-    ends_it(&mut carried_on, 4, 2).await?;
+    the_recording_outlived_the_controller(stand, &mut carried_on, &kept_recording).await?;
+    ends_it(&mut carried_on, 5, 2).await?;
 
     if !stand
         .controller
@@ -4683,6 +5006,14 @@ async fn the_node_without_its_controller(stand: &mut Stand) -> TestResult {
         return Err("the new controller did not remove what the old one had built".into());
     }
     the_new_controller_carries_on_the_service(stand).await?;
+    // The recording the old controller could not deliver is delivered by
+    // the new one, from the file it found listed.
+    let sent = stand.application.recording(&unsent).await?;
+    assert!(
+        !sent.is_empty(),
+        "a recording from before the restart arrived empty"
+    );
+    no_recording_is_left(stand, "after the node was without its controller").await?;
     for gone in [
         format!("channels/{transferred}"),
         format!("channels/{telephone}"),
@@ -4699,6 +5030,82 @@ async fn the_node_without_its_controller(stand: &mut Stand) -> TestResult {
     stand
         .expect_no_bridges("after the node was without its controller")
         .await
+}
+
+/// A call that arrives a moment before a controller is started waits for
+/// it and is served; the conversation from before is carried on, found with
+/// its two participants, their hold limits and its recording in progress.
+/// Either may reach the application first. Returns the owner of the
+/// conversation from before.
+async fn the_new_controller_serves_both(
+    stand: &mut Stand,
+    [first, second]: [&ParticipantId; 2],
+    recording: &RecordingId,
+) -> TestResult<Owner> {
+    let network = &stand.network.control;
+    let waited = network.create_channel(&from_the_operator(DIALED)).await?;
+    stand.start_the_controller().await?;
+    let network = &stand.network.control;
+    let (carried_on, found, recordings, mut new) = both_conversations_offered(stand).await?;
+    assert_eq!(
+        recordings.as_slice(),
+        std::slice::from_ref(recording),
+        "the new controller did not find the recording in progress"
+    );
+    let mut limits: Vec<(&str, u64)> = found
+        .iter()
+        .map(|snapshot| (snapshot.participant.id.as_str(), snapshot.hold_limit_ms))
+        .collect();
+    limits.sort_unstable();
+    assert_eq!(
+        limits,
+        [(first.as_str(), 0), (second.as_str(), SECOND_HOLD_LIMIT_MS)],
+        "the new controller did not find the hold limits the one before had"
+    );
+    new.send(&ApplicationMessage::Accept)?;
+    accepted(&mut new, 1, Command::End).await?;
+    network.reason_it_ended(&waited).await?;
+    Ok(carried_on)
+}
+
+/// Before the controller is killed: a recording that will be in progress
+/// through the restart, and one written but refused by the application —
+/// to be sent by the next controller. Returns both.
+async fn recordings_before_the_restart(
+    stand: &Stand,
+    owner: &mut Owner,
+) -> TestResult<(RecordingId, RecordingId)> {
+    let kept = recording_begins(owner, 5).await?;
+    stand.application.refuse_recordings(true);
+    let unsent = recording_begins(owner, 6).await?;
+    // Long enough to have something in it.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    recording_ends(owner, 7, &unsent).await?;
+    if !stand
+        .controller
+        .comes_to_say(&not_with_the_application(&unsent))
+        .await
+    {
+        return Err("the controller did not say the application refused a recording".into());
+    }
+    Ok((kept, unsent))
+}
+
+/// The recording begun before the restart is stopped by the new owner
+/// through the new controller, and has both participants in it.
+async fn the_recording_outlived_the_controller(
+    stand: &Stand,
+    owner: &mut Owner,
+    recording: &RecordingId,
+) -> TestResult {
+    let length_ms = recording_ends(owner, 4, recording).await?;
+    let audio = stand.application.recording(recording).await?;
+    assert_eq!(u64::try_from(audio.len())?, length_ms * BYTES_PER_MS);
+    expect_recorded(
+        &audio,
+        &[("the caller", Phone::SAYS), ("the second", SECOND_SAYS)],
+    );
+    Ok(())
 }
 
 /// The names of the channels and bridges of audio paths the node's Asterisk
@@ -4870,10 +5277,10 @@ async fn asterisk_recorded_it(stand: &Stand, dialed: &str, last: &str) -> TestRe
 /// The two conversation connections a restarted controller opens: for the
 /// conversation it found in Asterisk — two people, connected — and for the
 /// call that waited for it. Either may come first. The first comes with its
-/// participants as they were found.
+/// participants and its recordings as they were found.
 async fn both_conversations_offered(
     stand: &Stand,
-) -> TestResult<(Owner, Vec<ParticipantSnapshot>, Owner)> {
+) -> TestResult<(Owner, Vec<ParticipantSnapshot>, Vec<RecordingId>, Owner)> {
     let (mut carried_on, mut new) = (None, None);
     for _ in 0..2 {
         let mut owner = Owner::accept(&stand.application).await?;
@@ -4883,6 +5290,7 @@ async fn both_conversations_offered(
                     Opening::Resumed {
                         participants,
                         connected,
+                        recordings,
                         ..
                     },
                 ..
@@ -4895,7 +5303,7 @@ async fn both_conversations_offered(
                         && matches!(connected.as_slice(), [group] if group.len() == 2),
                     "the conversation from before was found as {participants:?}, connected {connected:?}"
                 );
-                carried_on = Some((owner, participants));
+                carried_on = Some((owner, participants, recordings));
             }
             ControllerMessage::Hello {
                 opening: Opening::Started { .. },
@@ -4910,7 +5318,9 @@ async fn both_conversations_offered(
         }
     }
     match (carried_on, new) {
-        (Some((carried_on, found)), Some(new)) => Ok((carried_on, found, new)),
+        (Some((carried_on, found, recordings)), Some(new)) => {
+            Ok((carried_on, found, recordings, new))
+        }
         _ => Err("the new controller did not offer both conversations".into()),
     }
 }
@@ -5199,6 +5609,7 @@ async fn every_scenario(stand: &Stand) -> TestResult {
     a_request_identifier_used_twice(stand).await?;
     the_application_connects_participants(stand).await?;
     two_groups_are_merged(stand).await?;
+    the_conversation_is_recorded(stand).await?;
     audio_that_stops_arriving(stand).await?;
     a_call_asterisk_does_not_place(stand).await?;
     a_step_refused_for_one_who_stays(stand).await?;

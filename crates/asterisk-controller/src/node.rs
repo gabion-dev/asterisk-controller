@@ -9,7 +9,10 @@ use std::{
 
 use node_protocol::messages::Line;
 
-use crate::{application::Application, config::Config, media, reports::Journal, settings::Applied};
+use crate::{
+    application::Application, config::Config, media, recordings, reports::Journal,
+    settings::Applied,
+};
 
 /// The node, as its conversations see it.
 pub struct Node {
@@ -30,6 +33,9 @@ pub struct Node {
     pub applied: RwLock<Arc<Applied>>,
     /// What the node did on its own and the application has not received.
     pub reports: Journal,
+    /// The recordings of the node's conversations that the application
+    /// does not have yet.
+    pub recordings: recordings::Outbox,
     /// Where media connections meet the conversations that asked for them.
     pub door: media::Door,
     /// How busy each outbound line is.

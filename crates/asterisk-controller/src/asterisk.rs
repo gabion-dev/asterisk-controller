@@ -91,8 +91,9 @@ pub enum FromAsterisk {
 struct Routes {
     /// Conversations, by identifier.
     conversations: HashMap<String, mpsc::UnboundedSender<FromAsterisk>>,
-    /// Which conversation owns a channel, by the channel's identifier.
-    channels: HashMap<String, String>,
+    /// Which conversation each subject of Asterisk's messages belongs to:
+    /// by a channel's identifier, or a recording's name.
+    subjects: HashMap<String, String>,
 }
 
 /// Asterisk's control interface, as the controller uses it.
@@ -202,8 +203,46 @@ impl Asterisk {
         }
     }
 
-    /// Give a conversation its line to Asterisk, with the channels it has.
-    fn open_line(self: &Arc<Self>, conversation: &str, channels: &[&str]) -> Line {
+    /// Whether Asterisk is writing the recording of this name now.
+    ///
+    /// # Errors
+    ///
+    /// Asterisk could not be asked, or answered neither yes nor no.
+    pub async fn recording_is_live(&self, name: &str) -> Result<bool, String> {
+        let (status, body) = self
+            .request("GET", &format!("recordings/live/{}", ari::query(name)))
+            .await?;
+        match status {
+            200 => Ok(true),
+            404 => Ok(false),
+            other => Err(format!(
+                "Asterisk answered {other} when asked whether recording {name} is live: {body}"
+            )),
+        }
+    }
+
+    /// Delete the file of a recording Asterisk has written. One that is not
+    /// there is deleted already.
+    ///
+    /// # Errors
+    ///
+    /// Asterisk could not be asked, or refused.
+    pub async fn delete_stored_recording(&self, name: &str) -> Result<(), String> {
+        let (status, body) = self
+            .request("DELETE", &format!("recordings/stored/{}", ari::query(name)))
+            .await?;
+        if (200..=299).contains(&status) || status == 404 {
+            Ok(())
+        } else {
+            Err(format!(
+                "Asterisk answered {status} when asked to delete recording {name}: {body}"
+            ))
+        }
+    }
+
+    /// Give a conversation its line to Asterisk, with the channels and
+    /// recordings it has.
+    fn open_line(self: &Arc<Self>, conversation: &str, subjects: &[&str]) -> Line {
         let (to_conversation, inbox) = mpsc::unbounded_channel();
         let (requests, mut asked) = mpsc::unbounded_channel::<Asked>();
         {
@@ -211,10 +250,10 @@ impl Asterisk {
             routes
                 .conversations
                 .insert(conversation.to_owned(), to_conversation.clone());
-            for channel in channels {
+            for subject in subjects {
                 routes
-                    .channels
-                    .insert((*channel).to_owned(), conversation.to_owned());
+                    .subjects
+                    .insert((*subject).to_owned(), conversation.to_owned());
             }
         }
         // The conversation's requests, one after another. This outlives the
@@ -281,14 +320,15 @@ impl Line {
             .send((request.to_owned(), method.to_owned(), uri.to_owned(), body));
     }
 
-    /// From now on what Asterisk says about `channel` is for this
-    /// conversation. Said before the channel is asked for, so that not a
+    /// From now on what Asterisk says about `subject` — a channel, by its
+    /// identifier, or a recording, by its name — is for this conversation.
+    /// Said before the channel or recording is asked for, so that not a
     /// word about it goes astray.
-    pub fn own(&self, channel: &str) {
+    pub fn own(&self, subject: &str) {
         self.asterisk
             .routes()
-            .channels
-            .insert(channel.to_owned(), self.conversation.clone());
+            .subjects
+            .insert(subject.to_owned(), self.conversation.clone());
     }
 
     /// What Asterisk says next.
@@ -311,7 +351,7 @@ impl Drop for Line {
         if still_ours {
             routes.conversations.remove(&self.conversation);
             routes
-                .channels
+                .subjects
                 .retain(|_, conversation| *conversation != self.conversation);
         }
     }
@@ -409,16 +449,14 @@ async fn connected(node: &Arc<Node>, asterisk: &Arc<Asterisk>) -> Result<Ended, 
     // answer about their channel, which each carried-on conversation asks
     // for first.
     for found in found.into_values() {
-        let channels: Vec<&str> = found
-            .members
-            .iter()
-            .map(|member| member.channel.as_str())
-            .collect();
-        let line = asterisk.open_line(&found.id, &channels);
+        let subjects: Vec<&str> = found.subjects().collect();
+        let line = asterisk.open_line(&found.id, &subjects);
         eprintln!(
-            "asterisk-controller: carrying on conversation {}, found with {} participants",
+            "asterisk-controller: carrying on conversation {}, found with {} participants and \
+             {} recordings",
             found.id,
-            found.members.len()
+            found.members.len(),
+            found.recordings.len()
         );
         tokio::spawn(conversation::carry_on(found, line, Arc::clone(node)));
     }
@@ -439,7 +477,8 @@ async fn connected(node: &Arc<Node>, asterisk: &Arc<Asterisk>) -> Result<Ended, 
 
 /// Read what is in the node's application and sort it: the channels of
 /// participants, by the conversation each belongs to, with the groups
-/// their bridges make — and everything else, which is removed.
+/// their bridges make and the recordings still being written of them, with
+/// their taps — and everything else, which is removed.
 ///
 /// Read while nobody is connected for the application ([`connected`]):
 /// nothing can enter it then, so what is found is exactly what a controller
@@ -462,6 +501,8 @@ async fn take_over(asterisk: &Asterisk) -> Result<Vec<conversation::Found>, Stri
 
     let mut found: HashMap<String, conversation::Found> = HashMap::new();
     let mut leftovers = Vec::new();
+    // Taps of recordings: placed once the recordings are known.
+    let mut taps = Vec::new();
     for channel in &application.channel_ids {
         let path = format!("channels/{}", ari::query(channel));
         let (status, body) = asterisk.request("GET", &path).await?;
@@ -469,20 +510,13 @@ async fn take_over(asterisk: &Asterisk) -> Result<Vec<conversation::Found>, Stri
             // Gone meanwhile.
             continue;
         }
+        if let Some(tap) = conversation::record_tap_of(channel) {
+            taps.push((channel.clone(), tap));
+            continue;
+        }
         let described = ari::read_channel(&body)
             .map_err(|error| format!("it described channel {channel} unreadably: {error}"))?;
-        let mut notes = HashMap::new();
-        for name in conversation::NOTES {
-            let (status, body) = asterisk
-                .request("GET", &format!("{path}/variable?variable={name}"))
-                .await?;
-            if status == 200
-                && let Ok(value) = ari::read_variable(&body)
-                && !value.is_empty()
-            {
-                notes.insert(*name, value);
-            }
-        }
+        let notes = notes_on(asterisk, &path).await?;
         match conversation::found(&described, &notes) {
             Some((conversation, origin, member)) => {
                 found
@@ -495,25 +529,13 @@ async fn take_over(asterisk: &Asterisk) -> Result<Vec<conversation::Found>, Stri
         }
     }
     for bridge in &application.bridge_ids {
-        let path = format!("bridges/{}", ari::query(bridge));
-        let Some(conversation) = conversation::group_of(bridge) else {
-            leftovers.push(path);
-            continue;
-        };
-        let Some(found) = found.get_mut(&conversation) else {
-            leftovers.push(path);
-            continue;
-        };
-        let (status, body) = asterisk.request("GET", &path).await?;
-        if status != 200 {
-            continue;
+        if !sort_bridge(asterisk, bridge, &mut found).await? {
+            leftovers.push(format!("bridges/{}", ari::query(bridge)));
         }
-        let described = ari::read_bridge(&body)
-            .map_err(|error| format!("it described bridge {bridge} unreadably: {error}"))?;
-        for member in &mut found.members {
-            if described.channels.contains(&member.channel) {
-                member.group = Some(bridge.clone());
-            }
+    }
+    for (channel, tap) in taps {
+        if !conversation::place_tap(&mut found, &channel, tap) {
+            leftovers.push(format!("channels/{}", ari::query(&channel)));
         }
     }
     for leftover in leftovers {
@@ -523,11 +545,76 @@ async fn take_over(asterisk: &Asterisk) -> Result<Vec<conversation::Found>, Stri
     Ok(found.into_values().collect())
 }
 
+/// What a controller before this one wrote on a channel.
+async fn notes_on(
+    asterisk: &Asterisk,
+    channel_path: &str,
+) -> Result<HashMap<&'static str, String>, String> {
+    let mut notes = HashMap::new();
+    for name in conversation::NOTES {
+        let (status, body) = asterisk
+            .request("GET", &format!("{channel_path}/variable?variable={name}"))
+            .await?;
+        if status == 200
+            && let Ok(value) = ari::read_variable(&body)
+            && !value.is_empty()
+        {
+            notes.insert(*name, value);
+        }
+    }
+    Ok(notes)
+}
+
+/// Sort one bridge found in the application: the bridge of a group of a
+/// found conversation marks its members as connected; the bridge of a
+/// recording of a found conversation that Asterisk is still writing is the
+/// recording's. Returns whether the bridge is anyone's.
+async fn sort_bridge(
+    asterisk: &Asterisk,
+    bridge: &str,
+    found: &mut HashMap<String, conversation::Found>,
+) -> Result<bool, String> {
+    if let Some((conversation, recording)) = conversation::recording_of(bridge) {
+        let Some(found) = found.get_mut(&conversation) else {
+            return Ok(false);
+        };
+        if !asterisk.recording_is_live(&recording).await? {
+            return Ok(false);
+        }
+        found.recordings.push(conversation::FoundRecording {
+            id: recording,
+            bridge: bridge.to_owned(),
+            taps: Vec::new(),
+        });
+        return Ok(true);
+    }
+    let Some(conversation) = conversation::group_of(bridge) else {
+        return Ok(false);
+    };
+    let Some(found) = found.get_mut(&conversation) else {
+        return Ok(false);
+    };
+    let path = format!("bridges/{}", ari::query(bridge));
+    let (status, body) = asterisk.request("GET", &path).await?;
+    if status != 200 {
+        // Gone meanwhile.
+        return Ok(true);
+    }
+    let described = ari::read_bridge(&body)
+        .map_err(|error| format!("it described bridge {bridge} unreadably: {error}"))?;
+    for member in &mut found.members {
+        if described.channels.contains(&member.channel) {
+            member.group = Some(bridge.to_owned());
+        }
+    }
+    Ok(true)
+}
+
 /// Pass what Asterisk said to whom it is for.
 fn pass_on(node: &Arc<Node>, asterisk: &Arc<Asterisk>, message: ari::Message) {
     let owner = message
-        .channel()
-        .and_then(|channel| asterisk.routes().channels.get(channel).cloned());
+        .subject()
+        .and_then(|subject| asterisk.routes().subjects.get(subject).cloned());
     if let Some(conversation) = owner {
         if let Some(to_conversation) = asterisk.routes().conversations.get(&conversation) {
             // A conversation that has just ended no longer listens.

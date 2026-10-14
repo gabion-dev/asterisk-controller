@@ -23,7 +23,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     config::{Config, SipTls},
-    destination, media, prompts, state_files,
+    destination, media, prompts, recordings, state_files,
 };
 
 /// The Asterisk versions this controller knows how to drive. What Asterisk
@@ -33,7 +33,7 @@ use crate::{
 const KNOWN_ASTERISK_VERSIONS: &[&str] = &["22.11.0"];
 
 /// The modules of the Asterisk build this controller is checked against —
-/// release `22.11.0-r2` of gabion-dev/asterisk-server, the one
+/// release `22.11.0-r3` of gabion-dev/asterisk-server, the one
 /// `scripts/fetch-asterisk.sh` fetches — on every platform, apart from the
 /// timer, which is each platform's own ([`TIMING_MODULE`]).
 ///
@@ -240,7 +240,7 @@ fn known_modules(record: &Path, modules: &[String]) -> Result<(), String> {
     }
     let mut problem = format!(
         "{} is not the Asterisk build this controller is checked against \
-         (release 22.11.0-r2 of gabion-dev/asterisk-server):",
+         (release 22.11.0-r3 of gabion-dev/asterisk-server):",
         record.display()
     );
     if !unknown.is_empty() {
@@ -364,13 +364,15 @@ pub fn write(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(failed(&etc, error)),
     }
-    // Asterisk looks for keys in a `keys` directory inside its key directory.
+    // Asterisk looks for keys in a `keys` directory inside its key directory,
+    // and writes recordings into a `recording` directory inside its spool
+    // directory, which it does not make.
     let call_records = format!("log/{CALL_RECORDS}");
     for directory in [
         "etc",
         "db",
         "keys/keys",
-        "spool",
+        recordings::SPOOL,
         "run",
         call_records.as_str(),
         "cache",
@@ -1029,7 +1031,7 @@ mod tests {
             .unwrap_or_default();
         assert!(
             lacking.contains("lacks modules the controller drives (chan_bridge_media.so)")
-                && lacking.contains("22.11.0-r2"),
+                && lacking.contains("22.11.0-r3"),
             "{lacking:?}"
         );
         Ok(())

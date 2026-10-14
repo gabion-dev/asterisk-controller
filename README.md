@@ -41,8 +41,9 @@ The node opens its outside connections itself:
   gives: one WebSocket connection for each conversation
   (`<address>/conversation`) and one standing service connection
   (`<address>/service`). For each prompt it needs it also makes a one-off
-  `GET <address>/prompts/<identifier>` — over HTTPS when the address is
-  `wss://`, over plain HTTP when it is `ws://`;
+  `GET <address>/prompts/<identifier>`, and for each recording it has
+  written a `PUT <address>/recordings/<identifier>` with the file — over
+  HTTPS when the address is `wss://`, over plain HTTP when it is `ws://`;
 - Asterisk connects to the operators, for outbound calls and transfers.
 
 The application needs no open port towards the node. Every connection to it
@@ -63,7 +64,7 @@ You need:
   drives only that build: it reads the version and the list of modules from
   `<tree>/BUILD-INFO.txt` and does not start with another version, with
   other modules than that build's, or without that file.
-  `scripts/fetch-asterisk.sh` fetches that tree — release `22.11.0-r2` of
+  `scripts/fetch-asterisk.sh` fetches that tree — release `22.11.0-r3` of
   [gabion-dev/asterisk-server](https://github.com/gabion-dev/asterisk-server),
   for Linux (x86_64, aarch64) and macOS (arm64, x86_64) — checks its pinned
   SHA-256 and unpacks it into `target/asterisk-server`. The tree is only read;
@@ -201,11 +202,14 @@ The controller writes:
   application has not yet confirmed;
 - `prompts/<sha256>.sln16` — the audio of prompts, fetched from the
   application and checked against their SHA-256; a prompt the settings no
-  longer name is removed.
+  longer name is removed;
+- `recordings/<identifier>` — the list of recordings the application does
+  not have yet (see [Recordings](#recordings)).
 
-It also creates `db/`, `keys/keys/`, `spool/`, `run/`, `log/` and `cache/`
-for Asterisk, and names them in `etc/asterisk.conf`. Every file the
-controller writes is readable by its owner alone (mode 0600).
+It also creates `db/`, `keys/keys/`, `spool/recording/`, `run/`,
+`log/cdr-csv/` and `cache/` for Asterisk, and names them in
+`etc/asterisk.conf`; Asterisk writes recordings into `spool/recording/`.
+Every file the controller writes is readable by its owner alone (mode 0600).
 
 The state directory holds secrets: the control password in `control-secret`
 and `etc/ari.conf`, the operators' passwords in `etc/pjsip.conf` and
@@ -249,7 +253,14 @@ Lines that say something is wrong:
 - `asterisk-controller: prompt "<identifier>" is not here; …` — until it is
   fetched, a message fallback with it does not answer the caller and turns
   them away as a temporary failure (cause 41);
-- `conversation <id>: FAILED — <reason>` — a conversation could not go on.
+- `conversation <id>: FAILED — <reason>` — a conversation could not go on;
+- `conversation <id>: recording <id> FAILED — <reason>` — a recording could
+  not be made, or made no further; the application is told;
+- `asterisk-controller: recording <id> is not with the application yet — <reason>`
+  — the file stays on the node and is sent again; then
+  `asterisk-controller: recording <id> is with the application`;
+- `asterisk-controller: RECORDING <id> IS LOST — …` — the file of a
+  recording is not on the node when it is to be sent.
 
 While the controller keeps trying to reach Asterisk, the application or an
 instance for a conversation, it says the reason once, and again only when the
@@ -298,9 +309,10 @@ Restarting the controller is up to whoever runs the node.
 ### When the controller is started again
 
 A controller started next to a running Asterisk finds the calls left in it and
-offers each conversation to the application as it is now. What the controller
-before it had built for audio is removed and built anew when the application
-asks; reports it left unconfirmed are sent again.
+offers each conversation to the application as it is now, its recordings in
+progress included. What the controller before it had built for audio is
+removed and built anew when the application asks; reports it left
+unconfirmed, and recordings it left unsent, are sent again.
 
 ### When Asterisk stops
 
@@ -312,6 +324,22 @@ telephony server is lost, audio paths end, and commands are refused until
 it is back. When Asterisk is found again, a participant whose call ended
 meanwhile leaves with the departure `lost`, the owner is told the server is
 back, and a conversation with nobody left ends.
+
+### Recordings
+
+The application can record a conversation. The node records every voice in
+it once — the participants' and the application's own, whoever is connected
+to whom — into one file in the protocol's audio format, raw 16-bit linear
+PCM at 16 kHz. A recording lasts until the application stops it or the last
+participant is gone; a conversation does not end while it is being written.
+When it is written, the node sends the file to the application,
+`PUT <address>/recordings/<identifier>`, with its length and the node's
+credentials, and deletes its copy only once the application has answered
+2xx: a file the application refuses or cannot be given stays on the node and
+is sent again — when the application next welcomes the node, and every 10
+seconds. A controller started again carries on the recordings in progress
+and sends the ones left unsent. How long a recording is kept is the
+application's business, once it has the file.
 
 ### Calls the application places
 
@@ -407,9 +435,9 @@ uploads; it needs `SIGNING_KEY` (an armored private key) and
 
 ## Status
 
-Early development; no release has been published. Not built yet: recording;
-the application's requests for browser call legs and device facts; calls
-from user endpoints and web passes; operators that require registration.
+Early development; pre-releases only. Not built yet: the application's
+requests for browser call legs and device facts; calls from user endpoints
+and web passes; operators that require registration.
 
 ## License
 

@@ -18,8 +18,9 @@
 //! certificate is judged against the roots the machine trusts.
 //!
 //! The same address and credentials serve the node's plain requests: the
-//! audio of a prompt is fetched from `<address>/prompts/<identifier>`, over
-//! HTTPS when the address is `wss://`.
+//! audio of a prompt is fetched from `<address>/prompts/<identifier>`, and
+//! the file of a recording is sent to `<address>/recordings/<identifier>`,
+//! over HTTPS when the address is `wss://`.
 //!
 //! Liveness is the protocol's: each side sends a ping at least every
 //! [`PING_EVERY`] and counts a connection lost after [`SILENCE_LIMIT`] with
@@ -30,17 +31,18 @@
 use std::{fs, io::ErrorKind, path::Path, sync::Arc, time::Duration};
 
 use data_encoding::BASE64;
-use http_body_util::{BodyExt, Empty, Limited};
+use futures_util::stream;
+use http_body_util::{BodyExt, Empty, Limited, StreamBody};
 use hyper::{
     Request, Uri,
-    body::Bytes,
+    body::{Body, Bytes, Frame},
     client::conn::http1,
-    header::{CONNECTION, HOST},
+    header::{CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, HOST},
 };
 use hyper_util::rt::TokioIo;
 use rustls::pki_types::ServerName;
 use tokio::{
-    io::{AsyncRead, AsyncWrite},
+    io::{AsyncRead, AsyncReadExt as _, AsyncWrite},
     net::TcpStream,
 };
 use tokio_rustls::TlsConnector;
@@ -66,6 +68,16 @@ pub const PING_EVERY: Duration = Duration::from_secs(10);
 /// How long a connection may be silent before it is counted lost.
 pub const SILENCE_LIMIT: Duration = Duration::from_secs(30);
 
+/// The slowest a file is expected to travel to the application, in bytes a
+/// second: about a megabit a second. A file is given [`SILENCE_LIMIT`] plus
+/// the time it takes at this speed — an hour of the protocol's audio, some
+/// 115 megabytes, about fifteen minutes — before the node gives up on the
+/// attempt and tries again later.
+const SLOWEST_SEND: u64 = 128 * 1024;
+
+/// How much of a file is read and sent at a time.
+const SEND_CHUNK: usize = 64 * 1024;
+
 /// What a connection is opened for: the end of the application it goes to.
 #[derive(Clone, Copy, Debug)]
 pub enum Endpoint {
@@ -83,6 +95,14 @@ impl Endpoint {
         }
     }
 }
+
+/// A plain connection to the application, inside TLS or not.
+type Plain = Box<dyn Stream>;
+
+/// What a plain connection is made of, whatever carries it.
+trait Stream: AsyncRead + AsyncWrite + Unpin + Send {}
+
+impl<S: AsyncRead + AsyncWrite + Unpin + Send> Stream for S {}
 
 /// Where the application is and how the node proves itself to it.
 pub struct Application {
@@ -160,33 +180,25 @@ impl Application {
     pub async fn fetch(&self, path: &str, largest: usize) -> Result<Vec<u8>, String> {
         let url = format!("{}/{path}", self.address);
         let failed = |problem: &dyn std::fmt::Display| format!("{url}: {problem}");
-        let address: Uri = self.address.parse().map_err(|error| failed(&error))?;
-        let host = address.host().ok_or_else(|| failed(&"no host"))?.to_owned();
-        let port = address
-            .port_u16()
-            .unwrap_or(if self.tls.is_some() { 443 } else { 80 });
-        let target = format!("{}/{path}", address.path().trim_end_matches('/'));
         let fetching = async {
-            let host_only = host.trim_start_matches('[').trim_end_matches(']');
-            let stream = TcpStream::connect((host_only, port))
-                .await
-                .map_err(|error| failed(&error))?;
-            match &self.tls {
-                Some(tls) => {
-                    let name = ServerName::try_from(host_only.to_owned())
-                        .map_err(|error| failed(&error))?;
-                    let stream = TlsConnector::from(Arc::clone(tls))
-                        .connect(name, stream)
-                        .await
-                        .map_err(|error| failed(&error))?;
-                    self.get(stream, &host, &target, largest).await
-                }
-                None => self.get(stream, &host, &target, largest).await,
+            let (stream, host, target) = self.connect(path).await?;
+            let request = self
+                .request("GET", &host, &target)
+                .body(Empty::<Bytes>::new())
+                .map_err(|error| error.to_string())?;
+            let response = send(stream, request).await?;
+            let status = response.status();
+            if status != hyper::StatusCode::OK {
+                return Err(format!("the application answered {status}"));
             }
-            .map_err(|problem| failed(&problem))
+            let body = Limited::new(response.into_body(), largest)
+                .collect()
+                .await
+                .map_err(|error| format!("{error} (more than {largest} bytes?)"))?;
+            Ok(body.to_bytes().to_vec())
         };
         match tokio::time::timeout(SILENCE_LIMIT, fetching).await {
-            Ok(fetched) => fetched,
+            Ok(fetched) => fetched.map_err(|problem| failed(&problem)),
             Err(_) => Err(failed(&format!(
                 "no answer within {} seconds",
                 SILENCE_LIMIT.as_secs()
@@ -194,44 +206,128 @@ impl Application {
         }
     }
 
-    /// One GET request on an open stream.
-    async fn get<S>(
-        &self,
-        stream: S,
-        host: &str,
-        target: &str,
-        largest: usize,
-    ) -> Result<Vec<u8>, String>
-    where
-        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-    {
-        let (mut sender, connection) = http1::handshake(TokioIo::new(stream))
+    /// Send a file to the application, `PUT <address>/<path>`: the file's
+    /// bytes as the body, with their length, within [`SILENCE_LIMIT`] plus
+    /// the time the file takes at [`SLOWEST_SEND`]. The application's 2xx
+    /// says it has the file.
+    ///
+    /// # Errors
+    ///
+    /// The file cannot be read, the application cannot be reached, answers
+    /// otherwise than 2xx, or takes too long; the reason, in words.
+    pub async fn put(&self, path: &str, file: &Path) -> Result<(), String> {
+        let url = format!("{}/{path}", self.address);
+        let failed = |problem: &dyn std::fmt::Display| format!("{url}: {problem}");
+        let length = tokio::fs::metadata(file)
+            .await
+            .map_err(|error| format!("{}: {error}", file.display()))?
+            .len();
+        let limit = SILENCE_LIMIT + Duration::from_secs(length / SLOWEST_SEND);
+        let sending = async {
+            let opened = tokio::fs::File::open(file)
+                .await
+                .map_err(|error| format!("{}: {error}", file.display()))?;
+            let (stream, host, target) = self.connect(path).await?;
+            let request = self
+                .request("PUT", &host, &target)
+                .header(CONTENT_LENGTH, length)
+                .header(CONTENT_TYPE, "application/octet-stream")
+                .body(StreamBody::new(chunks_of(opened)))
+                .map_err(|error| error.to_string())?;
+            let status = send(stream, request).await?.status();
+            if status.is_success() {
+                Ok(())
+            } else {
+                Err(format!("the application answered {status}"))
+            }
+        };
+        match tokio::time::timeout(limit, sending).await {
+            Ok(sent) => sent.map_err(|problem| failed(&problem)),
+            Err(_) => Err(failed(&format!(
+                "not taken within {} seconds",
+                limit.as_secs()
+            ))),
+        }
+    }
+
+    /// Open a plain connection to the application for one request to
+    /// `<address>/<path>`. Returns the connection, the host as the request
+    /// names it and the request's target.
+    async fn connect(&self, path: &str) -> Result<(Plain, String, String), String> {
+        let address: Uri = self.address.parse().map_err(|error| format!("{error}"))?;
+        let host = address.host().ok_or("no host")?.to_owned();
+        let port = address
+            .port_u16()
+            .unwrap_or(if self.tls.is_some() { 443 } else { 80 });
+        let target = format!("{}/{path}", address.path().trim_end_matches('/'));
+        let host_only = host.trim_start_matches('[').trim_end_matches(']');
+        let stream = TcpStream::connect((host_only, port))
             .await
             .map_err(|error| error.to_string())?;
-        // The connection is driven beside the request and ends with it.
-        tokio::spawn(connection);
-        let request = Request::builder()
-            .method("GET")
+        let plain: Plain = match &self.tls {
+            Some(tls) => {
+                let name = ServerName::try_from(host_only.to_owned())
+                    .map_err(|error| error.to_string())?;
+                let secured = TlsConnector::from(Arc::clone(tls))
+                    .connect(name, stream)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                Box::new(secured)
+            }
+            None => Box::new(stream),
+        };
+        Ok((plain, host, target))
+    }
+
+    /// The head of one request on a connection that ends with it.
+    fn request(&self, method: &str, host: &str, target: &str) -> hyper::http::request::Builder {
+        Request::builder()
+            .method(method)
             .uri(target)
             .header(HOST, host)
             .header(AUTHORIZATION, self.authorization.clone())
             .header(CONNECTION, "close")
-            .body(Empty::<Bytes>::new())
-            .map_err(|error| error.to_string())?;
-        let response = sender
-            .send_request(request)
-            .await
-            .map_err(|error| error.to_string())?;
-        let status = response.status();
-        if status != hyper::StatusCode::OK {
-            return Err(format!("the application answered {status}"));
-        }
-        let body = Limited::new(response.into_body(), largest)
-            .collect()
-            .await
-            .map_err(|error| format!("{error} (more than {largest} bytes?)"))?;
-        Ok(body.to_bytes().to_vec())
     }
+}
+
+/// Make one request on an open connection and return the response, its
+/// body unread.
+async fn send<B>(
+    stream: Plain,
+    request: Request<B>,
+) -> Result<hyper::Response<hyper::body::Incoming>, String>
+where
+    B: Body + Send + 'static,
+    B::Data: Send,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    let (mut sender, connection) = http1::handshake(TokioIo::new(stream))
+        .await
+        .map_err(|error| error.to_string())?;
+    // The connection is driven beside the request and ends with it.
+    tokio::spawn(connection);
+    sender
+        .send_request(request)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+/// A file as the body of a request: read and sent a chunk at a time, never
+/// whole in memory — a recording may be hundreds of megabytes.
+fn chunks_of(
+    file: tokio::fs::File,
+) -> impl futures_util::Stream<Item = Result<Frame<Bytes>, std::io::Error>> + Send {
+    stream::unfold(file, |mut file| async move {
+        let mut chunk = vec![0_u8; SEND_CHUNK];
+        match file.read(&mut chunk).await {
+            Ok(0) => None,
+            Ok(read) => {
+                chunk.truncate(read);
+                Some((Ok(Frame::data(Bytes::from(chunk))), file))
+            }
+            Err(error) => Some((Err(error), file)),
+        }
+    })
 }
 
 /// Read the node's secret from the state directory.

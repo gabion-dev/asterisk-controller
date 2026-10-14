@@ -147,6 +147,9 @@ impl<'a> Service<'a> {
                     {
                         eprintln!("asterisk-controller: {problem}");
                     }
+                    // Recordings the application did not take while it was
+                    // away are sent now.
+                    node.recordings.wake();
                     return Ok(service);
                 }
                 ApplicationServiceMessage::Refuse { reason } => {

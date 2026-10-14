@@ -26,6 +26,15 @@
 //! the participant alone hears, on top of the others. The media channel and
 //! its connection stay as they are, so the application sees no change.
 //!
+//! A recording the application asks for is a bridge of its own in Asterisk,
+//! fed by a tap on every participant and on every media channel of the
+//! conversation and written as a whole: every voice once, the application's
+//! included, whoever is connected to whom. Asterisk writes the file; when it
+//! is written to its end the node sends it to the application
+//! ([`crate::recordings`]). A conversation lasts while a recording of it is
+//! being written, and a recording lasts while the conversation does — not
+//! while its owner does.
+//!
 //! A conversation outlives the controller too. What only the controller
 //! knows of a participant — which conversation they are in, who they are
 //! in it, where it came from, how long they are held when their audio is
@@ -58,8 +67,8 @@ use node_protocol::{
         ApplicationMessage, Command, CommandOutcome, CommandRejection, ControllerMessage,
         ConversationId, Departure, EndReason, EntryKey, Event, Fallback, FallbackFailure,
         FallbackKind, LineId, Opening, Origin, Participant, ParticipantId, ParticipantMedium,
-        ParticipantSnapshot, ParticipantState as StateTold, PhoneNumber, RejectReason, Report,
-        RequestOutcome, RequestRejection, SegmentId,
+        ParticipantSnapshot, ParticipantState as StateTold, PhoneNumber, RecordingId, RejectReason,
+        Report, RequestOutcome, RequestRejection, SegmentId,
     },
 };
 use tokio::{sync::mpsc, time::Instant};
@@ -78,7 +87,7 @@ use crate::{
     media::{self, FromMedia, Media},
     node::{Node, Place},
     playout::{FRAME_BYTES, Outcome, Playout, ToMedium},
-    prompts, reports,
+    prompts, recordings, reports,
 };
 
 /// Milliseconds of audio in one heard frame.
@@ -121,8 +130,6 @@ pub enum Fault {
     Frame(AudioFrameError),
     /// The dialplan started the application with arguments that name no entry.
     Entry(String),
-    /// The application asked for something this build does not do yet.
-    NotImplemented(&'static str),
 }
 
 impl fmt::Display for Fault {
@@ -135,7 +142,6 @@ impl fmt::Display for Fault {
             Self::Protocol(error) => write!(f, "protocol: {error}"),
             Self::Frame(error) => write!(f, "protocol: {error}"),
             Self::Entry(problem) => write!(f, "entry: {problem}"),
-            Self::NotImplemented(what) => write!(f, "not implemented in this build: {what}"),
         }
     }
 }
@@ -369,6 +375,8 @@ pub struct Found {
     pub origin: Origin,
     /// Its participants.
     pub members: Vec<FoundMember>,
+    /// Its recordings that Asterisk is still writing.
+    pub recordings: Vec<FoundRecording>,
 }
 
 impl Found {
@@ -378,8 +386,93 @@ impl Found {
             id,
             origin,
             members: Vec::new(),
+            recordings: Vec::new(),
         }
     }
+
+    /// Everything Asterisk says about that is this conversation's: the
+    /// channels of its participants and of the taps of its recordings, and
+    /// the recordings by name.
+    pub fn subjects(&self) -> impl Iterator<Item = &str> {
+        let channels = self.members.iter().map(|member| member.channel.as_str());
+        let recordings = self.recordings.iter().flat_map(|recording| {
+            std::iter::once(recording.id.as_str())
+                .chain(recording.taps.iter().map(|tap| tap.channel.as_str()))
+        });
+        channels.chain(recordings)
+    }
+}
+
+/// A recording found in Asterisk, still being written.
+pub struct FoundRecording {
+    /// Its identifier — its name in Asterisk.
+    pub id: String,
+    /// The bridge that is recorded.
+    pub bridge: String,
+    /// The taps on participants that feed the bridge.
+    pub taps: Vec<FoundTap>,
+}
+
+/// A tap of a recording found in Asterisk.
+pub struct FoundTap {
+    /// The tap's channel.
+    pub channel: String,
+    /// The participant it is on.
+    pub participant: ParticipantId,
+}
+
+/// The conversation and recording a channel of the node's application is a
+/// tap of, and what the tap is on — from the channel's identifier, as the
+/// controller names taps (`<conversation>.record-<recording>.rtap-<on>`);
+/// `None` for a channel that is no tap of a recording.
+pub fn record_tap_of(channel: &str) -> Option<(String, String, String)> {
+    let (conversation, rest) = channel.split_once('.')?;
+    let rest = rest.strip_prefix("record-")?;
+    let (recording, on) = rest.split_once(".rtap-")?;
+    Some((conversation.to_owned(), recording.to_owned(), on.to_owned()))
+}
+
+/// The conversation and recording a bridge belongs to, from the bridge's
+/// identifier (`<conversation>.record-<recording>`); `None` for a bridge
+/// that is no recording's.
+pub fn recording_of(bridge: &str) -> Option<(String, String)> {
+    let (conversation, rest) = bridge.split_once('.')?;
+    let recording = rest.strip_prefix("record-")?;
+    (!recording.contains('.')).then(|| (conversation.to_owned(), recording.to_owned()))
+}
+
+/// Give a tap found in the application to the recording it feeds: one on a
+/// participant of a found conversation, of a recording still being written.
+/// Returns whether it was anyone's. A tap on a media channel is nobody's:
+/// the media channel is removed with the audio path it belonged to.
+pub fn place_tap(
+    found: &mut HashMap<String, Found>,
+    channel: &str,
+    (conversation, recording, on): (String, String, String),
+) -> bool {
+    let Some(found) = found.get_mut(&conversation) else {
+        return false;
+    };
+    let Some(participant) = found
+        .members
+        .iter()
+        .find(|member| member.participant.as_str() == on)
+        .map(|member| member.participant.clone())
+    else {
+        return false;
+    };
+    let Some(recording) = found
+        .recordings
+        .iter_mut()
+        .find(|found| found.id == recording)
+    else {
+        return false;
+    };
+    recording.taps.push(FoundTap {
+        channel: channel.to_owned(),
+        participant,
+    });
+    true
 }
 
 /// A participant found in Asterisk.
@@ -627,6 +720,28 @@ enum Pending {
     MessageVerdict(String, ParticipantId, u16),
     /// How much audio a participant has sent.
     Medium(ParticipantId),
+    /// The bridge of a recording.
+    RecordBridge(String),
+    /// A tap of a recording: on the channel `on`.
+    RecordTap {
+        recording: String,
+        tap: String,
+        on: String,
+    },
+    /// A tap of a recording put into the recording's bridge.
+    RecordJoin { recording: String, tap: String },
+    /// Whether the channel a refused step of a tap was about is still in
+    /// the node's application: asked when Asterisk has refused the step with
+    /// this status.
+    RecordVerdict {
+        recording: String,
+        tap: String,
+        refused_with: u16,
+    },
+    /// Asterisk asked to write a recording.
+    Record(String),
+    /// Asterisk asked to stop writing a recording.
+    RecordStop,
     /// Housekeeping of the controller; nobody waits for the answer.
     Internal,
 }
@@ -713,6 +828,65 @@ struct Conversation {
     /// For a conversation the application asked for: Asterisk's word on the
     /// call to its first participant, once it has come.
     first_placed: Option<Result<Participant, CommandRejection>>,
+    /// The recordings being made of the conversation. One that is over is
+    /// no longer here.
+    recordings: Vec<Recording>,
+}
+
+/// A recording of the conversation, from the application's command to
+/// Asterisk's word that it is written.
+///
+/// In Asterisk it is a mixing bridge of its own, fed by a tap (a snoop
+/// channel hearing what comes in) on every participant and on every media
+/// channel, and recorded as a whole: the recording hears every voice once,
+/// the application's included, whatever the participants are connected to.
+/// It is asked for once the first tap is in the bridge; it ends when the
+/// application stops it or when the last tap is gone — then Asterisk ends it
+/// by itself.
+struct Recording {
+    /// Its identifier — its name in Asterisk, and in the file.
+    id: String,
+    /// The bridge that is recorded.
+    bridge: String,
+    /// The taps that feed the bridge, or have been asked for.
+    taps: Vec<RecordTap>,
+    phase: RecordPhase,
+    stop: Stop,
+}
+
+/// A tap of a recording.
+struct RecordTap {
+    /// The tap's channel.
+    channel: String,
+    /// The channel it is on: a participant's, or a media channel.
+    on: String,
+    /// The tap is in the node's application: it can be put into the bridge.
+    entered: bool,
+    /// It has been asked into the bridge.
+    joined: bool,
+}
+
+/// How far a recording has got.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RecordPhase {
+    /// The bridge has been asked for; Asterisk is asked to write once the
+    /// first tap is in it.
+    Preparing,
+    /// Asterisk has been asked to write, and has not said it does.
+    Asked,
+    /// Asterisk said it is writing.
+    Writing,
+}
+
+/// Whether the recording is to be stopped.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Stop {
+    NotAsked,
+    /// Asked, before Asterisk said the recording is written: it is stopped
+    /// as soon as it is.
+    Asked,
+    /// Asterisk has been asked to stop it.
+    Sent,
 }
 
 /// The channel a call arrived on.
@@ -863,6 +1037,7 @@ impl Conversation {
             unannounced: HashMap::new(),
             command_ids: HashSet::new(),
             first_placed: None,
+            recordings: Vec::new(),
         }
     }
 
@@ -925,6 +1100,9 @@ impl Conversation {
         for group in groups {
             conversation.settle_group(group);
         }
+        // The recordings go on; whoever they do not tap yet is tapped.
+        conversation.carry_on_recordings(found.recordings);
+        conversation.arrange_recordings();
         // Whoever left between being found and being heard about is found
         // out now: from here on their leaving would be heard.
         let channels: Vec<(ParticipantId, String)> = conversation
@@ -1173,7 +1351,11 @@ impl Conversation {
             origin: self.origin.clone(),
             participants,
             connected,
-            recordings: Vec::new(),
+            recordings: self
+                .recordings
+                .iter()
+                .filter_map(|recording| recording.id.parse().ok())
+                .collect(),
         }
     }
 
@@ -1228,8 +1410,13 @@ impl Conversation {
     async fn run(&mut self) -> Result<(), Fault> {
         // The conversation lasts while it has a participant — or is still
         // owed Asterisk's word about one it tried to call: the application
-        // has a `dial` command waiting for its answer.
-        while !(self.members.is_empty() && self.unannounced.is_empty()) {
+        // has a `dial` command waiting for its answer — or a recording of
+        // it is still being written: its end is told before the
+        // conversation's.
+        while !(self.members.is_empty()
+            && self.unannounced.is_empty()
+            && self.recordings.is_empty())
+        {
             let due = self.liveness_due();
             tokio::select! {
                 said = self.asterisk.next() => self.asterisk_said(said).await?,
@@ -1363,15 +1550,19 @@ impl Conversation {
             return Ok(());
         }
         self.server_lost = false;
-        let still: HashSet<String> = found
+        let (still, recorded) = found
             .map(|found| {
-                found
+                let still: HashSet<String> = found
                     .members
                     .into_iter()
                     .map(|member| member.channel)
-                    .collect()
+                    .collect();
+                (still, found.recordings)
             })
             .unwrap_or_default();
+        // A recording Asterisk no longer writes ended meanwhile: with the
+        // file as it is, or with none.
+        self.recordings_found(recorded).await?;
         let gone: Vec<String> = self
             .members
             .iter()
@@ -1437,8 +1628,12 @@ impl Conversation {
         loop {
             // A caller sent to the message has left the conversation, but
             // the fallback is reported by Asterisk's answer, which may come
-            // after they have gone.
-            if self.members.is_empty() && !self.message_answer_awaited() {
+            // after they have gone; a recording ends a moment after the last
+            // participant does.
+            if self.members.is_empty()
+                && !self.message_answer_awaited()
+                && self.recordings.is_empty()
+            {
                 return Ok(false);
             }
             if look {
@@ -2013,6 +2208,18 @@ impl Conversation {
             }
             ari::Message::ChannelHold { channel } => self.far_end_hold(&channel.id, true),
             ari::Message::ChannelUnhold { channel } => self.far_end_hold(&channel.id, false),
+            ari::Message::RecordingStarted { recording } => {
+                self.recording_started(&recording.name).await?;
+            }
+            ari::Message::RecordingFinished { recording } => {
+                self.recording_finished(&recording.name).await?;
+            }
+            ari::Message::RecordingFailed { recording } => {
+                let why = recording
+                    .cause
+                    .unwrap_or_else(|| "could not be written".to_owned());
+                self.fail_recording(&recording.name, &why).await?;
+            }
             // Not about a channel: never routed to a conversation.
             ari::Message::ApplicationReplaced | ari::Message::Other => {}
         }
@@ -2105,6 +2312,14 @@ impl Conversation {
                 self.message_verdict(&channel, caller, refused_with, status_code, body);
                 Ok(())
             }
+            Some(
+                pending @ (Pending::RecordBridge(_)
+                | Pending::RecordTap { .. }
+                | Pending::RecordJoin { .. }
+                | Pending::RecordVerdict { .. }
+                | Pending::Record(_)
+                | Pending::RecordStop),
+            ) => self.record_step_answered(pending, status_code, body).await,
             // The caller is in the dialplan's steps of the fallback: only now
             // is it carried out.
             Some(Pending::Message(..)) => {
@@ -2140,6 +2355,9 @@ impl Conversation {
                 )
                 .await;
         }
+        if self.record_tap_entered(channel) {
+            return Ok(());
+        }
         self.path_channel_entered(channel);
         Ok(())
     }
@@ -2159,6 +2377,10 @@ impl Conversation {
         cause: Option<i64>,
         known: Option<Departure>,
     ) -> Result<(), Fault> {
+        // A tap of a recording ends with the channel it is on.
+        if self.record_tap_left(channel) {
+            return Ok(());
+        }
         let Some(position) = self
             .members
             .iter()
@@ -2167,6 +2389,9 @@ impl Conversation {
             return Ok(());
         };
         let mut member = self.members.swap_remove(position);
+        if self.members.is_empty() {
+            self.end_recordings_nobody_feeds().await?;
+        }
         if let Some(mut sound) = member.sound.take() {
             // Nothing more will be played to them: every segment still
             // queued ends here, before the word that they are gone.
@@ -2332,8 +2557,10 @@ impl Conversation {
                 participant,
                 limit_ms,
             } => self.hold_for(id, &participant, limit_ms).await,
-            Command::StartRecording { .. } => Err(Fault::NotImplemented("start_recording")),
-            Command::StopRecording { .. } => Err(Fault::NotImplemented("stop_recording")),
+            // How long the recording is kept is the application's to see
+            // to, once it has the file; the node records.
+            Command::StartRecording { retention: _ } => self.start_recording(id).await,
+            Command::StopRecording { recording } => self.stop_recording(id, &recording).await,
         }
     }
 
@@ -2613,6 +2840,10 @@ impl Conversation {
             "POST",
             &uri,
         );
+        // What the application plays to them is recorded too: the media
+        // channel is tapped once it exists, which is once Asterisk has
+        // answered the request before this one.
+        self.arrange_recordings();
         None
     }
 
@@ -3026,6 +3257,9 @@ impl Conversation {
             ari::query(&channel),
         );
         self.ask_with(Pending::Dial(asker, participant), "POST", &uri, body);
+        // Recorded from the first ring: their channel is tapped once it
+        // exists, which is once Asterisk has answered the request before.
+        self.arrange_recordings();
         Ok(None)
     }
 
@@ -3306,6 +3540,14 @@ impl Conversation {
                     .ask("abandon", "DELETE", &format!("bridges/{bridge}"));
             }
         }
+        // A recording ends with its bridge; what became of its file the
+        // node's sender finds out from Asterisk.
+        for recording in &self.recordings {
+            for gone in recording.in_asterisk() {
+                self.asterisk.ask("abandon", "DELETE", &gone);
+            }
+            self.node.recordings.disown(&recording.id);
+        }
         let close = CloseFrame {
             code: CloseCode::Error,
             reason: fault
@@ -3319,6 +3561,542 @@ impl Conversation {
             let _ = application.close(Some(close)).await;
         }
     }
+}
+
+impl Recording {
+    /// What of the recording is in Asterisk, as what to delete: its taps,
+    /// then its bridge.
+    fn in_asterisk(&self) -> impl Iterator<Item = String> + '_ {
+        self.taps
+            .iter()
+            .map(|tap| format!("channels/{}", ari::query(&tap.channel)))
+            .chain(std::iter::once(format!(
+                "bridges/{}",
+                ari::query(&self.bridge)
+            )))
+    }
+}
+
+/// Recording the conversation.
+impl Conversation {
+    /// The application asks to record the conversation: the recording is
+    /// named at once and begun — its bridge asked for, everyone tapped.
+    async fn start_recording(&mut self, id: u64) -> Result<(), Fault> {
+        let recording = uuid::Uuid::new_v4().to_string();
+        let told = recording_id(&recording)?;
+        if let Err(problem) = self.node.recordings.begin(&recording, &self.id) {
+            // A file nobody knows of would never be sent: nothing is begun.
+            eprintln!(
+                "conversation {}: recording {recording} cannot be begun — {problem}",
+                self.id
+            );
+            let outcome = CommandOutcome::AcceptedRecording {
+                recording: told.clone(),
+            };
+            self.tell(&ControllerMessage::CommandResult { id, outcome })
+                .await?;
+            return self.event(Event::RecordingFailed { recording: told }).await;
+        }
+        let bridge = format!("{}.record-{recording}", self.id);
+        // What Asterisk says of the recording is this conversation's: said
+        // before anything is asked, so that not a word about it goes astray.
+        self.asterisk.own(&recording);
+        self.ask(
+            Pending::RecordBridge(recording.clone()),
+            "POST",
+            &format!("bridges?type=mixing&bridgeId={}", ari::query(&bridge)),
+        );
+        self.recordings.push(Recording {
+            id: recording,
+            bridge,
+            taps: Vec::new(),
+            phase: RecordPhase::Preparing,
+            stop: Stop::NotAsked,
+        });
+        self.arrange_recordings();
+        let outcome = CommandOutcome::AcceptedRecording { recording: told };
+        self.tell(&ControllerMessage::CommandResult { id, outcome })
+            .await
+    }
+
+    /// The application stops a recording. One not yet written by Asterisk
+    /// is stopped as soon as it is: the application gets the file, however
+    /// short. A stop asked twice is one stop.
+    async fn stop_recording(&mut self, id: u64, recording: &RecordingId) -> Result<(), Fault> {
+        let Some(found) = self
+            .recordings
+            .iter_mut()
+            .find(|found| found.id == recording.as_str())
+        else {
+            return self.reject(id, CommandRejection::UnknownRecording).await;
+        };
+        if found.stop == Stop::NotAsked {
+            found.stop = Stop::Asked;
+        }
+        if found.phase == RecordPhase::Writing {
+            let name = found.id.clone();
+            self.send_stop(&name);
+        }
+        self.accept(id).await
+    }
+
+    /// Ask Asterisk to stop writing a recording, once.
+    fn send_stop(&mut self, recording: &str) {
+        let Some(found) = self
+            .recordings
+            .iter_mut()
+            .find(|found| found.id == recording)
+        else {
+            return;
+        };
+        if found.stop == Stop::Sent {
+            return;
+        }
+        found.stop = Stop::Sent;
+        self.ask(
+            Pending::RecordStop,
+            "POST",
+            &format!("recordings/live/{}/stop", ari::query(recording)),
+        );
+    }
+
+    /// Carry on the recordings a controller before this one began, as they
+    /// were found in Asterisk: still written, with the taps they have.
+    fn carry_on_recordings(&mut self, found: Vec<FoundRecording>) {
+        for found in found {
+            if let Err(problem) = self.node.recordings.begin(&found.id, &self.id) {
+                eprintln!(
+                    "conversation {}: recording {} is carried on, but cannot be listed — {problem}",
+                    self.id, found.id
+                );
+            }
+            let taps = self.taps_found(found.taps);
+            self.recordings.push(Recording {
+                id: found.id,
+                bridge: found.bridge,
+                taps,
+                phase: RecordPhase::Writing,
+                stop: Stop::NotAsked,
+            });
+        }
+    }
+
+    /// Taps found in Asterisk, on participants of this conversation: each
+    /// in the recording's bridge already.
+    fn taps_found(&self, found: Vec<FoundTap>) -> Vec<RecordTap> {
+        found
+            .into_iter()
+            .filter_map(|tap| {
+                let on = self
+                    .members
+                    .iter()
+                    .find(|member| member.id == tap.participant)?
+                    .channel
+                    .clone();
+                Some(RecordTap {
+                    channel: tap.channel,
+                    on,
+                    entered: true,
+                    joined: true,
+                })
+            })
+            .collect()
+    }
+
+    /// Asterisk is found again after a loss, and these recordings of the
+    /// conversation are still written — with the taps they have now. Every
+    /// other recording ended meanwhile, unheard: with its file as it is, or
+    /// with none.
+    async fn recordings_found(&mut self, mut found: Vec<FoundRecording>) -> Result<(), Fault> {
+        let known: Vec<String> = self
+            .recordings
+            .iter()
+            .map(|recording| recording.id.clone())
+            .collect();
+        for recording in known {
+            match found.iter().position(|still| still.id == recording) {
+                Some(position) => {
+                    let taps = self.taps_found(found.swap_remove(position).taps);
+                    if let Some(kept) = self.recordings.iter_mut().find(|kept| kept.id == recording)
+                    {
+                        kept.taps = taps;
+                        kept.phase = RecordPhase::Writing;
+                    }
+                }
+                None if self.node.recordings.file(&recording).is_file() => {
+                    self.recording_finished(&recording).await?;
+                }
+                None => {
+                    self.fail_recording(
+                        &recording,
+                        "Asterisk no longer writes it, and no file is left",
+                    )
+                    .await?;
+                }
+            }
+        }
+        self.arrange_recordings();
+        Ok(())
+    }
+
+    /// Tap, for every recording, whoever it does not tap yet: the channel
+    /// of every participant and every media channel. Called whenever one of
+    /// them may have appeared; asks for nothing twice.
+    ///
+    /// A tap is asked for as soon as its channel is asked for: requests of
+    /// the conversation are made in order, so the channel exists by then —
+    /// or does not, and the tap is refused for a channel that is gone.
+    fn arrange_recordings(&mut self) {
+        if self.recordings.is_empty() {
+            return;
+        }
+        let prefix = format!("{}.", self.id);
+        // Each channel to tap, with what the tap is named after: the
+        // participant, or the media channel's own name.
+        let mut on: Vec<(String, String)> = Vec::new();
+        for member in &self.members {
+            if member.removed_by_us {
+                continue;
+            }
+            on.push((member.channel.clone(), member.id.as_str().to_owned()));
+            if let Some(sound) = &member.sound {
+                let named = sound
+                    .channel
+                    .strip_prefix(&prefix)
+                    .unwrap_or(&sound.channel);
+                on.push((sound.channel.clone(), named.to_owned()));
+            }
+        }
+        let mut asks = Vec::new();
+        for recording in &mut self.recordings {
+            for (channel, named) in &on {
+                if recording.taps.iter().any(|tap| tap.on == *channel) {
+                    continue;
+                }
+                let tap = format!("{prefix}record-{}.rtap-{named}", recording.id);
+                recording.taps.push(RecordTap {
+                    channel: tap.clone(),
+                    on: channel.clone(),
+                    entered: false,
+                    joined: false,
+                });
+                asks.push((recording.id.clone(), tap, channel.clone()));
+            }
+        }
+        for (recording, tap, on) in asks {
+            // Said before the tap is asked for: not a word about it may go
+            // astray.
+            self.asterisk.own(&tap);
+            let uri = format!(
+                "channels/{}/snoop?spy=in&app={}&snoopId={}",
+                ari::query(&on),
+                ari::query(APPLICATION),
+                ari::query(&tap),
+            );
+            self.ask(Pending::RecordTap { recording, tap, on }, "POST", &uri);
+        }
+    }
+
+    /// A channel that entered the application is a tap of a recording: it
+    /// is put into the recording's bridge. Returns whether it was one.
+    fn record_tap_entered(&mut self, channel: &str) -> bool {
+        let mut join = None;
+        for recording in &mut self.recordings {
+            let Some(tap) = recording.taps.iter_mut().find(|tap| tap.channel == channel) else {
+                continue;
+            };
+            tap.entered = true;
+            if !tap.joined {
+                tap.joined = true;
+                join = Some((recording.id.clone(), recording.bridge.clone()));
+            }
+            break;
+        }
+        let Some((recording, bridge)) = join else {
+            return self
+                .recordings
+                .iter()
+                .any(|recording| recording.taps.iter().any(|tap| tap.channel == channel));
+        };
+        self.ask(
+            Pending::RecordJoin {
+                recording,
+                tap: channel.to_owned(),
+            },
+            "POST",
+            &format!(
+                "bridges/{}/addChannel?channel={}",
+                ari::query(&bridge),
+                ari::query(channel)
+            ),
+        );
+        true
+    }
+
+    /// A channel that is gone was a tap of a recording — it ended with the
+    /// channel it was on. The recording goes on without it; when the last
+    /// tap is gone, Asterisk ends the recording by itself. Returns whether
+    /// the channel was one.
+    fn record_tap_left(&mut self, channel: &str) -> bool {
+        let mut was_one = false;
+        for recording in &mut self.recordings {
+            let before = recording.taps.len();
+            recording.taps.retain(|tap| tap.channel != channel);
+            was_one |= recording.taps.len() != before;
+        }
+        was_one
+    }
+
+    /// Asterisk answered a step of a recording.
+    async fn record_step_answered(
+        &mut self,
+        pending: Pending,
+        status_code: u16,
+        body: &str,
+    ) -> Result<(), Fault> {
+        let refused = !(200..=299).contains(&status_code);
+        match pending {
+            Pending::RecordBridge(recording) if refused => {
+                let why =
+                    format!("Asterisk answered {status_code} when asked for its bridge: {body}");
+                self.fail_recording(&recording, &why).await
+            }
+            Pending::Record(recording) if refused => {
+                let why = format!("Asterisk answered {status_code} when asked to write it: {body}");
+                self.fail_recording(&recording, &why).await
+            }
+            // A tap refused, or not let into the bridge, is about a channel
+            // that may be hanging up — Asterisk's word that it left may
+            // come after its refusal. So the refusal alone decides nothing:
+            // Asterisk is asked whether the channel is still in the
+            // application.
+            Pending::RecordTap { recording, tap, on } if refused => {
+                let verdict = Pending::RecordVerdict {
+                    recording,
+                    tap,
+                    refused_with: status_code,
+                };
+                self.ask(verdict, "GET", &format!("channels/{}", ari::query(&on)));
+                Ok(())
+            }
+            Pending::RecordJoin { recording, tap } if refused => {
+                let verdict = Pending::RecordVerdict {
+                    recording,
+                    tap: tap.clone(),
+                    refused_with: status_code,
+                };
+                self.ask(verdict, "GET", &format!("channels/{}", ari::query(&tap)));
+                Ok(())
+            }
+            Pending::RecordJoin { recording, .. } => {
+                self.record_fed(&recording);
+                Ok(())
+            }
+            Pending::RecordVerdict {
+                recording,
+                tap,
+                refused_with,
+            } => {
+                self.record_verdict(&recording, &tap, refused_with, status_code, body)
+                    .await
+            }
+            // A stop refused is a recording that has ended already: its
+            // end comes, or has come, on its own.
+            Pending::RecordBridge(_)
+            | Pending::RecordTap { .. }
+            | Pending::Record(_)
+            | Pending::RecordStop
+            | Pending::Dial(..)
+            | Pending::Step(..)
+            | Pending::Verdict(..)
+            | Pending::Group
+            | Pending::Exists(_)
+            | Pending::Message(..)
+            | Pending::MessageVerdict(..)
+            | Pending::Medium(_)
+            | Pending::Internal => Ok(()),
+        }
+    }
+
+    /// A tap is in the bridge of a recording: Asterisk is asked to write
+    /// the recording, if it has not been yet. Not before — what Asterisk
+    /// does with a recording of a bridge nobody feeds is not known.
+    fn record_fed(&mut self, recording: &str) {
+        let Some(found) = self
+            .recordings
+            .iter_mut()
+            .find(|found| found.id == recording)
+        else {
+            return;
+        };
+        if found.phase != RecordPhase::Preparing {
+            return;
+        }
+        found.phase = RecordPhase::Asked;
+        let bridge = found.bridge.clone();
+        self.ask(
+            Pending::Record(recording.to_owned()),
+            "POST",
+            &format!(
+                "bridges/{}/record?name={}&format={}",
+                ari::query(&bridge),
+                ari::query(recording),
+                recordings::FORMAT,
+            ),
+        );
+    }
+
+    /// Asterisk said whether the channel a refused step of a tap was about
+    /// is still in the application. One that is not is leaving: the
+    /// recording goes on without them. One that is would be missing from
+    /// the recording, and nobody would know: the recording fails.
+    async fn record_verdict(
+        &mut self,
+        recording: &str,
+        tap: &str,
+        refused_with: u16,
+        status_code: u16,
+        body: &str,
+    ) -> Result<(), Fault> {
+        let refused =
+            format!("Asterisk answered {refused_with} when asked to tap a channel for it");
+        match still_in_application(status_code, body) {
+            Ok(false) => {
+                eprintln!(
+                    "conversation {}: {refused}; the channel is leaving",
+                    self.id
+                );
+                self.record_tap_left(tap);
+                Ok(())
+            }
+            Ok(true) => {
+                self.fail_recording(recording, &format!("{refused}, and the channel stays"))
+                    .await
+            }
+            Err(why) => {
+                self.fail_recording(recording, &format!("{refused}, and {why}"))
+                    .await
+            }
+        }
+    }
+
+    /// Asterisk said it is writing a recording.
+    async fn recording_started(&mut self, recording: &str) -> Result<(), Fault> {
+        let Some(found) = self
+            .recordings
+            .iter_mut()
+            .find(|found| found.id == recording)
+        else {
+            return Ok(());
+        };
+        found.phase = RecordPhase::Writing;
+        let stop_asked = found.stop == Stop::Asked;
+        let told = recording_id(recording)?;
+        self.event(Event::RecordingStarted { recording: told })
+            .await?;
+        if stop_asked {
+            self.send_stop(recording);
+        }
+        Ok(())
+    }
+
+    /// Asterisk said a recording is written to its end: its length is the
+    /// file's, and the file goes to the application.
+    async fn recording_finished(&mut self, recording: &str) -> Result<(), Fault> {
+        let Some(position) = self
+            .recordings
+            .iter()
+            .position(|found| found.id == recording)
+        else {
+            return Ok(());
+        };
+        let length = self.node.recordings.finished(recording);
+        let told = self.take_down_recording(position)?;
+        match length {
+            Ok(length_ms) => {
+                self.event(Event::RecordingFinished {
+                    recording: told,
+                    length_ms,
+                })
+                .await
+            }
+            Err(problem) => {
+                eprintln!(
+                    "conversation {}: recording {recording} is written, but — {problem}",
+                    self.id
+                );
+                self.node.recordings.lost(recording);
+                self.event(Event::RecordingFailed { recording: told }).await
+            }
+        }
+    }
+
+    /// A recording cannot be made, or made no further: there is no file to
+    /// send, and the application is told.
+    async fn fail_recording(&mut self, recording: &str, why: &str) -> Result<(), Fault> {
+        let Some(position) = self
+            .recordings
+            .iter()
+            .position(|found| found.id == recording)
+        else {
+            return Ok(());
+        };
+        eprintln!(
+            "conversation {}: recording {recording} FAILED — {why}",
+            self.id
+        );
+        self.node.recordings.failed(recording);
+        let told = self.take_down_recording(position)?;
+        self.event(Event::RecordingFailed { recording: told }).await
+    }
+
+    /// Take a recording that is over out of Asterisk — its taps and its
+    /// bridge — and off the conversation's list. Returns its identifier as
+    /// the application is told it.
+    fn take_down_recording(&mut self, position: usize) -> Result<RecordingId, Fault> {
+        let recording = self.recordings.swap_remove(position);
+        for gone in recording.in_asterisk() {
+            self.ask(Pending::Internal, "DELETE", &gone);
+        }
+        recording_id(&recording.id)
+    }
+
+    /// The last participant is gone. A recording Asterisk was never asked
+    /// to write will never be fed: it fails. One asked for ends by itself
+    /// when its last tap is gone — and is asked to stop as well, in case it
+    /// was never fed, which Asterisk may not end by itself.
+    async fn end_recordings_nobody_feeds(&mut self) -> Result<(), Fault> {
+        let (unfed, asked): (Vec<String>, Vec<String>) = self
+            .recordings
+            .iter()
+            .map(|recording| (recording.id.clone(), recording.phase))
+            .fold(
+                (Vec::new(), Vec::new()),
+                |(mut unfed, mut asked), (id, phase)| {
+                    if phase == RecordPhase::Preparing {
+                        unfed.push(id);
+                    } else {
+                        asked.push(id);
+                    }
+                    (unfed, asked)
+                },
+            );
+        for recording in unfed {
+            self.fail_recording(&recording, "nobody is left to record")
+                .await?;
+        }
+        for recording in asked {
+            self.send_stop(&recording);
+        }
+        Ok(())
+    }
+}
+
+/// A recording's identifier as the application is told it.
+fn recording_id(recording: &str) -> Result<RecordingId, Fault> {
+    recording
+        .parse()
+        .map_err(|_| Fault::Asterisk(format!("recording identifier {recording:?} is not valid")))
 }
 
 /// What is still to be asked of Asterisk for a participant who is in a
@@ -3504,7 +4282,43 @@ fn participant_id(node: &Node, number: u64) -> Result<ParticipantId, Fault> {
 
 #[cfg(test)]
 mod tests {
-    use super::still_in_application;
+    use super::{record_tap_of, recording_of, still_in_application};
+
+    #[test]
+    fn the_bridge_and_the_taps_of_a_recording_are_known_by_their_names() {
+        let conversation = "8d0b2a74-5c4b-4f43-9a5e-0d6f2b8f0c11";
+        let recording = "1f1a49a7-ab03-4208-9b3c-020c5f2d93a6";
+        assert_eq!(
+            recording_of(&format!("{conversation}.record-{recording}")),
+            Some((conversation.to_owned(), recording.to_owned()))
+        );
+        assert_eq!(
+            record_tap_of(&format!(
+                "{conversation}.record-{recording}.rtap-p-ab12cd34ef56-2"
+            )),
+            Some((
+                conversation.to_owned(),
+                recording.to_owned(),
+                "p-ab12cd34ef56-2".to_owned()
+            ))
+        );
+        // A tap is no bridge, and the bridges and channels of audio paths
+        // and groups are no recording's.
+        assert_eq!(
+            recording_of(&format!("{conversation}.record-{recording}.rtap-p-1")),
+            None
+        );
+        for other in [
+            format!("{conversation}.ab12cd34ef56.group-1"),
+            format!("{conversation}.ab12cd34ef56.bridge-1"),
+            format!("{conversation}.ab12cd34ef56.media-1"),
+            format!("{conversation}.ab12cd34ef56.tap-1"),
+            "1759792000.7".to_owned(),
+        ] {
+            assert_eq!(recording_of(&other), None, "{other}");
+            assert_eq!(record_tap_of(&other), None, "{other}");
+        }
+    }
 
     /// A channel as Asterisk describes it, doing `app_name(app_data)`.
     fn doing(app_name: &str, app_data: &str) -> String {

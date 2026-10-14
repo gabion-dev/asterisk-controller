@@ -58,6 +58,22 @@ pub enum Message {
         /// The channel.
         channel: Channel,
     },
+    /// Asterisk began to write a recording.
+    RecordingStarted {
+        /// The recording.
+        recording: LiveRecording,
+    },
+    /// A recording is written to its end: stopped, or the bridge it records
+    /// has nobody left to record.
+    RecordingFinished {
+        /// The recording.
+        recording: LiveRecording,
+    },
+    /// A recording could not be written.
+    RecordingFailed {
+        /// The recording.
+        recording: LiveRecording,
+    },
     /// Another connection has subscribed to the application: from now on
     /// Asterisk says nothing more about it on this one.
     ApplicationReplaced,
@@ -67,8 +83,9 @@ pub enum Message {
 }
 
 impl Message {
-    /// The channel a message is about, when it is about one.
-    pub fn channel(&self) -> Option<&str> {
+    /// What a message is about, as its owner is found by: the identifier of
+    /// a channel, or the name of a recording.
+    pub fn subject(&self) -> Option<&str> {
         match self {
             Self::StasisStart { channel, .. }
             | Self::StasisEnd { channel }
@@ -77,9 +94,23 @@ impl Message {
             | Self::ChannelDestroyed { channel, .. }
             | Self::ChannelHold { channel }
             | Self::ChannelUnhold { channel } => Some(&channel.id),
+            Self::RecordingStarted { recording }
+            | Self::RecordingFinished { recording }
+            | Self::RecordingFailed { recording } => Some(&recording.name),
             Self::ApplicationReplaced | Self::Other => None,
         }
     }
+}
+
+/// A recording, as Asterisk describes it in what it says about one.
+#[derive(Debug, Deserialize)]
+pub struct LiveRecording {
+    /// The recording's name — the one the controller gave it, which is the
+    /// recording's identifier in the node protocol too.
+    pub name: String,
+    /// Why it failed, when it did.
+    #[serde(default)]
+    pub cause: Option<String>,
 }
 
 /// What is in a Stasis application, as Asterisk describes it.
@@ -318,6 +349,40 @@ mod tests {
         ] {
             assert!(!is_in_application(&description, "gabion")?, "{description}");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn what_asterisk_says_of_a_recording_is_about_the_recording_by_its_name() -> TestResult {
+        let finished = super::read(
+            &serde_json::json!({
+                "type": "RecordingFinished", "application": "gabion",
+                "recording": {
+                    "name": "8d0b2a74-5c4b-4f43-9a5e-0d6f2b8f0c11", "format": "sln16",
+                    "target_uri": "bridge:conversation.record-8d0b", "state": "done",
+                    "duration": 30
+                }
+            })
+            .to_string(),
+        )?;
+        assert_eq!(
+            finished.subject(),
+            Some("8d0b2a74-5c4b-4f43-9a5e-0d6f2b8f0c11")
+        );
+        let failed = super::read(
+            &serde_json::json!({
+                "type": "RecordingFailed", "application": "gabion",
+                "recording": {
+                    "name": "r", "format": "sln16", "target_uri": "bridge:b",
+                    "state": "failed", "cause": "Cannot record channel while in bridge"
+                }
+            })
+            .to_string(),
+        )?;
+        assert!(matches!(
+            failed,
+            super::Message::RecordingFailed { recording } if recording.cause.is_some()
+        ));
         Ok(())
     }
 

@@ -12,7 +12,7 @@
 # is kept as it is.
 set -euo pipefail
 
-RELEASE="22.11.0-r2"
+RELEASE="22.11.0-r3"
 BASE="https://github.com/gabion-dev/asterisk-server/releases/download/${RELEASE}"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -22,16 +22,16 @@ STAMP="${TREE}/.release"
 case "$(uname -s)-$(uname -m)" in
   Linux-x86_64)
     ARCHIVE="asterisk-server-linux-amd64.tar.gz"
-    SHA256="83f7f918042ce122318779359174b6ed30f9089b196882bb0350cc099780327d" ;;
+    SHA256="28145d8df5909528580bc04abff350af770f2e4086bae0084d978352ad463a21" ;;
   Linux-aarch64)
     ARCHIVE="asterisk-server-linux-arm64.tar.gz"
-    SHA256="f4c8e08f5b2aa03067382b610e2d068d6758f4cb60cd97c9f5ddca38fe7cd334" ;;
+    SHA256="f43c5a4eb868d9ec64c3cc0ee15e44615c13923b0af050aaf3f6d3e2da2b5ba4" ;;
   Darwin-arm64)
     ARCHIVE="asterisk-server-darwin-arm64.tar.gz"
-    SHA256="dc3ba7e139a8e306b38eb287334a0fbb38333852078018726622238c5e22927f" ;;
+    SHA256="dad28302be12f39f687e509f45a4de7fa3396d0514524cc681d2e3392633aca4" ;;
   Darwin-x86_64)
     ARCHIVE="asterisk-server-darwin-amd64.tar.gz"
-    SHA256="12644c64a7b372d06ccbf3df2106f51af8766226ef500ad4b11bdc0ce8183f5b" ;;
+    SHA256="56791a5a2f1c04ad5eabcb94d9e8e5055885101454ca3d2c7a141520b731e676" ;;
   *)
     echo "ERROR: no Asterisk build for $(uname -s) $(uname -m)" >&2
     exit 1 ;;

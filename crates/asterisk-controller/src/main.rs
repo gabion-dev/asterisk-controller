@@ -24,6 +24,7 @@ mod media;
 mod node;
 mod playout;
 mod prompts;
+mod recordings;
 mod reports;
 mod service;
 mod settings;
@@ -119,6 +120,7 @@ async fn main() -> ExitCode {
     let asterisk = asterisk::Asterisk::new(config.asterisk_http, &secret);
     let media_authorization: Arc<str> = media::authorization(&secret).into();
     let reports = reports::Journal::of(&config.state);
+    let recordings = recordings::Outbox::of(&config.state);
     let node = Arc::new(Node {
         config,
         application,
@@ -131,12 +133,14 @@ async fn main() -> ExitCode {
             .collect(),
         applied: RwLock::new(Arc::new(applied)),
         reports,
+        recordings,
         door: media::Door::default(),
         lines: node::Lines::default(),
         replaced: tokio::sync::Notify::new(),
     });
     tokio::spawn(asterisk::run(Arc::clone(&node), Arc::clone(&asterisk)));
     tokio::spawn(service::run(Arc::clone(&node), Arc::clone(&asterisk)));
+    tokio::spawn(recordings::run(Arc::clone(&node), Arc::clone(&asterisk)));
 
     loop {
         tokio::select! {
