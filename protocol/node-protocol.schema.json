@@ -1752,7 +1752,7 @@
       ]
     },
     "Report": {
-      "description": "What the node did while no instance owned a conversation. Nothing the node does on its own goes unreported.",
+      "description": "What happened on the node outside the events of a conversation: what it did while no instance owned the conversation, and what it lost once the conversation was over. Nothing the node does on its own goes unreported.",
       "oneOf": [
         {
           "type": "object",
@@ -1894,6 +1894,33 @@
           ],
           "additionalProperties": false,
           "description": "A participant left with nobody to talk to and nobody in charge."
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "recording_lost"
+            },
+            "conversation": {
+              "$ref": "#/definitions/ConversationId"
+            },
+            "recording": {
+              "$ref": "#/definitions/RecordingId"
+            },
+            "at_unix_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Milliseconds since the Unix epoch."
+            }
+          },
+          "required": [
+            "type",
+            "conversation",
+            "recording",
+            "at_unix_ms"
+          ],
+          "additionalProperties": false,
+          "description": "A recording that ended is lost: its file was not on the node when it was to be sent, and the application will never get it. Said once for each lost recording; a recording the application has is never said lost."
         }
       ]
     },

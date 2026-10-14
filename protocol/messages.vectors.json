@@ -1874,6 +1874,49 @@
    }
   },
   {
+   "name": "report: a recording is lost",
+   "type": "NodeMessage",
+   "accept": true,
+   "json": {
+    "type": "report",
+    "id": "7f1c2a8e-3b4d-4e5f-9a6b-1c2d3e4f5a6b",
+    "report": {
+     "type": "recording_lost",
+     "conversation": "c-1",
+     "recording": "3e0c6f2a-9b1d-4c7e-8a5f-2d4b6e8f0a1c",
+     "at_unix_ms": 1791226292824
+    }
+   }
+  },
+  {
+   "name": "report: a recording lost without the recording",
+   "type": "NodeMessage",
+   "accept": false,
+   "json": {
+    "type": "report",
+    "id": "7f1c2a8e-3b4d-4e5f-9a6b-1c2d3e4f5a6b",
+    "report": {
+     "type": "recording_lost",
+     "conversation": "c-1",
+     "at_unix_ms": 1791226292824
+    }
+   }
+  },
+  {
+   "name": "report: a recording lost without its conversation",
+   "type": "NodeMessage",
+   "accept": false,
+   "json": {
+    "type": "report",
+    "id": "7f1c2a8e-3b4d-4e5f-9a6b-1c2d3e4f5a6b",
+    "report": {
+     "type": "recording_lost",
+     "recording": "3e0c6f2a-9b1d-4c7e-8a5f-2d4b6e8f0a1c",
+     "at_unix_ms": 1791226292824
+    }
+   }
+  },
+  {
    "name": "event: the telephony server is lost",
    "type": "ControllerMessage",
    "accept": true,

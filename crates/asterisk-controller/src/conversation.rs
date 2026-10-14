@@ -4025,7 +4025,7 @@ impl Conversation {
                     "conversation {}: recording {recording} is written, but — {problem}",
                     self.id
                 );
-                self.node.recordings.lost(recording);
+                recordings::lose(&self.node, recording, Some(self.id.as_str()));
                 self.event(Event::RecordingFailed { recording: told }).await
             }
         }

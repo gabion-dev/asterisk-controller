@@ -20,8 +20,10 @@
 //! listened is found ended and sent.
 //!
 //! A recording whose file is not there when it is to be sent is lost: the
-//! node says so loudly and takes it off the list. How the application is
-//! told of a loss outside the conversation's events is not built yet.
+//! node says so loudly, takes it off the list and reports the loss to the
+//! application ([`crate::reports`]) — the conversation the recording was of
+//! may be over by then, so the loss is a report kept until the application
+//! has it, not an event of the conversation.
 
 use std::{
     collections::HashSet,
@@ -32,9 +34,10 @@ use std::{
     time::Duration,
 };
 
+use node_protocol::messages::{ConversationId, RecordingId, Report};
 use tokio::sync::Notify;
 
-use crate::{asterisk::Asterisk, node::Node, state_files};
+use crate::{asterisk::Asterisk, node::Node, reports, state_files};
 
 /// The directory of the state directory that lists the node's recordings.
 const DIRECTORY: &str = "recordings";
@@ -72,6 +75,10 @@ pub struct Outbox {
 /// One recording on the node's list.
 struct Entry {
     recording: String,
+    /// The conversation the recording was of, as the list names it. The
+    /// node writes every entry with it; one without was not written by the
+    /// node.
+    conversation: Option<String>,
     finished: bool,
 }
 
@@ -140,17 +147,6 @@ impl Outbox {
         self.unlist(recording);
     }
 
-    /// A recording's file is not there when it should be: the recording is
-    /// lost, and said to be. There is nothing to send.
-    pub fn lost(&self, recording: &str) {
-        self.owned().remove(recording);
-        self.unlist(recording);
-        eprintln!(
-            "asterisk-controller: RECORDING {recording} IS LOST — its file is not on the node, \
-             and the application will not get it"
-        );
-    }
-
     /// A conversation lets go of a recording without knowing its end — the
     /// conversation itself is abandoned. The sender finds out from Asterisk
     /// what became of it.
@@ -215,11 +211,55 @@ impl Outbox {
             }
             let text = fs::read_to_string(entry.path()).map_err(failed)?;
             listed.push(Entry {
+                conversation: text
+                    .lines()
+                    .find_map(|line| line.strip_prefix(CONVERSATION))
+                    .map(str::to_owned),
                 finished: text.lines().any(|line| line == FINISHED),
                 recording,
             });
         }
         Ok(listed)
+    }
+}
+
+/// A recording's file is not there when it should be: the recording is
+/// lost. It is taken off the list, said so loudly, and reported to the
+/// application, which will never get the file — as a report, kept until the
+/// application has it, because the conversation the recording was of may be
+/// over. A loss whose conversation is not known cannot be reported, only
+/// said: the report names the conversation, and a list entry without one
+/// was not written by the node.
+pub fn lose(node: &Node, recording: &str, conversation: Option<&str>) {
+    let outbox = &node.recordings;
+    outbox.owned().remove(recording);
+    outbox.unlist(recording);
+    eprintln!(
+        "asterisk-controller: RECORDING {recording} IS LOST — its file is not on the node, \
+         and the application will not get it"
+    );
+    let report = conversation
+        .ok_or_else(|| "the list does not name its conversation".to_owned())
+        .and_then(|conversation| {
+            conversation
+                .parse::<ConversationId>()
+                .map_err(|_| "the conversation's identifier is not valid".to_owned())
+        })
+        .and_then(|conversation| {
+            recording
+                .parse::<RecordingId>()
+                .map(|recording| Report::RecordingLost {
+                    conversation,
+                    recording,
+                    at_unix_ms: reports::now_unix_ms(),
+                })
+                .map_err(|_| "the recording's identifier is not valid".to_owned())
+        });
+    match report {
+        Ok(report) => node.reports.keep(report),
+        Err(why) => eprintln!(
+            "asterisk-controller: recording {recording}: the loss cannot be reported — {why}"
+        ),
     }
 }
 
@@ -272,7 +312,7 @@ async fn send_or_settle(node: &Node, asterisk: &Asterisk, entry: &Entry) -> bool
             Ok(true) => return true,
             Ok(false) => {
                 if !outbox.file(recording).is_file() {
-                    outbox.lost(recording);
+                    lose(node, recording, entry.conversation.as_deref());
                     return true;
                 }
                 if let Err(problem) = outbox.finished(recording) {
@@ -288,7 +328,7 @@ async fn send_or_settle(node: &Node, asterisk: &Asterisk, entry: &Entry) -> bool
     }
     let file = outbox.file(recording);
     if !file.is_file() {
-        outbox.lost(recording);
+        lose(node, recording, entry.conversation.as_deref());
         return true;
     }
     let sent = node

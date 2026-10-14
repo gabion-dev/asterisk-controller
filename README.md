@@ -260,7 +260,8 @@ Lines that say something is wrong:
   — the file stays on the node and is sent again; then
   `asterisk-controller: recording <id> is with the application`;
 - `asterisk-controller: RECORDING <id> IS LOST — …` — the file of a
-  recording is not on the node when it is to be sent.
+  recording is not on the node when it is to be sent; the application is
+  told by a report (`recording_lost`).
 
 While the controller keeps trying to reach Asterisk, the application or an
 instance for a conversation, it says the reason once, and again only when the
@@ -338,7 +339,10 @@ credentials, and deletes its copy only once the application has answered
 2xx: a file the application refuses or cannot be given stays on the node and
 is sent again — when the application next welcomes the node, and every 10
 seconds. A controller started again carries on the recordings in progress
-and sends the ones left unsent. How long a recording is kept is the
+and sends the ones left unsent. A file that is not on the node when it is to
+be sent is lost, and the node reports the loss to the application
+(`recording_lost`) the way it reports what it did on its own: the report is
+kept until the application confirms it. How long a recording is kept is the
 application's business, once it has the file.
 
 ### Calls the application places

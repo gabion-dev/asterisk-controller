@@ -1932,7 +1932,11 @@ impl Stand {
     /// it lost the other, and nothing Asterisk was connected to went away
     /// without closing its connection.
     async fn expect_no_lost_control_connection(&self) -> TestResult {
-        if self.controller.said("LOST").await {
+        if self
+            .controller
+            .said("the connection to Asterisk is LOST")
+            .await
+        {
             return Err("the controller lost its connection to Asterisk".into());
         }
         if self.asterisk.said("closed abruptly").await {
@@ -4502,8 +4506,9 @@ async fn the_conversation_is_recorded(stand: &Stand) -> TestResult {
 }
 
 /// The rest of [`the_conversation_is_recorded`]: a file the application
-/// refuses stays on the node and is sent again; a recording ends with the
-/// last participant, and the conversation waits for its end.
+/// refuses stays on the node and is sent again; a file that is gone from
+/// the node by then is reported lost; a recording ends with the last
+/// participant, and the conversation waits for its end.
 async fn recordings_are_sent_again_and_end_with_the_people(
     stand: &Stand,
     owner: &mut Owner,
@@ -4511,19 +4516,45 @@ async fn recordings_are_sent_again_and_end_with_the_people(
 ) -> TestResult {
     stand.application.refuse_recordings(true);
     let refused = recording_begins(owner, 13).await?;
+    let doomed = recording_begins(owner, 17).await?;
     // Long enough to have something in it.
     tokio::time::sleep(Duration::from_millis(500)).await;
     recording_ends(owner, 14, &refused).await?;
-    if !stand
-        .controller
-        .comes_to_say(&not_with_the_application(&refused))
-        .await
-    {
-        return Err("the controller did not say the application refused a recording".into());
+    recording_ends(owner, 18, &doomed).await?;
+    for recording in [&refused, &doomed] {
+        if !stand
+            .controller
+            .comes_to_say(&not_with_the_application(recording))
+            .await
+        {
+            return Err("the controller did not say the application refused a recording".into());
+        }
     }
+    // The file of one of them is gone from the node before it is sent again
+    // — as after a disk that lost it: the recording is lost, and the
+    // application is told so by a report, the conversation's events being no
+    // place for it once the conversation may be over.
+    fs::remove_file(
+        stand
+            .state
+            .join("spool/recording")
+            .join(format!("{}.sln16", doomed.as_str())),
+    )?;
     stand.application.refuse_recordings(false);
     let again = stand.application.recording(&refused).await?;
     assert!(!again.is_empty(), "a recording sent again arrived empty");
+    stand
+        .reported("a recording whose file is gone", true, |report| {
+            matches!(report, Report::RecordingLost { recording, .. } if *recording == doomed)
+        })
+        .await?;
+    if !stand
+        .controller
+        .comes_to_say(&format!("RECORDING {} IS LOST", doomed.as_str()))
+        .await
+    {
+        return Err("the controller did not say a recording is lost".into());
+    }
     no_recording_is_left(stand, "after a refused recording was sent again").await?;
 
     // A recording ends with the last participant, and the conversation
