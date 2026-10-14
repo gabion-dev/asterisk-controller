@@ -56,7 +56,7 @@ use node_protocol::{
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader},
-    net::{TcpListener, TcpStream},
+    net::{TcpListener, TcpStream, UdpSocket},
     process::{Child, Command as Process},
     sync::{Mutex, mpsc},
     time::timeout,
@@ -145,9 +145,81 @@ fn asterisk_tree() -> TestResult<PathBuf> {
     }
 }
 
-/// A port nothing listens on right now.
+/// A port nothing listens on right now, as the system offers one.
 async fn free_port() -> TestResult<u16> {
     Ok(TcpListener::bind("127.0.0.1:0").await?.local_addr()?.port())
+}
+
+/// How many ports the node and the network each get for audio: ten calls
+/// of RTP and RTCP in pairs.
+const AUDIO_PORTS: u16 = 20;
+
+/// How many ports the system is asked for before the test gives up on
+/// finding one that is free and apart from the others.
+const PORT_ATTEMPTS: usize = 64;
+
+/// The ports the test gives out: none twice, none inside a range of audio
+/// ports, and none in use over UDP or TCP.
+///
+/// The system offers a free TCP port when asked, but it offers them in
+/// order on some systems (macOS), so a port asked for after a range of
+/// audio ports can fall inside that range — the network's SIP port inside
+/// the node's audio ports, say, and the node's RTCP then lands on it as
+/// "PJSIP syntax error" packets. And it says nothing of UDP, which is what
+/// SIP and audio use. So every port is checked over UDP too, and what was
+/// given out is remembered.
+struct Ports {
+    taken: Vec<std::ops::RangeInclusive<u16>>,
+}
+
+impl Ports {
+    fn new() -> Self {
+        Self { taken: Vec::new() }
+    }
+
+    fn is_taken(&self, port: u16) -> bool {
+        self.taken.iter().any(|range| range.contains(&port))
+    }
+
+    async fn free_over_udp(port: u16) -> bool {
+        UdpSocket::bind(("127.0.0.1", port)).await.is_ok()
+    }
+
+    /// One port, free over TCP and UDP and not given out before.
+    async fn one(&mut self) -> TestResult<u16> {
+        for _ in 0..PORT_ATTEMPTS {
+            let port = free_port().await?;
+            if self.is_taken(port) || !Self::free_over_udp(port).await {
+                continue;
+            }
+            self.taken.push(port..=port);
+            return Ok(port);
+        }
+        Err(format!("no port apart from the others was found in {PORT_ATTEMPTS} attempts").into())
+    }
+
+    /// The first of [`AUDIO_PORTS`] consecutive ports, beginning on an even
+    /// one (audio goes in pairs), all free over UDP and none given out
+    /// before.
+    async fn audio_range(&mut self) -> TestResult<u16> {
+        'attempts: for _ in 0..PORT_ATTEMPTS {
+            let first = free_port().await? & !1;
+            let Some(last) = first.checked_add(AUDIO_PORTS - 1) else {
+                continue;
+            };
+            for port in first..=last {
+                if self.is_taken(port) || !Self::free_over_udp(port).await {
+                    continue 'attempts;
+                }
+            }
+            self.taken.push(first..=last);
+            return Ok(first);
+        }
+        Err(format!(
+            "no range of {AUDIO_PORTS} audio ports apart from the others was found in {PORT_ATTEMPTS} attempts"
+        )
+        .into())
+    }
 }
 
 /// Where the operators of the test's telephone network are: the plain one
@@ -259,6 +331,24 @@ struct NetworkPorts {
     node_secure: u16,
 }
 
+impl NetworkPorts {
+    /// Give the network its ports, apart from the node's.
+    ///
+    /// `node` is the port the node listens on for operators — given out
+    /// already, named here so that the network knows where to call.
+    async fn allot(ports: &mut Ports, node: u16) -> TestResult<Self> {
+        Ok(Self {
+            http: ports.one().await?,
+            operator: ports.one().await?,
+            stranger: ports.one().await?,
+            secure: ports.one().await?,
+            audio: ports.audio_range().await?,
+            node,
+            node_secure: ports.one().await?,
+        })
+    }
+}
+
 /// The certificates of the test: the node's, which the network judges, and
 /// the network's, which the node judges — each made for the address it is
 /// reached at.
@@ -347,7 +437,11 @@ fn write_network_configuration(
         ),
         (
             "rtp.conf",
-            format!("[general]\nrtpstart = {}\nrtpend = {}\n", ports.audio, ports.audio.saturating_add(19)),
+            format!(
+                "[general]\nrtpstart = {}\nrtpend = {}\n",
+                ports.audio,
+                ports.audio.saturating_add(AUDIO_PORTS - 1)
+            ),
         ),
         ("manager.conf", "[general]\nenabled = no\n".into()),
         // The module of call records is in the tree, so it is required, and
@@ -1737,22 +1831,14 @@ impl Stand {
         let state = root.join("node");
         fs::create_dir_all(&state)?;
 
-        let http_port = free_port().await?;
-        let controller_port = free_port().await?;
-        let sip_port = free_port().await?;
-        // Audio ports go in pairs that begin on an even one.
-        let audio_port = free_port().await? & !1;
+        let mut ports = Ports::new();
+        let http_port = ports.one().await?;
+        let controller_port = ports.one().await?;
+        let sip_port = ports.one().await?;
+        let audio_port = ports.audio_range().await?;
         let application = Application::open().await?;
         let application_port = application.port;
-        let network_ports = NetworkPorts {
-            http: free_port().await?,
-            operator: free_port().await?,
-            stranger: free_port().await?,
-            secure: free_port().await?,
-            audio: free_port().await? & !1,
-            node: sip_port,
-            node_secure: free_port().await?,
-        };
+        let network_ports = NetworkPorts::allot(&mut ports, sip_port).await?;
         let operators = OperatorPorts {
             plain: network_ports.operator,
             secure: network_ports.secure,
@@ -1774,7 +1860,11 @@ impl Stand {
             "--asterisk-http".into(),
             format!("127.0.0.1:{http_port}").into(),
             "--audio-ports".into(),
-            format!("{audio_port}-{}", audio_port.saturating_add(19)).into(),
+            format!(
+                "{audio_port}-{}",
+                audio_port.saturating_add(AUDIO_PORTS - 1)
+            )
+            .into(),
             "--sip".into(),
             format!("127.0.0.1:{sip_port}").into(),
             "--sip-tls".into(),
