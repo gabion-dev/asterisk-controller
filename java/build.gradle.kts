@@ -24,7 +24,7 @@ plugins {
     signing
     // Null is checked when the library compiles, as in the framework it is
     // compiled into: NullAway, run by Error Prone, of the same versions.
-    id("net.ltgt.errorprone") version "4.1.0"
+    id("net.ltgt.errorprone") version "5.1.1"
 }
 
 group = "dev.gabion"
@@ -57,23 +57,23 @@ repositories {
 dependencies {
     // The versions the Gabion framework itself uses: the library is compiled
     // into an application built on them.
-    api("tools.jackson.core:jackson-databind:3.0.3")
-    api("org.jspecify:jspecify:1.0.0")
+    api("tools.jackson.core:jackson-databind:3.1.5")
+    api("org.jspecify:jspecify:1.0.1")
 
-    errorprone("com.google.errorprone:error_prone_core:2.36.0")
-    errorprone("com.uber.nullaway:nullaway:0.12.3")
+    errorprone("com.google.errorprone:error_prone_core:2.50.0")
+    errorprone("com.uber.nullaway:nullaway:0.14.2")
 }
 
 java {
     toolchain {
-        languageVersion = JavaLanguageVersion.of(21)
+        languageVersion = JavaLanguageVersion.of(25)
     }
     // Central takes a library only with its sources and its documentation.
     withSourcesJar()
     withJavadocJar()
 }
 
-val generateProtocol by tasks.registering(Exec::class) {
+val generateProtocol = tasks.register<Exec>("generateProtocol") {
     description = "Generates the Java message types from the protocol description."
     group = "build"
 
@@ -122,7 +122,7 @@ sourceSets {
 // exchange with the controller. They are not tests in the build tool's sense
 // — each is one program with one verdict — and are run by the `vectorCheck`
 // and `serviceCheck` tasks below.
-val vectors: SourceSet by sourceSets.creating {
+val vectors: SourceSet = sourceSets.create("vectors") {
     compileClasspath += sourceSets.main.get().output
     runtimeClasspath += sourceSets.main.get().output
 }
@@ -130,7 +130,7 @@ val vectors: SourceSet by sourceSets.creating {
 configurations[vectors.implementationConfigurationName].extendsFrom(configurations.api.get())
 
 tasks.withType<JavaCompile>().configureEach {
-    options.release = 21
+    options.release = 25
     // Every warning the compiler knows is an error — Error Prone's too:
     // generated code is held to the same standard as code written by hand.
     options.compilerArgs.addAll(listOf("-Xlint:all", "-Werror", "-proc:none"))
@@ -142,7 +142,7 @@ tasks.withType<JavaCompile>().configureEach {
     }
 }
 
-val vectorCheck by tasks.registering(JavaExec::class) {
+val vectorCheck = tasks.register<JavaExec>("vectorCheck") {
     description = "Runs the library through the vectors it shares with the controller."
     group = "verification"
 
@@ -156,7 +156,7 @@ val vectorCheck by tasks.registering(JavaExec::class) {
     args(protocolPackage, messages.asFile.path, audioFrames.asFile.path, fingerprints.asFile.path)
 }
 
-val buildController by tasks.registering(Exec::class) {
+val buildController = tasks.register<Exec>("buildController") {
     description = "Builds the controller the service check talks to."
     group = "build"
 
@@ -164,7 +164,7 @@ val buildController by tasks.registering(Exec::class) {
     commandLine("cargo", "build", "--quiet", "--locked", "-p", "asterisk-controller")
 }
 
-val serviceCheck by tasks.registering(JavaExec::class) {
+val serviceCheck = tasks.register<JavaExec>("serviceCheck") {
     description = "Plays the application on the controller's service connection with this library."
     group = "verification"
 
@@ -198,7 +198,7 @@ tasks.javadoc {
 
 // What is written by hand is documented in full: a missing comment there is
 // an error. The generated types are on its classpath, not in its sources.
-val handwrittenJavadoc by tasks.registering(Javadoc::class) {
+val handwrittenJavadoc = tasks.register<Javadoc>("handwrittenJavadoc") {
     description = "Checks that the hand-written part of the library is documented in full."
     group = "verification"
 
@@ -288,7 +288,7 @@ tasks.named("publishLibraryPublicationToBundleRepository") {
     doFirst { delete(bundleDirectory) }
 }
 
-val centralBundle by tasks.registering(Zip::class) {
+val centralBundle = tasks.register<Zip>("centralBundle") {
     description = "Packs the library, its sources, documentation, POM, signatures and checksums for Central."
     group = "publishing"
 

@@ -15,12 +15,12 @@ workspace = true
 [dependencies]
 regress = "0.12.0"
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
-sha2 = "0.11.0"
+serde_json = "1.0.154"
+sha2 = "0.11.1"
 
 [build-dependencies]
 prettyplease = "0.3.0"
 schemars = "0.8"
-serde_json = "1.0.151"
-syn = "3.0.6"
+serde_json = "1.0.154"
+syn = "3.0.9"
 typify = "0.8.0"

@@ -47,11 +47,11 @@ jobs:
       - name: Tests
         run: cargo test --locked
 
-      - name: Java 21
+      - name: Java 25
         uses: actions/setup-java@v6
         with:
           distribution: temurin
-          java-version: '21'
+          java-version: '25'
 
       # Builds the Java library — generating its types from the protocol
       # description — with every compiler warning as an error, and runs it
