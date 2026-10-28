@@ -38,7 +38,8 @@ import java.util.concurrent.TimeUnit;
  * client and no server, and the check takes no library the application would not.
  *
  * The controller is given a tree with nothing in it but the build record of the Asterisk it is
- * checked against — the tree {@code scripts/fetch-asterisk.sh} fetches — since it drives no other.
+ * checked against — the tree {@code scripts/fetch-asterisk.sh} fetches — since it drives no other,
+ * and a run directory of its own next to its state, as every node is.
  *
  * Usage: java ServiceCheck <controller binary> <build record of the fetched Asterisk>
  */
@@ -66,6 +67,7 @@ public final class ServiceCheck {
         Path tree = Files.createDirectories(root.resolve("tree"));
         Files.copy(record, tree.resolve("BUILD-INFO.txt"));
         Path state = Files.createDirectories(root.resolve("node"));
+        Path run = Files.createDirectories(root.resolve("run"));
         Path secret = Files.writeString(state.resolve("node-secret"), SECRET);
         Files.setPosixFilePermissions(secret, PosixFilePermissions.fromString("rw-------"));
 
@@ -77,6 +79,7 @@ public final class ServiceCheck {
                     "--application", "ws://127.0.0.1:" + server.getLocalPort(),
                     "--asterisk-tree", tree.toString(),
                     "--state", state.toString(),
+                    "--run", run.toString(),
                     "--asterisk-http", "127.0.0.1:" + freePort(),
                     "--audio-ports", "40000-40001")
                     .redirectErrorStream(true)
