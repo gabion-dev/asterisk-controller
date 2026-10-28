@@ -75,6 +75,8 @@ impl Controller {
             .arg(root.join("tree"))
             .arg("--state")
             .arg(root.join("node"))
+            .arg("--run")
+            .arg(root.join("run"))
             .arg("--asterisk-http")
             .arg(format!("127.0.0.1:{}", free()?))
             .args(["--audio-ports", "40000-40019"])

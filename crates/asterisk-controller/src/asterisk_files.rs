@@ -373,13 +373,16 @@ pub fn write(
         "db",
         "keys/keys",
         recordings::SPOOL,
-        "run",
         call_records.as_str(),
         "cache",
     ] {
         let directory = config.state.join(directory);
         fs::create_dir_all(&directory).map_err(|error| failed(&directory, error))?;
     }
+    // The run directory lies outside the state directory, where its owner
+    // put it (Config::run); its console socket is no one else's to reach.
+    fs::create_dir_all(&config.run).map_err(|error| failed(&config.run, error))?;
+    owner_only(&config.run, 0o700).map_err(|error| failed(&config.run, error))?;
     // The configuration carries the secret of the control user and the
     // passwords of the operators.
     owner_only(&etc, 0o700).map_err(|error| failed(&etc, error))?;
@@ -550,7 +553,7 @@ fn directories(config: &Config) -> String {
         state.join("db").display(),
         state.join("keys").display(),
         state.join("spool").display(),
-        state.join("run").display(),
+        config.run.display(),
         state.join("log").display(),
         state.join("cache").display(),
         lib = lib.display(),
@@ -916,6 +919,7 @@ mod tests {
             application_url: "ws://127.0.0.1:4001/".into(),
             asterisk_tree: PathBuf::from("/tree"),
             state: PathBuf::from("/state"),
+            run: PathBuf::from("/run-directory"),
             asterisk_http: "127.0.0.1:4002".parse()?,
             audio_ports: (4100, 4199),
             sip: sip.map(str::parse).transpose()?,

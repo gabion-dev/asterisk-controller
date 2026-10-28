@@ -78,7 +78,7 @@ Start the controller first:
 ```sh
 asterisk-controller --node <name> --listen 127.0.0.1:<port> \
     --application <wss://host[:port][/path]> \
-    --asterisk-tree <directory> --state <directory> \
+    --asterisk-tree <directory> --state <directory> --run <directory> \
     --asterisk-http 127.0.0.1:<port> --audio-ports <first>-<last> \
     [--sip <address:port>] [--sip-public <address>] \
     [--sip-tls <address:port> --sip-tls-certificate <file> --sip-tls-key <file>]
@@ -93,11 +93,16 @@ asterisk-controller --node <name> --listen 127.0.0.1:<port> \
   `localhost`.
 - `--asterisk-tree` — the Asterisk tree.
 - `--state` — the node's state directory, an absolute path. It may not hold
-  control characters or any of `, & ; $ ( ) [ ] { } \ " ' |`. Keep it short:
-  Asterisk's console socket, `<state>/run/asterisk.ctl`, must fit a Unix
-  socket path — at most 107 bytes on Linux, 103 on macOS. Asterisk would cut
-  a longer one and make its socket outside the state directory, so the
-  controller does not start with such a path.
+  control characters or any of `, & ; $ ( ) [ ] { } \ " ' |`.
+- `--run` — Asterisk's run directory, an absolute path: its console socket,
+  `<run>/asterisk.ctl`, and its pid file. Apart from the state directory
+  because a Unix socket path is short — at most 107 bytes on Linux, 103 on
+  macOS. Asterisk would cut a longer one and make its socket elsewhere, so
+  the controller does not start with such a path; the state directory may
+  then lie as deep as it likes. The controller makes the directory, readable
+  by its owner only. It never empties it: it may be started next to a
+  running Asterisk, whose socket that is. Removing what a stopped Asterisk
+  left behind is for whoever launches the node.
 - `--asterisk-http` — where Asterisk's HTTP server and control interface
   listen; the controller writes it into Asterisk's configuration and
   connects there. A loopback address only.

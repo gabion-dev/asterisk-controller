@@ -1875,6 +1875,8 @@ impl Stand {
             tree.clone().into_os_string(),
             "--state".into(),
             state.clone().into_os_string(),
+            "--run".into(),
+            state.join("run").into_os_string(),
             "--asterisk-http".into(),
             format!("127.0.0.1:{http_port}").into(),
             "--audio-ports".into(),

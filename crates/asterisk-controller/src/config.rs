@@ -17,7 +17,8 @@ pub const PROTOCOL_VERSION: u64 = 1;
 
 const USAGE: &str = "usage: asterisk-controller \
     --node <name> --listen <127.0.0.1:port> --application <wss://host[:port][/path]> \
-    --asterisk-tree <directory> --state <directory> --asterisk-http <127.0.0.1:port> \
+    --asterisk-tree <directory> --state <directory> --run <directory> \
+    --asterisk-http <127.0.0.1:port> \
     --audio-ports <first>-<last> [--sip <address:port>] [--sip-public <address>] \
     [--sip-tls <address:port> --sip-tls-certificate <file> --sip-tls-key <file>]";
 
@@ -41,8 +42,15 @@ pub struct Config {
     pub asterisk_tree: PathBuf,
     /// Where everything that belongs to this node alone lives: the
     /// configuration the controller writes for Asterisk, the directories
-    /// Asterisk writes to, and the node's stored settings.
+    /// Asterisk writes to, and the node's stored settings — all but its
+    /// run directory.
     pub state: PathBuf,
+    /// Asterisk's run directory: the socket of its console and its pid
+    /// file, which live as long as Asterisk does. Separate from the state
+    /// directory because a Unix socket path is short: whoever launches the
+    /// node puts it where the socket fits, and the state directory may lie
+    /// as deep as it likes.
+    pub run: PathBuf,
     /// Where Asterisk's own HTTP server listens. Loopback only: it carries
     /// call control, and nothing on a telephony node accepts commands from
     /// the network.
@@ -87,6 +95,7 @@ impl Config {
         let mut application_url = None;
         let mut asterisk_tree = None;
         let mut state = None;
+        let mut run = None;
         let mut asterisk_http = None;
         let mut audio_ports = None;
         let mut sip = None;
@@ -106,6 +115,7 @@ impl Config {
                 "--application" => application_url = Some(application(&value)?),
                 "--asterisk-tree" => asterisk_tree = Some(PathBuf::from(value)),
                 "--state" => state = Some(state_directory(&value)?),
+                "--run" => run = Some(run_directory(&value)?),
                 "--asterisk-http" => asterisk_http = Some(loopback(&name, &value)?),
                 "--audio-ports" => audio_ports = Some(port_range(&value)?),
                 "--sip" => {
@@ -157,6 +167,7 @@ impl Config {
             application_url: application_url.ok_or_else(|| missing("--application"))?,
             asterisk_tree: asterisk_tree.ok_or_else(|| missing("--asterisk-tree"))?,
             state: state.ok_or_else(|| missing("--state"))?,
+            run: run.ok_or_else(|| missing("--run"))?,
             asterisk_http: asterisk_http.ok_or_else(|| missing("--asterisk-http"))?,
             audio_ports: audio_ports.ok_or_else(|| missing("--audio-ports"))?,
             sip,
@@ -244,10 +255,6 @@ fn application(value: &str) -> Result<String, String> {
 ///
 /// The path is absolute: Asterisk's configuration names its directories by
 /// it, and a relative one would be read from wherever Asterisk was started.
-/// And it is short enough for the socket of Asterisk's console inside it
-/// ([`CONSOLE_SOCKET`]): Asterisk cuts a longer socket path to what a Unix
-/// socket address holds and makes the socket at the cut path — outside the
-/// state directory.
 fn state_directory(value: &str) -> Result<PathBuf, String> {
     if value
         .chars()
@@ -267,22 +274,44 @@ fn state_directory(value: &str) -> Result<PathBuf, String> {
              was started"
         ));
     }
+    Ok(path)
+}
+
+/// Asterisk's run directory. Absolute, for the reason the state directory
+/// is; without control characters, which would end the line of
+/// Asterisk's configuration that names it; and short enough for the
+/// socket of Asterisk's console inside it ([`CONSOLE_SOCKET`]): Asterisk
+/// cuts a longer socket path to what a Unix socket address holds and makes
+/// the socket at the cut path — outside the run directory.
+fn run_directory(value: &str) -> Result<PathBuf, String> {
+    if value.chars().any(char::is_control) {
+        return Err(format!(
+            "--run {value:?}: the path may not hold control characters — Asterisk's \
+             configuration names the directory on one line"
+        ));
+    }
+    let path = PathBuf::from(value);
+    if !path.is_absolute() {
+        return Err(format!(
+            "--run {value:?}: the path must be absolute — Asterisk would read a relative one \
+             from wherever it was started"
+        ));
+    }
     let socket = path.join(CONSOLE_SOCKET);
     let length = socket.as_os_str().len();
     if length > LONGEST_SOCKET_PATH {
         return Err(format!(
-            "--state {value:?}: the socket of Asterisk's console, {}, would be {length} bytes \
+            "--run {value:?}: the socket of Asterisk's console, {}, would be {length} bytes \
              long; a Unix socket path holds at most {LONGEST_SOCKET_PATH} here, and Asterisk \
-             would cut it and make the socket outside the state directory",
+             would cut it and make the socket outside the run directory",
             socket.display()
         ));
     }
     Ok(path)
 }
 
-/// Where Asterisk makes the socket of its console: its run directory inside
-/// the state directory, and the socket's default name.
-const CONSOLE_SOCKET: &str = "run/asterisk.ctl";
+/// The socket of Asterisk's console in its run directory: the default name.
+const CONSOLE_SOCKET: &str = "asterisk.ctl";
 
 /// The longest path a Unix socket address holds: the size of `sun_path`
 /// less its terminating zero — 108 bytes on Linux (unix(7)), 104 on macOS
@@ -340,7 +369,7 @@ fn port_range(value: &str) -> Result<(u16, u16), String> {
 mod tests {
     use super::{
         CONSOLE_SOCKET, Config, LONGEST_SOCKET_PATH, application, node_name, port_range,
-        state_directory,
+        run_directory, state_directory,
     };
 
     #[test]
@@ -358,11 +387,23 @@ mod tests {
     }
 
     #[test]
-    fn a_state_directory_leaves_room_for_the_console_socket() {
+    fn a_run_directory_leaves_room_for_the_console_socket() {
         let room = LONGEST_SOCKET_PATH - "/".len() - CONSOLE_SOCKET.len();
-        let longest = format!("/{}", "s".repeat(room - 1));
-        assert!(state_directory(&longest).is_ok());
-        assert!(state_directory(&format!("{longest}s")).is_err());
+        let longest = format!("/{}", "r".repeat(room - 1));
+        assert!(run_directory(&longest).is_ok());
+        assert!(run_directory(&format!("{longest}r")).is_err());
+    }
+
+    #[test]
+    fn a_state_directory_may_lie_as_deep_as_it_likes() {
+        let deep = format!("/{}", "s".repeat(4 * LONGEST_SOCKET_PATH));
+        assert!(state_directory(&deep).is_ok());
+    }
+
+    #[test]
+    fn a_run_directory_is_absolute_and_on_one_line() {
+        assert!(run_directory("run").is_err());
+        assert!(run_directory("/a\nb").is_err());
     }
 
     #[test]
@@ -423,6 +464,8 @@ mod tests {
             "/tree",
             "--state",
             "/state",
+            "--run",
+            "/run-directory",
             "--asterisk-http",
             "127.0.0.1:4002",
             "--audio-ports",
