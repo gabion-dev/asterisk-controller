@@ -1727,11 +1727,14 @@ fn is_hang_up(report: &Report) -> bool {
     matches!(report, Report::ParticipantHungUp { .. })
 }
 
+/// The fallback's message was given to a caller whose call came without a
+/// number: the report says so by having none.
 fn is_message(report: &Report) -> bool {
     matches!(
         report,
         Report::FallbackApplied {
             fallback: node_protocol::messages::FallbackKind::Message,
+            caller: None,
             ..
         }
     )
@@ -2073,18 +2076,22 @@ impl Stand {
     /// itself the channel that arrives, and it arrives answered: Asterisk
     /// runs the dialplan for it only once the test has connected to it.
     async fn call_from_a_phone(&self) -> TestResult<(String, Phone, Owner)> {
-        let (caller, phone) = self.a_phone_calls(DIALED).await?;
+        let (caller, phone) = self.a_phone_calls(DIALED, None).await?;
         Ok((caller, phone, Owner::accept(&self.application).await?))
     }
 
-    /// A caller who speaks and listens calls `number`. Whether a
-    /// conversation connection follows is for the scenario to say.
-    async fn a_phone_calls(&self, number: &str) -> TestResult<(String, Phone)> {
+    /// A caller who speaks and listens calls `number`, showing `from` as
+    /// their number, or none. Whether a conversation connection follows is
+    /// for the scenario to say.
+    async fn a_phone_calls(&self, number: &str, from: Option<&str>) -> TestResult<(String, Phone)> {
+        let shown = from.map_or_else(String::new, |from| {
+            format!("&callerId={}", from.replace('+', "%2B"))
+        });
         let caller = self
             .control
             .create_channel(&format!(
                 "endpoint=WebSocket/INCOMING/c(ulaw)&extension={}\
-                 &context=gabion-from-network&priority=1",
+                 &context=gabion-from-network&priority=1{shown}",
                 number.replace('+', "%2B")
             ))
             .await?;
@@ -4881,6 +4888,7 @@ async fn a_fallback_transfer_finds_the_number_busy(stand: &mut Stand) -> TestRes
                     failure: FallbackFailure::NotConnected {
                         departure: Departure::Busy
                     },
+                    caller: None,
                     ..
                 }
             )
@@ -4949,7 +4957,9 @@ async fn the_call_the_node_placed(stand: &Stand) -> TestResult<serde_json::Value
 async fn the_node_without_the_application(stand: &mut Stand) -> TestResult {
     stand.application.go_away().await;
 
-    let (_caller, mut phone) = stand.a_phone_calls(DIALED_WITH_TRANSFER).await?;
+    let (_caller, mut phone) = stand
+        .a_phone_calls(DIALED_WITH_TRANSFER, Some(CALLER))
+        .await?;
     let network_end = the_call_the_node_placed(stand).await?;
     assert_eq!(
         network_end.pointer("/caller/number"),
@@ -4967,7 +4977,7 @@ async fn the_node_without_the_application(stand: &mut Stand) -> TestResult {
         .await?;
     phone.hears(SECOND_SAYS, true).await?;
     second_phone.hears(Phone::SAYS, true).await?;
-    the_fallback_is_reported(stand).await?;
+    the_fallback_is_reported(stand, Some(CALLER)).await?;
 
     // The application is there again.
     stand.application.come_back().await?;
@@ -5012,7 +5022,7 @@ async fn the_node_without_the_application(stand: &mut Stand) -> TestResult {
     stand
         .expect_a_group_of(2, "after a ringing caller was transferred by a fallback")
         .await?;
-    the_fallback_is_reported(stand).await?;
+    the_fallback_is_reported(stand, None).await?;
     // The caller hangs up: the one who was called for them is not kept.
     stand
         .control
@@ -5039,15 +5049,19 @@ async fn the_node_without_the_application(stand: &mut Stand) -> TestResult {
 }
 
 /// The node carried out a fallback's transfer by itself, and keeps the two
-/// connected while it looks for the application: both are reported.
-async fn the_fallback_is_reported(stand: &Stand) -> TestResult {
+/// connected while it looks for the application: both are reported. The
+/// report names the caller by the number their call came with — `from` —
+/// so that whoever reads it can call them back; with none, it names none.
+async fn the_fallback_is_reported(stand: &Stand, from: Option<&str>) -> TestResult {
     stand
         .reported("a fallback's transfer", true, |report| {
             matches!(report, Report::FallbackApplied {
                 fallback: node_protocol::messages::FallbackKind::Transfer,
                 origin: Origin::DialedNumber { dialed },
+                caller,
                 ..
-            } if dialed.as_str() == DIALED_WITH_TRANSFER)
+            } if dialed.as_str() == DIALED_WITH_TRANSFER
+                && caller.as_ref().map(|number| number.as_str()) == from)
         })
         .await?;
     stand

@@ -860,6 +860,69 @@
    }
   },
   {
+   "name": "report: fallback applied, with the caller's number",
+   "type": "NodeMessage",
+   "accept": true,
+   "json": {
+    "type": "report",
+    "id": "7f1c2a8e-3b4d-4e5f-9a6b-1c2d3e4f5a6b",
+    "report": {
+     "type": "fallback_applied",
+     "conversation": "c-1",
+     "origin": {
+      "type": "dialed_number",
+      "dialed": "+19715870050"
+     },
+     "fallback": "transfer",
+     "caller": "+15035550100",
+     "at_unix_ms": 1791226292824
+    }
+   }
+  },
+  {
+   "name": "report: fallback applied, with a caller's number not in E.164 form",
+   "type": "NodeMessage",
+   "accept": false,
+   "json": {
+    "type": "report",
+    "id": "7f1c2a8e-3b4d-4e5f-9a6b-1c2d3e4f5a6b",
+    "report": {
+     "type": "fallback_applied",
+     "conversation": "c-1",
+     "origin": {
+      "type": "dialed_number",
+      "dialed": "+19715870050"
+     },
+     "fallback": "message",
+     "caller": "5035550100",
+     "at_unix_ms": 1791226292824
+    }
+   }
+  },
+  {
+   "name": "report: fallback failed, with the caller's number",
+   "type": "NodeMessage",
+   "accept": true,
+   "json": {
+    "type": "report",
+    "id": "7f1c2a8e-3b4d-4e5f-9a6b-1c2d3e4f5a6b",
+    "report": {
+     "type": "fallback_failed",
+     "conversation": "c-1",
+     "origin": {
+      "type": "dialed_number",
+      "dialed": "+19715870051"
+     },
+     "fallback": "message",
+     "failure": {
+      "type": "caller_left"
+     },
+     "caller": "+15035550100",
+     "at_unix_ms": 1759900000000
+    }
+   }
+  },
+  {
    "name": "report without an identifier",
    "type": "NodeMessage",
    "accept": false,

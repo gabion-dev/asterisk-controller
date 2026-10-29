@@ -1792,6 +1792,9 @@
             "fallback": {
               "$ref": "#/definitions/FallbackKind"
             },
+            "caller": {
+              "$ref": "#/definitions/PhoneNumber"
+            },
             "at_unix_ms": {
               "type": "integer",
               "minimum": 0,
@@ -1805,7 +1808,8 @@
             "fallback",
             "at_unix_ms"
           ],
-          "additionalProperties": false
+          "additionalProperties": false,
+          "description": "The fallback of the caller's entry was carried out. The caller's number is absent when the medium gave none in full form."
         },
         {
           "type": "object",
@@ -1825,6 +1829,9 @@
             "failure": {
               "$ref": "#/definitions/FallbackFailure"
             },
+            "caller": {
+              "$ref": "#/definitions/PhoneNumber"
+            },
             "at_unix_ms": {
               "type": "integer",
               "minimum": 0,
@@ -1840,7 +1847,7 @@
             "at_unix_ms"
           ],
           "additionalProperties": false,
-          "description": "The fallback of the caller's entry was begun and could not be carried out. Whoever the node hung up then is reported on their own."
+          "description": "The fallback of the caller's entry was begun and could not be carried out. Whoever the node hung up then is reported on their own. The caller's number is absent when the medium gave none in full form."
         },
         {
           "type": "object",

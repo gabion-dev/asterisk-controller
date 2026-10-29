@@ -108,9 +108,13 @@ const MEDIUM_READ_EVERY: Duration = Duration::from_secs(1);
 /// piled up without bound behind an application that does not read.
 const MEDIA_BACKLOG: usize = 256;
 /// How long the controller waits before it looks again for an instance of
-/// the application, while it keeps people connected with none. Until an
-/// instance listens there is no event to wait for: its listening is the
-/// state, and this is how often the state is read.
+/// the application, while it keeps people connected with none. Whether an
+/// instance will take the conversation is known only by offering it: the
+/// service connection's `welcome` says that some instance accepted the
+/// node, not that the conversation's own connection — through the address,
+/// to whichever instance — will be taken, and an instance that declines
+/// leaves nothing to wait for. Its taking is the state, and this is how
+/// often the state is read; the outcome is never decided by the clock.
 const LOOK_FOR_OWNER: Duration = Duration::from_secs(1);
 
 /// Why a conversation could not be carried on.
@@ -813,6 +817,10 @@ struct Conversation {
     /// for; `None` when nobody did, or when a controller started again did
     /// not find them. Whether they are still here is told by `members`.
     caller: Option<ParticipantId>,
+    /// The caller's number, when the medium gave it in full form. Kept
+    /// apart from `members`: the fallback is reported after they may have
+    /// left, and whoever is told of it needs to know whom to call back.
+    caller_number: Option<PhoneNumber>,
     /// What every name this controller gives in Asterisk for the
     /// conversation begins with: the conversation and the controller's run.
     names: String,
@@ -969,6 +977,7 @@ fn begin(
 
     let mut conversation = Conversation::blank(id.to_owned(), asterisk, node, origin);
     conversation.caller = Some(first.id.clone());
+    conversation.caller_number.clone_from(&first.number);
     conversation.members.push(first);
     conversation.participants = 1;
     Ok((conversation, opening))
@@ -1033,6 +1042,7 @@ impl Conversation {
             group_bridges: HashMap::new(),
             participants: 0,
             caller: None,
+            caller_number: None,
             names,
             unannounced: HashMap::new(),
             command_ids: HashSet::new(),
@@ -1059,11 +1069,13 @@ impl Conversation {
         };
         // The caller is the one who came through the entry: the one the node
         // did not call, so the one with no line.
-        let caller = found
+        let (caller, caller_number) = found
             .members
             .iter()
             .find(|member| member.line.is_none())
-            .map(|member| member.participant.clone());
+            .map_or((None, None), |member| {
+                (Some(member.participant.clone()), member.number.clone())
+            });
         let members: Vec<Member> = found
             .members
             .into_iter()
@@ -1096,6 +1108,7 @@ impl Conversation {
         conversation.groups_made = u64::try_from(group_bridges.len()).unwrap_or(u64::MAX);
         conversation.group_bridges = group_bridges;
         conversation.caller = caller;
+        conversation.caller_number = caller_number;
         // A group that has lost all but one of its people is no group.
         for group in groups {
             conversation.settle_group(group);
@@ -2056,10 +2069,12 @@ impl Conversation {
         self.fallback = FallbackProgress::Done;
         self.gather(&[caller.clone(), dialled.clone()]);
         let origin = self.origin.clone();
+        let caller = self.caller_number.clone();
         self.keep_report(|conversation, at_unix_ms| Report::FallbackApplied {
             conversation,
             origin,
             fallback: FallbackKind::Transfer,
+            caller,
             at_unix_ms,
         });
     }
@@ -2083,11 +2098,13 @@ impl Conversation {
     /// out, and why.
     fn fallback_failed(&self, fallback: FallbackKind, failure: FallbackFailure) {
         let origin = self.origin.clone();
+        let caller = self.caller_number.clone();
         self.keep_report(|conversation, at_unix_ms| Report::FallbackFailed {
             conversation,
             origin,
             fallback,
             failure,
+            caller,
             at_unix_ms,
         });
     }
@@ -2324,10 +2341,12 @@ impl Conversation {
             // is it carried out.
             Some(Pending::Message(..)) => {
                 let origin = self.origin.clone();
+                let caller = self.caller_number.clone();
                 self.keep_report(|conversation, at_unix_ms| Report::FallbackApplied {
                     conversation,
                     origin,
                     fallback: FallbackKind::Message,
+                    caller,
                     at_unix_ms,
                 });
                 Ok(())
