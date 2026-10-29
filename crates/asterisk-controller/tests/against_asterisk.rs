@@ -973,6 +973,18 @@ fn where_it_begins(samples: &[i16], rate: u32, frequency: u32) -> Option<usize> 
     Some((first + 1) * frame)
 }
 
+/// The level of a tone of `frequency` Hz in each twenty milliseconds of
+/// audio of `rate`, for a failure to show whether a tone was weak all along
+/// or missing in places.
+fn level_by_twenty_ms(samples: &[i16], rate: u32, frequency: u32) -> String {
+    let frame = usize::try_from(rate / 50).unwrap_or(1).max(1);
+    samples
+        .chunks(frame)
+        .map(|twenty_ms| format!("{:.0}", level(twenty_ms, rate, frequency)))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Audio as the application sends and receives it: sixteen bits, little-endian.
 fn to_bytes(samples: &[i16]) -> Vec<u8> {
     samples
@@ -3680,7 +3692,10 @@ async fn the_application_connects_participants(stand: &Stand) -> TestResult {
     assert!(
         matches!(heard, [said, other, leaked, others] if said > 7000.0 && other > 7000.0 && leaked < 500.0 && others > 7000.0),
         "said to one of two connected: they heard it, the other, and the other heard it and them \
-         at {heard:.0?}"
+         at {heard:.0?}; by twenty milliseconds, the one played to heard the tone at {} and the \
+         other at {}",
+        level_by_twenty_ms(to_first, Phone::RATE, 1000),
+        level_by_twenty_ms(to_first, Phone::RATE, SECOND_SAYS)
     );
     is_delivered(&mut owner).await?;
 
