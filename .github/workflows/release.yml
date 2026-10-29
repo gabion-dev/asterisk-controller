@@ -131,21 +131,10 @@ jobs:
     runs-on: ${{ matrix.runner }}
     env:
       MACOSX_DEPLOYMENT_TARGET: '13.0'
-      # The node's state directory of the checks lives in the temporary
-      # directory, and the socket of Asterisk's console inside it may not
-      # be longer than 103 bytes on macOS; the default one is too long.
-      TMPDIR: /tmp
 
     steps:
       - name: Check out
         uses: actions/checkout@v7
-
-      # The checks reach the operators of their telephone network and its
-      # stranger at addresses of their own.
-      - name: Loopback addresses of the checks
-        run: |
-          sudo ifconfig lo0 alias 127.0.0.2 up
-          sudo ifconfig lo0 alias 127.0.0.3 up
 
       - name: Rust toolchain
         run: rustup show active-toolchain
@@ -156,8 +145,8 @@ jobs:
       - name: Linter (strict)
         run: cargo clippy --all-targets --locked
 
-      - name: Asterisk the controller is pinned to
-        run: bash scripts/fetch-asterisk.sh
+      - name: Host of the checks against Asterisk
+        uses: ./.github/actions/asterisk-lab-host
 
       - name: Tests
         run: cargo test --locked

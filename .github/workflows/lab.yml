@@ -1,0 +1,69 @@
+# .github/workflows/lab.yml
+
+name: Lab on every platform
+
+on:
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: 'How many times in a row the checks against Asterisk run on each machine'
+        required: true
+        default: '25'
+
+permissions:
+  contents: read
+
+# =============================================================================
+# The controller against the pinned Asterisk, many times in a row, on a native
+# machine of every platform a release is built for — and nothing else.
+#
+# The defects of this code are races between the controller and Asterisk, and
+# timing that holds on one machine and not on a slower one: one green run
+# proves little, and the push checks run on one Linux machine only. This
+# workflow repeats the checks where a release would run them, without making
+# one: nothing is built for release, signed or published.
+#
+# Every run is made even after a failed one, so the result says how often the
+# checks fail, not only that they did.
+# =============================================================================
+
+jobs:
+  lab:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm, macos-15, macos-15-intel]
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+
+      - name: Rust toolchain
+        run: rustup show active-toolchain
+
+      - name: Host of the checks against Asterisk
+        uses: ./.github/actions/asterisk-lab-host
+
+      - name: The checks against Asterisk, again and again
+        env:
+          RUNS: ${{ github.event.inputs.runs }}
+        run: |
+          set -euo pipefail
+          if ! [[ "${RUNS}" =~ ^[1-9][0-9]*$ ]]; then
+            echo "ERROR: the number of runs is a positive whole number, not '${RUNS}'" >&2
+            exit 1
+          fi
+          failed=0
+          for run in $(seq 1 "${RUNS}"); do
+            echo "::group::run ${run} of ${RUNS}"
+            if cargo test --locked -p asterisk-controller --test against_asterisk; then
+              echo "run ${run} of ${RUNS} passed"
+            else
+              echo "::error::run ${run} of ${RUNS} failed"
+              failed=$((failed + 1))
+            fi
+            echo "::endgroup::"
+          done
+          echo "${failed} of ${RUNS} runs failed on ${{ matrix.runner }}"
+          test "${failed}" -eq 0

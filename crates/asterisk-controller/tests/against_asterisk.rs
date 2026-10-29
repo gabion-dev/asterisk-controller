@@ -960,6 +960,19 @@ fn level(samples: &[i16], rate: u32, frequency: u32) -> f64 {
     }
 }
 
+/// Where a tone of `frequency` Hz has begun in audio of `rate`: the sample
+/// after the first twenty milliseconds in which it is there at half its
+/// strength or more. Audio that arrives without a pause — a telephone
+/// connected to someone who speaks — holds what came before the tone too,
+/// and a level taken over that would weigh it in.
+fn where_it_begins(samples: &[i16], rate: u32, frequency: u32) -> Option<usize> {
+    let frame = usize::try_from(rate / 50).ok()?;
+    let first = samples
+        .chunks(frame)
+        .position(|twenty_ms| level(twenty_ms, rate, frequency) > 4000.0)?;
+    Some((first + 1) * frame)
+}
+
 /// Audio as the application sends and receives it: sixteen bits, little-endian.
 fn to_bytes(samples: &[i16]) -> Vec<u8> {
     samples
@@ -3640,12 +3653,29 @@ async fn the_application_connects_participants(stand: &Stand) -> TestResult {
     begins_to_play(&mut owner, 14, &first).await?;
     phone.forget();
     second_phone.forget();
-    let (to_first, to_second) = (phone.hear(4000).await?, second_phone.hear(4000).await?);
+    // The tone reaches the first telephone a while after it has begun to
+    // play, and the two hear each other all along: a second of each is
+    // heard, and half a second from where the tone has begun is judged —
+    // the same stretch of what the second telephone heard alongside.
+    let (by_first, by_second) = (phone.hear(8000).await?, second_phone.hear(8000).await?);
+    let Some((to_first, to_second)) =
+        where_it_begins(&by_first, Phone::RATE, 1000).and_then(|begins| {
+            let judged = begins..begins + 4000;
+            Some((by_first.get(judged.clone())?, by_second.get(judged)?))
+        })
+    else {
+        return Err(format!(
+            "of two connected, the one played to did not hear half a second of the tone in a \
+             second; over it all the tone was at {:.0}",
+            level(&by_first, Phone::RATE, 1000)
+        )
+        .into());
+    };
     let heard = [
-        level(&to_first, Phone::RATE, 1000),
-        level(&to_first, Phone::RATE, SECOND_SAYS),
-        level(&to_second, Phone::RATE, 1000),
-        level(&to_second, Phone::RATE, Phone::SAYS),
+        level(to_first, Phone::RATE, 1000),
+        level(to_first, Phone::RATE, SECOND_SAYS),
+        level(to_second, Phone::RATE, 1000),
+        level(to_second, Phone::RATE, Phone::SAYS),
     ];
     assert!(
         matches!(heard, [said, other, leaked, others] if said > 7000.0 && other > 7000.0 && leaked < 500.0 && others > 7000.0),

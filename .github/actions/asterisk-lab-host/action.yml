@@ -1,0 +1,35 @@
+# .github/actions/asterisk-lab-host/action.yml
+
+name: Host of the checks against Asterisk
+description: >-
+  Makes a runner able to run the controller against the pinned Asterisk:
+  the addresses and the temporary directory the checks need, and the
+  Asterisk tree itself. One place for every workflow that runs them.
+
+runs:
+  using: composite
+  steps:
+    # The checks reach the operators of their telephone network and its
+    # stranger at addresses of their own. On Linux they are on the loopback
+    # already; on macOS only 127.0.0.1 is.
+    - name: Loopback addresses of the checks
+      if: runner.os == 'macOS'
+      shell: bash
+      run: |
+        sudo ifconfig lo0 alias 127.0.0.2 up
+        sudo ifconfig lo0 alias 127.0.0.3 up
+
+    # The node's state directory of the checks lives in the temporary
+    # directory, and the socket of Asterisk's console inside it may not be
+    # longer than 103 bytes on macOS; the default one is too long.
+    - name: Temporary directory of the checks
+      if: runner.os == 'macOS'
+      shell: bash
+      run: echo "TMPDIR=/tmp" >> "${GITHUB_ENV}"
+
+    # The controller is checked against the Asterisk it is pinned to: the
+    # release is fetched and verified against its pinned checksum, and the
+    # tests start that Asterisk and run real calls through the controller.
+    - name: Asterisk the controller is pinned to
+      shell: bash
+      run: bash scripts/fetch-asterisk.sh
