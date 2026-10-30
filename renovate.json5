@@ -1,0 +1,29 @@
+// renovate.json5
+//
+// The dependency updates of this repository come from the organisation's
+// Renovate (gabion-dev/renovate-config): the preset below carries the
+// policy — a seven-day release age, grouped and scheduled pull requests,
+// a Dependency Dashboard issue, vulnerability fixes without delay, GitHub
+// Actions pinned by digest. Only what is particular to this repository is
+// written here.
+//
+// The Rust toolchain (rust-toolchain.toml) and the crates (Cargo.toml,
+// Cargo.lock) are read by Renovate's own managers; the Java version the
+// workflows set up carries a `# renovate:` line and moves with the other
+// Java pins of the organisation. The Java library verifies its dependencies
+// by checksum (java/gradle/verification-metadata.xml): a pull request that
+// moves one of them stays red until the metadata is regenerated with the
+// Gradle wrapper.
+{
+  $schema: "https://docs.renovatebot.com/renovate-schema.json",
+  extends: ["local>gabion-dev/renovate-config"],
+  packageRules: [
+    {
+      description: "schemars 1 waits for typify, which generates the Rust types of the node protocol from its description: it builds on typify-impl, whose newest release requires schemars 0.8, and build.rs hands typify a schemars 0.8 RootSchema. Approve on the Dependency Dashboard when a release of typify-impl admits schemars 1.",
+      matchDatasources: ["crate"],
+      matchPackageNames: ["schemars"],
+      matchUpdateTypes: ["major"],
+      dependencyDashboardApproval: true,
+    },
+  ],
+}

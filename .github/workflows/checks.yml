@@ -48,6 +48,7 @@ jobs:
         uses: actions/setup-java@v6
         with:
           distribution: temurin
+          # renovate: datasource=custom.java-lts depName=java
           java-version: '25'
 
       # Builds the Java library — generating its types from the protocol

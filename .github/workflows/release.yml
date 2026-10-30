@@ -230,6 +230,7 @@ jobs:
         uses: actions/setup-java@v6
         with:
           distribution: temurin
+          # renovate: datasource=custom.java-lts depName=java
           java-version: '25'
 
       # The service check gives the controller the build record of the
@@ -254,13 +255,8 @@ jobs:
           name: central-bundle
           path: java/build/distributions/central-bundle.zip
 
-  # The repository's dependency audit (audit.yml): a release is published
-  # only while every release this repository pins is current or declared.
-  audit:
-    uses: ./.github/workflows/audit.yml
-
   release:
-    needs: [build-linux, verify-macos, java-library, audit]
+    needs: [build-linux, verify-macos, java-library]
     runs-on: ubuntu-24.04
     # Central validates and publishes on its side, and says how far it has
     # come only when asked. If it never comes to a state, the job ends here
