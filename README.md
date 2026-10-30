@@ -436,7 +436,10 @@ full documentation.
 request. `.github/workflows/release.yml` builds a release for Linux (x64 and
 ARM64, glibc 2.34 or newer) and macOS 13 or newer (Apple Silicon and Intel),
 each on a machine of its own platform after every check passed there, starts
-each binary on clean hosts, and publishes the release only when all did. With
+each binary on clean hosts, and publishes the release only when all did and
+the dependency audit of the repository passed (`.github/workflows/audit.yml`,
+also run by hand from the Actions tab: every release the repository pins is
+its newest one, or a lag declared in `gabion-audit.json` with its reason). With
 it the Java library goes to Maven Central under the same version,
 `dev.gabion:node-protocol:<version>`: it is uploaded and validated first,
 published only once the release exists, and dropped if anything fails before

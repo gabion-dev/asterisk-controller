@@ -54,14 +54,30 @@ repositories {
     mavenCentral()
 }
 
-dependencies {
-    // The versions the Gabion framework itself uses: the library is compiled
-    // into an application built on them.
-    api("tools.jackson.core:jackson-databind:3.1.5")
-    api("org.jspecify:jspecify:1.0.1")
+// The library is compiled into the Gabion framework's backend, so it is built
+// against the very versions the backend runs: the backend takes them from the
+// dependency set of its Spring Boot, and so does this build — the Spring Boot
+// release named here is the one the backend's Spring Boot plugin names. The
+// backend imports that set as a Gradle platform, whose versions any other
+// dependency of the graph may raise: a newer Jackson here would quietly
+// become the backend's Jackson.
+//
+// The set governs this build only. It sits in a configuration of its own that
+// nothing publishes, and the publication carries the versions it resolved: an
+// application that takes the library gets Jackson and JSpecify at those
+// versions, not Spring Boot's dependency management.
+val springBoot by configurations.creating {
+    isCanBeConsumed = false
+    isCanBeResolved = false
+}
 
-    errorprone("com.google.errorprone:error_prone_core:2.50.0")
-    errorprone("com.uber.nullaway:nullaway:0.14.2")
+dependencies {
+    springBoot(platform("org.springframework.boot:spring-boot-dependencies:4.1.2"))
+    api("tools.jackson.core:jackson-databind")
+    api("org.jspecify:jspecify")
+
+    errorprone("com.google.errorprone:error_prone_core:2.51.0")
+    errorprone("com.uber.nullaway:nullaway:0.14.3")
 }
 
 java {
@@ -128,6 +144,13 @@ val vectors: SourceSet = sourceSets.create("vectors") {
 }
 
 configurations[vectors.implementationConfigurationName].extendsFrom(configurations.api.get())
+
+listOf(
+    sourceSets.main.get().compileClasspathConfigurationName,
+    sourceSets.main.get().runtimeClasspathConfigurationName,
+    vectors.compileClasspathConfigurationName,
+    vectors.runtimeClasspathConfigurationName,
+).forEach { configurations[it].extendsFrom(springBoot) }
 
 tasks.withType<JavaCompile>().configureEach {
     options.release = 25
@@ -219,6 +242,9 @@ publishing {
     publications {
         create<MavenPublication>("library") {
             from(components["java"])
+            // The versions the build resolved from the Spring Boot set, not
+            // the versionless declarations above.
+            versionMapping { allVariants { fromResolutionResult() } }
             // The protocol has one name on both sides: the Rust crate and the
             // description are `node-protocol` too.
             artifactId = "node-protocol"
