@@ -1,0 +1,11 @@
+{
+  "acceptedVulnerabilities": [
+    {
+      "scope": "cargo",
+      "purl": "pkg:cargo/atomic-polyfill@1.0.3",
+      "advisory": "RUSTSEC-2023-0089",
+      "reason": "an unmaintained-crate notice, not a vulnerability: heapless 0.7 (via postcard, via phonenumber) names atomic-polyfill only for targets without native atomics; the controller is built for Linux and macOS, where the crate is not compiled (cargo tree -i atomic-polyfill is empty for the host)",
+      "reviewWhen": "phonenumber's postcard moves to heapless 0.8 or later, which dropped atomic-polyfill"
+    }
+  ]
+}

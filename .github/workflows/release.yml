@@ -64,8 +64,50 @@ jobs:
             exit 1
           fi
 
-  build-linux:
+  # The lock file against the OSV database: a known bulletin in what the
+  # controller links refuses the release unless gabion-audit.json declares
+  # it with a reason. The scanner is pinned and checked against the
+  # release's checksums (Renovate proposes its releases); the judgement is
+  # the organisation's audit package, the same every repository runs.
+  dependencies:
     needs: [version]
+    runs-on: ubuntu-24.04
+    env:
+      # renovate: datasource=github-releases depName=google/osv-scanner
+      OSV_SCANNER_VERSION: v2.7.0
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          package-manager-cache: false
+
+      - name: OSV-Scanner, pinned
+        run: |
+          set -euo pipefail
+          base="https://github.com/google/osv-scanner/releases/download/${OSV_SCANNER_VERSION}"
+          curl -sSfLO "${base}/osv-scanner_linux_amd64"
+          curl -sSfLO "${base}/osv-scanner_SHA256SUMS"
+          grep ' osv-scanner_linux_amd64$' osv-scanner_SHA256SUMS | sha256sum -c -
+          chmod +x osv-scanner_linux_amd64
+
+      - name: Scan Cargo.lock
+        run: ./osv-scanner_linux_amd64 scan source --format json --output-file cargo-scan.json -L Cargo.lock || [ $? -eq 1 ]
+
+      # The audit package has no runtime dependencies, so lifting the
+      # release-age cooldown for this one npx admits nothing but the audit
+      # itself, which the organisation publishes.
+      - name: Judge against gabion-audit.json
+        env:
+          npm_config_min_release_age: "0"
+        run: npx --yes gabion-audit@0.3.0 --osv-report cargo-scan.json=cargo
+
+  build-linux:
+    needs: [version, dependencies]
     strategy:
       fail-fast: false
       matrix:
@@ -119,7 +161,7 @@ jobs:
             asterisk-controller-linux-${{ matrix.arch }}.tar.gz.sha256
 
   build-macos:
-    needs: [version]
+    needs: [version, dependencies]
     strategy:
       fail-fast: false
       matrix:
@@ -213,7 +255,7 @@ jobs:
           bash scripts/verify-release.sh out/asterisk-controller
 
   java-library:
-    needs: [version]
+    needs: [version, dependencies]
     runs-on: ubuntu-24.04
 
     steps:
