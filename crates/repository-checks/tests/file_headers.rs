@@ -56,7 +56,7 @@ enum Marking {
 fn marking_of(file_name: &str) -> Option<Marking> {
     let extension = Path::new(file_name).extension().and_then(|e| e.to_str());
     match (file_name, extension) {
-        (_, Some("rs" | "java" | "kts")) => Some(Marking::Line {
+        (_, Some("rs" | "java" | "kts" | "json5")) => Some(Marking::Line {
             prefix: "// ",
             suffix: "",
         }),
