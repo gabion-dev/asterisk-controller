@@ -57,7 +57,7 @@ jobs:
           failed=0
           for run in $(seq 1 "${RUNS}"); do
             echo "::group::run ${run} of ${RUNS}"
-            if cargo test --locked -p asterisk-controller --test against_asterisk; then
+            if cargo test --locked -p asterisk-controller --test against_asterisk --test launcher; then
               echo "run ${run} of ${RUNS} passed"
             else
               echo "::error::run ${run} of ${RUNS} failed"

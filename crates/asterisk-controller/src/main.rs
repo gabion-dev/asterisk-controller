@@ -20,6 +20,7 @@ mod asterisk_files;
 mod config;
 mod conversation;
 mod destination;
+mod launch;
 mod media;
 mod node;
 mod playout;
@@ -53,7 +54,16 @@ use crate::{config::Config, node::Node};
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let config = match Config::from_arguments(std::env::args().skip(1)) {
+    // `launch` starts the node — Asterisk together with this controller —
+    // and keeps it running (crate::launch); without it, this is the
+    // controller.
+    let mut arguments = std::env::args().skip(1).peekable();
+    if arguments.peek().is_some_and(|first| first == "launch") {
+        arguments.next();
+        return launch::run(arguments).await;
+    }
+
+    let config = match Config::from_arguments(arguments) {
         Ok(config) => config,
         Err(problem) => {
             eprintln!("asterisk-controller: {problem}");

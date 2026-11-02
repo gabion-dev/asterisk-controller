@@ -163,6 +163,38 @@ controller SIGHUP (with certbot, from a `--deploy-hook`). Asterisk takes the
 new certificate in without dropping a call; connections already open keep
 the old one until they close.
 
+### Starting with the launcher
+
+The same binary starts the whole node — Asterisk together with the
+controller — and keeps it running:
+
+```sh
+asterisk-controller launch --restarts <n> --stable-after <milliseconds> \
+    --restart-delay <milliseconds> <the controller's arguments>
+```
+
+The launcher reads the controller's arguments the way the controller does and
+starts nothing on arguments the controller would refuse (status 1). Then:
+
+- it starts the controller, and Asterisk on the controller's ready line, as
+  above;
+- Asterisk is ready when it has printed `Asterisk Ready.` and its HTTP port
+  answers as Asterisk; an Asterisk whose port another program holds is
+  stopped;
+- each of the two is started again after `--restart-delay` when it exits, at
+  most `--restarts` times in a row; one that ran for `--stable-after` starts
+  its count over. While one restarts, the other keeps running;
+- when either has used up its restarts, the other is stopped too, and the
+  launcher exits with status 2;
+- on SIGTERM or SIGINT it stops Asterisk first and the controller after
+  Asterisk has exited, and exits with status 0;
+- SIGHUP is passed on to the controller.
+
+It tells what happens on standard output, one JSON object per line, with the
+field `event` first: `controller-ready`, `asterisk-ready`,
+`asterisk-unusable`, `exited`, `given-up`, `stopped`. The output of the
+controller goes to standard error as it is, Asterisk's after `asterisk: `.
+
 ### Settings
 
 What the node does with calls — its operators, outbound lines, entries
@@ -310,7 +342,8 @@ acts alone on what the controller wrote:
   other go on talking. Audio between the application and participants stops
   until the controller is back.
 
-Restarting the controller is up to whoever runs the node.
+Restarting the controller is up to whoever runs the node — the launcher
+does it ([above](#starting-with-the-launcher)).
 
 ### When the controller is started again
 
