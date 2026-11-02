@@ -39,6 +39,10 @@ use tokio::{
     time::timeout,
 };
 
+mod common;
+
+use common::Ports;
+
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
 /// How long any single step may take before the test gives up on it — a
@@ -62,11 +66,6 @@ fn asterisk_tree() -> TestResult<PathBuf> {
         )
         .into())
     }
-}
-
-/// A port nothing listens on right now, as the system offers one.
-async fn free_port() -> TestResult<u16> {
-    Ok(TcpListener::bind("127.0.0.1:0").await?.local_addr()?.port())
 }
 
 /// One node's directories and ports, apart from every other node's.
@@ -96,16 +95,16 @@ impl Place {
             .mode(0o600)
             .open(state.join("node-secret"))?
             .write_all_sync(b"the secret of the launched node")?;
-        // Audio ports are taken from one the system offers: a pair range of
-        // four, which is all a node that carries no call needs.
-        let first = free_port().await? & !1;
+        let mut ports = Ports::new()?;
+        // Four audio ports, two pairs: all a node that carries no call needs.
+        let first = ports.range(4).await?;
         Ok(Self {
             state,
             run,
-            listen: free_port().await?,
-            http: free_port().await?,
+            listen: ports.one().await?,
+            http: ports.one().await?,
             audio: (first, first + 3),
-            application: free_port().await?,
+            application: ports.one().await?,
         })
     }
 

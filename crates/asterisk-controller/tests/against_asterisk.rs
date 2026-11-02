@@ -56,7 +56,7 @@ use node_protocol::{
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader},
-    net::{TcpListener, TcpStream, UdpSocket},
+    net::{TcpListener, TcpStream},
     process::{Child, Command as Process},
     sync::{Mutex, mpsc},
     time::timeout,
@@ -73,6 +73,10 @@ use tokio_tungstenite::{
         },
     },
 };
+
+mod common;
+
+use common::Ports;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -145,82 +149,9 @@ fn asterisk_tree() -> TestResult<PathBuf> {
     }
 }
 
-/// A port nothing listens on right now, as the system offers one.
-async fn free_port() -> TestResult<u16> {
-    Ok(TcpListener::bind("127.0.0.1:0").await?.local_addr()?.port())
-}
-
 /// How many ports the node and the network each get for audio: ten calls
 /// of RTP and RTCP in pairs.
 const AUDIO_PORTS: u16 = 20;
-
-/// How many ports the system is asked for before the test gives up on
-/// finding one that is free and apart from the others.
-const PORT_ATTEMPTS: usize = 64;
-
-/// The ports the test gives out: none twice, none inside a range of audio
-/// ports, and none in use over UDP or TCP.
-///
-/// The system offers a free TCP port when asked, but it offers them in
-/// order on some systems (macOS), so a port asked for after a range of
-/// audio ports can fall inside that range — the network's SIP port inside
-/// the node's audio ports, say, and the node's RTCP then lands on it as
-/// "PJSIP syntax error" packets. And it says nothing of UDP, which is what
-/// SIP and audio use. So every port is checked over UDP too, and what was
-/// given out is remembered.
-struct Ports {
-    taken: Vec<std::ops::RangeInclusive<u16>>,
-}
-
-impl Ports {
-    fn new() -> Self {
-        Self { taken: Vec::new() }
-    }
-
-    fn is_taken(&self, port: u16) -> bool {
-        self.taken.iter().any(|range| range.contains(&port))
-    }
-
-    async fn free_over_udp(port: u16) -> bool {
-        UdpSocket::bind(("127.0.0.1", port)).await.is_ok()
-    }
-
-    /// One port, free over TCP and UDP and not given out before.
-    async fn one(&mut self) -> TestResult<u16> {
-        for _ in 0..PORT_ATTEMPTS {
-            let port = free_port().await?;
-            if self.is_taken(port) || !Self::free_over_udp(port).await {
-                continue;
-            }
-            self.taken.push(port..=port);
-            return Ok(port);
-        }
-        Err(format!("no port apart from the others was found in {PORT_ATTEMPTS} attempts").into())
-    }
-
-    /// The first of [`AUDIO_PORTS`] consecutive ports, beginning on an even
-    /// one (audio goes in pairs), all free over UDP and none given out
-    /// before.
-    async fn audio_range(&mut self) -> TestResult<u16> {
-        'attempts: for _ in 0..PORT_ATTEMPTS {
-            let first = free_port().await? & !1;
-            let Some(last) = first.checked_add(AUDIO_PORTS - 1) else {
-                continue;
-            };
-            for port in first..=last {
-                if self.is_taken(port) || !Self::free_over_udp(port).await {
-                    continue 'attempts;
-                }
-            }
-            self.taken.push(first..=last);
-            return Ok(first);
-        }
-        Err(format!(
-            "no range of {AUDIO_PORTS} audio ports apart from the others was found in {PORT_ATTEMPTS} attempts"
-        )
-        .into())
-    }
-}
 
 /// Where the operators of the test's telephone network are: the plain one
 /// and the one reached over TLS.
@@ -342,7 +273,7 @@ impl NetworkPorts {
             operator: ports.one().await?,
             stranger: ports.one().await?,
             secure: ports.one().await?,
-            audio: ports.audio_range().await?,
+            audio: ports.range(AUDIO_PORTS).await?,
             node,
             node_secure: ports.one().await?,
         })
@@ -973,16 +904,49 @@ fn where_it_begins(samples: &[i16], rate: u32, frequency: u32) -> Option<usize> 
     Some((first + 1) * frame)
 }
 
-/// The level of a tone of `frequency` Hz in each twenty milliseconds of
-/// audio of `rate`, for a failure to show whether a tone was weak all along
-/// or missing in places.
-fn level_by_twenty_ms(samples: &[i16], rate: u32, frequency: u32) -> String {
+/// The level of a tone of `frequency` Hz in each twenty milliseconds — one
+/// frame — of audio of `rate`.
+fn levels_by_twenty_ms(samples: &[i16], rate: u32, frequency: u32) -> Vec<f64> {
     let frame = usize::try_from(rate / 50).unwrap_or(1).max(1);
     samples
         .chunks(frame)
-        .map(|twenty_ms| format!("{:.0}", level(twenty_ms, rate, frequency)))
+        .map(|twenty_ms| level(twenty_ms, rate, frequency))
+        .collect()
+}
+
+/// The same as words, for a failure to show whether a tone was weak all
+/// along or missing in places.
+fn level_by_twenty_ms(samples: &[i16], rate: u32, frequency: u32) -> String {
+    levels_by_twenty_ms(samples, rate, frequency)
+        .iter()
+        .map(|level| format!("{level:.0}"))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// How loud a tone is in most of the audio: the median of its levels by
+/// twenty milliseconds.
+///
+/// Where Asterisk joins two sources for one participant — the whisper of a
+/// tap into what is written to the channel — it does not wait for a frame
+/// that is late: the frame goes out without that source. On the macOS
+/// machines of the lab one frame in twenty or so arrives out of step, and a
+/// tone that is there all along is missing from a frame here and there. A
+/// mean over half a second would then judge Asterisk's timing; the median
+/// judges what a scenario of who hears what is about, at the same threshold.
+fn typical_level(samples: &[i16], rate: u32, frequency: u32) -> f64 {
+    let mut levels = levels_by_twenty_ms(samples, rate, frequency);
+    levels.sort_by(f64::total_cmp);
+    levels.get(levels.len() / 2).copied().unwrap_or(0.0)
+}
+
+/// How loud a tone is where it is loudest, by twenty milliseconds: what one
+/// must not hear must not be heard in a single frame — a mean would let a
+/// frame of it pass among silence.
+fn loudest_level(samples: &[i16], rate: u32, frequency: u32) -> f64 {
+    levels_by_twenty_ms(samples, rate, frequency)
+        .into_iter()
+        .fold(0.0, f64::max)
 }
 
 /// Audio as the application sends and receives it: sixteen bits, little-endian.
@@ -1208,9 +1172,12 @@ struct Application {
 }
 
 impl Application {
-    async fn open() -> TestResult<Self> {
-        let listener = TcpListener::bind("127.0.0.1:0").await?;
-        let port = listener.local_addr()?.port();
+    /// Listen at a port of the test's account: the application goes away
+    /// and comes back at the same address, and a port the system offers
+    /// as free could meanwhile be taken by an outgoing connection
+    /// (`common`).
+    async fn open(port: u16) -> TestResult<Self> {
+        let listener = TcpListener::bind(("127.0.0.1", port)).await?;
         let (conversations, conversations_waiting) = mpsc::unbounded_channel();
         let (services, services_waiting) = mpsc::unbounded_channel();
         let queues = Queues {
@@ -1877,12 +1844,12 @@ impl Stand {
         let state = root.join("node");
         fs::create_dir_all(&state)?;
 
-        let mut ports = Ports::new();
+        let mut ports = Ports::new()?;
         let http_port = ports.one().await?;
         let controller_port = ports.one().await?;
         let sip_port = ports.one().await?;
-        let audio_port = ports.audio_range().await?;
-        let application = Application::open().await?;
+        let audio_port = ports.range(AUDIO_PORTS).await?;
+        let application = Application::open(ports.one().await?).await?;
         let application_port = application.port;
         let network_ports = NetworkPorts::allot(&mut ports, sip_port).await?;
         let operators = OperatorPorts {
@@ -3683,19 +3650,23 @@ async fn the_application_connects_participants(stand: &Stand) -> TestResult {
         )
         .into());
     };
+    // Who hears what is judged by twenty milliseconds: what is heard, in
+    // most of them; what must not be heard, in none (typical_level).
     let heard = [
-        level(to_first, Phone::RATE, 1000),
-        level(to_first, Phone::RATE, SECOND_SAYS),
-        level(to_second, Phone::RATE, 1000),
-        level(to_second, Phone::RATE, Phone::SAYS),
+        typical_level(to_first, Phone::RATE, 1000),
+        typical_level(to_first, Phone::RATE, SECOND_SAYS),
+        loudest_level(to_second, Phone::RATE, 1000),
+        typical_level(to_second, Phone::RATE, Phone::SAYS),
     ];
     assert!(
         matches!(heard, [said, other, leaked, others] if said > 7000.0 && other > 7000.0 && leaked < 500.0 && others > 7000.0),
-        "said to one of two connected: they heard it, the other, and the other heard it and them \
-         at {heard:.0?}; by twenty milliseconds, the one played to heard the tone at {} and the \
-         other at {}",
+        "said to one of two connected: they heard it, the other, and the other heard it (in \
+         its loudest twenty milliseconds) and them at {heard:.0?}; by twenty milliseconds, the \
+         one played to heard the tone at {} and the other at {}, and the other heard the tone at \
+         {}",
         level_by_twenty_ms(to_first, Phone::RATE, 1000),
-        level_by_twenty_ms(to_first, Phone::RATE, SECOND_SAYS)
+        level_by_twenty_ms(to_first, Phone::RATE, SECOND_SAYS),
+        level_by_twenty_ms(to_second, Phone::RATE, 1000)
     );
     is_delivered(&mut owner).await?;
 
@@ -4218,21 +4189,41 @@ async fn calls_are_carried_from_their_first_ring_to_their_end() -> TestResult {
     let mut stand = Stand::start().await?;
     let mut outcome = every_scenario(&stand).await;
     if outcome.is_ok() {
-        outcome = the_node_without_the_application(&mut stand).await;
+        println!("scenario: the_node_without_the_application");
+        outcome = named(
+            "the_node_without_the_application",
+            the_node_without_the_application(&mut stand).await,
+        );
     }
     if outcome.is_ok() {
-        outcome = a_fallback_transfer_finds_the_number_busy(&mut stand).await;
+        println!("scenario: a_fallback_transfer_finds_the_number_busy");
+        outcome = named(
+            "a_fallback_transfer_finds_the_number_busy",
+            a_fallback_transfer_finds_the_number_busy(&mut stand).await,
+        );
     }
     if outcome.is_ok() {
         // Late, because here the controller and Asterisk do lose each other.
-        outcome = the_node_without_its_controller(&mut stand).await;
+        println!("scenario: the_node_without_its_controller");
+        outcome = named(
+            "the_node_without_its_controller",
+            the_node_without_its_controller(&mut stand).await,
+        );
     }
     if outcome.is_ok() {
-        outcome = the_telephony_server_restarts_under_a_conversation(&mut stand).await;
+        println!("scenario: the_telephony_server_restarts_under_a_conversation");
+        outcome = named(
+            "the_telephony_server_restarts_under_a_conversation",
+            the_telephony_server_restarts_under_a_conversation(&mut stand).await,
+        );
     }
     if outcome.is_ok() {
         // Last, because the controller stops.
-        outcome = a_second_controller_takes_the_application(&mut stand).await;
+        println!("scenario: a_second_controller_takes_the_application");
+        outcome = named(
+            "a_second_controller_takes_the_application",
+            a_second_controller_takes_the_application(&mut stand).await,
+        );
     }
     if outcome.is_err() {
         stand.report().await;
@@ -5795,31 +5786,46 @@ async fn a_silent_instance_is_no_owner(stand: &Stand) -> TestResult {
         .await
 }
 
+/// Run one scenario, saying its name first — what a scenario prints goes
+/// to the report of a failed test, so a panic inside it is placed — and
+/// putting its name before its error.
+macro_rules! scenario {
+    ($name:ident ( $($argument:expr),* )) => {{
+        println!("scenario: {}", stringify!($name));
+        named(stringify!($name), $name($($argument),*).await)?;
+    }};
+}
+
+/// An outcome of a scenario, its error carrying the scenario's name.
+fn named(scenario: &str, outcome: TestResult) -> TestResult {
+    outcome.map_err(|error| format!("{scenario}: {error}").into())
+}
+
 async fn every_scenario(stand: &Stand) -> TestResult {
     stand.expect_the_operator_as_it_was_given().await?;
-    only_asterisk_opens_media_connections(stand).await?;
-    the_application_gives_the_node_its_settings(stand).await?;
-    answered_then_the_caller_hangs_up(stand).await?;
-    ended_by_the_handler(stand).await?;
-    declined(stand).await?;
-    the_owner_breaks_the_protocol(stand).await?;
-    the_application_hears_and_speaks(stand).await?;
-    a_call_arrives_from_the_operator(stand).await?;
-    calls_go_over_tls(stand).await?;
-    a_renewed_certificate_is_taken_in(stand).await?;
-    a_call_from_elsewhere_is_refused(stand).await?;
-    a_ringing_call_is_turned_away(stand).await?;
-    the_application_dials(stand).await?;
-    the_application_starts_a_conversation(stand).await?;
-    a_request_identifier_used_twice(stand).await?;
-    the_application_connects_participants(stand).await?;
-    two_groups_are_merged(stand).await?;
-    the_conversation_is_recorded(stand).await?;
-    audio_that_stops_arriving(stand).await?;
-    a_call_asterisk_does_not_place(stand).await?;
-    a_step_refused_for_one_who_stays(stand).await?;
-    connected_people_outlive_their_owner(stand).await?;
-    a_caller_alone_loses_the_application(stand).await?;
-    a_silent_instance_is_no_owner(stand).await?;
+    scenario!(only_asterisk_opens_media_connections(stand));
+    scenario!(the_application_gives_the_node_its_settings(stand));
+    scenario!(answered_then_the_caller_hangs_up(stand));
+    scenario!(ended_by_the_handler(stand));
+    scenario!(declined(stand));
+    scenario!(the_owner_breaks_the_protocol(stand));
+    scenario!(the_application_hears_and_speaks(stand));
+    scenario!(a_call_arrives_from_the_operator(stand));
+    scenario!(calls_go_over_tls(stand));
+    scenario!(a_renewed_certificate_is_taken_in(stand));
+    scenario!(a_call_from_elsewhere_is_refused(stand));
+    scenario!(a_ringing_call_is_turned_away(stand));
+    scenario!(the_application_dials(stand));
+    scenario!(the_application_starts_a_conversation(stand));
+    scenario!(a_request_identifier_used_twice(stand));
+    scenario!(the_application_connects_participants(stand));
+    scenario!(two_groups_are_merged(stand));
+    scenario!(the_conversation_is_recorded(stand));
+    scenario!(audio_that_stops_arriving(stand));
+    scenario!(a_call_asterisk_does_not_place(stand));
+    scenario!(a_step_refused_for_one_who_stays(stand));
+    scenario!(connected_people_outlive_their_owner(stand));
+    scenario!(a_caller_alone_loses_the_application(stand));
+    scenario!(a_silent_instance_is_no_owner(stand));
     stand.expect_no_lost_control_connection().await
 }
