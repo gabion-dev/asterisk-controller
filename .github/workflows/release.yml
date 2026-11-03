@@ -255,7 +255,8 @@ jobs:
           bash scripts/verify-release.sh out/asterisk-controller
 
   java-library:
-    needs: [version, dependencies]
+    # The library carries the checksums of the archives this release built.
+    needs: [version, dependencies, build-linux, verify-macos]
     runs-on: ubuntu-24.04
 
     steps:
@@ -280,16 +281,26 @@ jobs:
       - name: Asterisk the controller is pinned to
         run: bash scripts/fetch-asterisk.sh
 
+      # The checksum files of the four archives, published next to them:
+      # the library carries them (ControllerRelease).
+      - name: The archives of this release
+        uses: actions/download-artifact@v8
+        with:
+          pattern: asterisk-controller-*
+          merge-multiple: true
+          path: archives
+
       # Every check of the library first — the shared vectors, the service
       # connection with the controller, the documentation of what is written
-      # by hand — then the bundle Central takes, signed. Its version is the
-      # controller's (java/build.gradle.kts reads it from Cargo.toml).
+      # by hand, the release it carries — then the bundle Central takes,
+      # signed. Its version is the controller's (java/build.gradle.kts reads
+      # it from Cargo.toml).
       - name: Check and pack the library
         working-directory: java
         env:
           SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
           SIGNING_PASSWORD: ${{ secrets.SIGNING_PASSWORD }}
-        run: ./gradlew check centralBundle --console=plain
+        run: ./gradlew check centralBundle "-PcontrollerArchives=${GITHUB_WORKSPACE}/archives" --console=plain
 
       - name: Upload the bundle
         uses: actions/upload-artifact@v7

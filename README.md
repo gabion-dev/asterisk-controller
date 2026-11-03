@@ -508,11 +508,13 @@ has the controller reach an application over TLS with a certificate made for
 the test. The Java side is compiled with Error Prone and NullAway, every
 warning an error; its check runs the library through the shared vectors,
 plays the application on the service connection of the controller built
-from this repository, without Asterisk, and holds the hand-written part to
-full documentation.
+from this repository, without Asterisk, holds the hand-written part to full
+documentation, and checks the controller release the library carries.
 
 `.github/workflows/checks.yml` runs the same checks on every push and pull
-request. `.github/workflows/release.yml` builds a release for Linux (x64 and
+request — once more inside Amazon Linux 2023 — and installs the node on fresh
+Linux machines (x64 and ARM64) as root, judging the service
+(`scripts/check-install.sh`). `.github/workflows/release.yml` builds a release for Linux (x64 and
 ARM64, glibc 2.34 or newer) and macOS 13 or newer (Apple Silicon and Intel),
 each on a machine of its own platform after every check passed there, starts
 each binary on clean hosts, and publishes the release only when all did and
@@ -522,9 +524,13 @@ its newest one, or a lag declared in `gabion-audit.json` with its reason). With
 it the Java library goes to Maven Central under the same version,
 `dev.gabion:node-protocol:<version>`: it is uploaded and validated first,
 published only once the release exists, and dropped if anything fails before
-that. `(cd java && ./gradlew centralBundle)` lays out the signed bundle it
-uploads; it needs `SIGNING_KEY` (an armored private key) and
-`SIGNING_PASSWORD`.
+that. The library carries the SHA-256 of each of the release's four controller
+archives (`ControllerRelease`): an application that takes it knows which
+controller its node runs and how to tell an archive is that one.
+`(cd java && ./gradlew centralBundle -PcontrollerArchives=<directory>)` lays
+out the signed bundle it uploads, from the archives' `.sha256` files in
+`<directory>`; it needs `SIGNING_KEY` (an armored private key) and
+`SIGNING_PASSWORD`, and refuses to lay one out without the checksums.
 
 ## Status
 
