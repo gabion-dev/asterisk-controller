@@ -1,0 +1,171 @@
+# .github/workflows/library.yml
+
+name: Library
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# =============================================================================
+# The Java library of the node protocol, published to Maven Central under the
+# version in java/build.gradle.kts — run by hand, and only when the library
+# changed: its protocol description, the generator of its types or its
+# hand-written part. A controller release publishes nothing to Central and
+# refuses to go out while the library's sources differ from those published
+# under that version (scripts/library-is-published.sh); this workflow refuses
+# a version Central already has. Central counts every publication against a
+# monthly limit and never takes a version back, so the library is uploaded
+# and validated first and published last; anything failing before that drops
+# the deployment.
+#
+# Secrets: SIGNING_KEY (the armored private key the library is signed with)
+# and SIGNING_PASSWORD (its passphrase); CENTRAL_TOKEN_USERNAME and
+# CENTRAL_TOKEN_PASSWORD (a user token of the Central Portal).
+# =============================================================================
+
+jobs:
+  library:
+    runs-on: ubuntu-24.04
+    # Central validates and publishes on its side, and says how far it has
+    # come only when asked. If it never comes to a state, the job ends here
+    # and the steps that drop an unpublished deployment run.
+    timeout-minutes: 60
+    env:
+      CENTRAL: https://central.sonatype.com/api/v1/publisher
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+
+      # The toolchain is pinned in rust-toolchain.toml: the build generates the
+      # message types with `cargo run -p protocol-java`, and the service check
+      # talks to a controller it builds.
+      - name: Rust toolchain
+        run: rustup show active-toolchain
+
+      - name: Java 25
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          # renovate: datasource=custom.java-lts depName=java
+          java-version: '25'
+
+      # A version Central has is never published again: a changed library is
+      # a new version.
+      - name: The version is a new one
+        run: |
+          set -euo pipefail
+          VERSION="$(sed -n 's/^version = "\(.*\)"$/\1/p' java/build.gradle.kts)"
+          [ -n "${VERSION}" ] || { echo "ERROR: no version in java/build.gradle.kts" >&2; exit 1; }
+          echo "VERSION=${VERSION}" >> "${GITHUB_ENV}"
+          STATUS=0
+          bash scripts/library-is-published.sh || STATUS=$?
+          case "${STATUS}" in
+            3) echo "${VERSION} is new: it is published now" ;;
+            0) echo "ERROR: ${VERSION} is on Maven Central already, with these very sources" >&2; exit 1 ;;
+            *) echo "ERROR: ${VERSION} is on Maven Central already: raise the version in java/build.gradle.kts" >&2; exit 1 ;;
+          esac
+
+      # The service check gives the controller the build record of the
+      # Asterisk it is pinned to: the controller drives no other.
+      - name: Asterisk the controller is pinned to
+        run: bash scripts/fetch-asterisk.sh
+
+      # Every check of the library first — the shared vectors, the service
+      # connection with the controller, the documentation of what is written
+      # by hand — then the bundle Central takes, signed.
+      - name: Check and pack the library
+        working-directory: java
+        env:
+          SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
+          SIGNING_PASSWORD: ${{ secrets.SIGNING_PASSWORD }}
+        run: ./gradlew check centralBundle --console=plain
+
+      - name: The bundle where Central takes it from
+        run: cp java/build/distributions/central-bundle.zip central-bundle.zip
+
+      # Uploaded for validation first. The deployment's identifier goes to the
+      # later steps.
+      - name: Upload the library to Central for validation
+        id: central
+        env:
+          TOKEN_USERNAME: ${{ secrets.CENTRAL_TOKEN_USERNAME }}
+          TOKEN_PASSWORD: ${{ secrets.CENTRAL_TOKEN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          TOKEN="$(printf '%s:%s' "${TOKEN_USERNAME}" "${TOKEN_PASSWORD}" | base64 -w0)"
+          echo "::add-mask::${TOKEN}"
+          echo "TOKEN=${TOKEN}" >> "${GITHUB_ENV}"
+          ID="$(curl --fail-with-body --silent --show-error \
+            --header "Authorization: Bearer ${TOKEN}" \
+            --form "bundle=@central-bundle.zip;type=application/octet-stream" \
+            "${CENTRAL}/upload?publishingType=USER_MANAGED&name=node-protocol-${VERSION}")"
+          echo "Central deployment ${ID}"
+          echo "id=${ID}" >> "${GITHUB_OUTPUT}"
+
+      # Central says how far it has come only when asked; ten seconds between
+      # questions. Validated is the state to go on from; failed carries its
+      # reasons, and they are printed.
+      - name: Wait until Central has validated the library
+        env:
+          ID: ${{ steps.central.outputs.id }}
+        run: |
+          set -euo pipefail
+          while true; do
+            STATUS="$(curl --fail-with-body --silent --show-error --request POST \
+              --header "Authorization: Bearer ${TOKEN}" "${CENTRAL}/status?id=${ID}")"
+            STATE="$(jq -r .deploymentState <<<"${STATUS}")"
+            echo "Central: ${STATE}"
+            case "${STATE}" in
+              VALIDATED) exit 0 ;;
+              FAILED) jq . <<<"${STATUS}" >&2; exit 1 ;;
+              PENDING|VALIDATING) sleep 10 ;;
+              *) echo "ERROR: unexpected state ${STATE}" >&2; jq . <<<"${STATUS}" >&2; exit 1 ;;
+            esac
+          done
+
+      # Validated: the library goes out now.
+      - name: Publish the library on Central
+        env:
+          ID: ${{ steps.central.outputs.id }}
+        run: |
+          set -euo pipefail
+          # From here on the deployment is never dropped: publishing may have
+          # begun even when the answer to this request is lost.
+          echo "PUBLISH_ASKED=1" >> "${GITHUB_ENV}"
+          curl --fail-with-body --silent --show-error --request POST \
+            --header "Authorization: Bearer ${TOKEN}" "${CENTRAL}/deployment/${ID}"
+          while true; do
+            STATUS="$(curl --fail-with-body --silent --show-error --request POST \
+              --header "Authorization: Bearer ${TOKEN}" "${CENTRAL}/status?id=${ID}")"
+            STATE="$(jq -r .deploymentState <<<"${STATUS}")"
+            echo "Central: ${STATE}"
+            case "${STATE}" in
+              PUBLISHED) exit 0 ;;
+              FAILED) jq . <<<"${STATUS}" >&2; exit 1 ;;
+              VALIDATED|PUBLISHING) sleep 10 ;;
+              *) echo "ERROR: unexpected state ${STATE}" >&2; jq . <<<"${STATUS}" >&2; exit 1 ;;
+            esac
+          done
+
+      # Anything failed before the library was published: the deployment is
+      # dropped, so that nothing of this run stays waiting on Central. Once
+      # publishing was asked for, nothing is dropped — the deployment named in
+      # the log is published from the Portal.
+      - name: Drop the unpublished deployment
+        if: failure() && steps.central.outputs.id != '' && env.PUBLISH_ASKED != '1'
+        env:
+          ID: ${{ steps.central.outputs.id }}
+        run: |
+          set -euo pipefail
+          STATE="$(curl --fail-with-body --silent --show-error --request POST \
+            --header "Authorization: Bearer ${TOKEN}" "${CENTRAL}/status?id=${ID}" | jq -r .deploymentState)"
+          echo "Central deployment ${ID}: ${STATE}"
+          case "${STATE}" in
+            VALIDATED|FAILED)
+              curl --fail-with-body --silent --show-error --request DELETE \
+                --header "Authorization: Bearer ${TOKEN}" "${CENTRAL}/deployment/${ID}"
+              echo "dropped" ;;
+            *) echo "left as it is: ${STATE}" ;;

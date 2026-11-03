@@ -33,6 +33,9 @@
 //!   them. Both end by themselves with code 0; so does the launcher.
 //! - SIGHUP goes on to the controller: it is how whoever renews the node's
 //!   certificate says so.
+//! - SIGUSR1 goes on to the controller too: the node is to be replaced, and
+//!   takes no new call ([`crate::drain`]). A controller started again while
+//!   the node empties is told so as soon as it is ready.
 //!
 //! What happens is told on stdout, one JSON object per line, for whoever
 //! started the launcher to follow ([`Event`]). The output of both halves
@@ -255,6 +258,8 @@ enum Happening {
     Stop,
     /// The node's certificate was renewed.
     Hangup,
+    /// The node is to empty before it is replaced.
+    Drain,
 }
 
 /// Where a half's process stands.
@@ -319,6 +324,7 @@ pub async fn run(arguments: impl Iterator<Item = String>) -> ExitCode {
         controller: Process::default(),
         asterisk: Process::default(),
         asterisk_launched: false,
+        draining: false,
     };
     node.start(Half::Controller);
 
@@ -339,10 +345,12 @@ pub async fn run(arguments: impl Iterator<Item = String>) -> ExitCode {
 fn listen_for_signals(happenings: &mpsc::UnboundedSender<Happening>) -> Result<(), String> {
     let stop: fn() -> Happening = || Happening::Stop;
     let hangup: fn() -> Happening = || Happening::Hangup;
+    let drain: fn() -> Happening = || Happening::Drain;
     for (kind, name, happening) in [
         (SignalKind::terminate(), "SIGTERM", stop),
         (SignalKind::interrupt(), "SIGINT", stop),
         (SignalKind::hangup(), "SIGHUP", hangup),
+        (SignalKind::user_defined1(), "SIGUSR1", drain),
     ] {
         let mut received =
             signal(kind).map_err(|error| format!("cannot listen for {name}: {error}"))?;
@@ -369,6 +377,8 @@ struct Node {
     /// Whether Asterisk has been started at all: the controller's first
     /// ready line starts it, later ones do not.
     asterisk_launched: bool,
+    /// Whether the node is emptying before it is replaced.
+    draining: bool,
 }
 
 impl Node {
@@ -422,6 +432,12 @@ impl Node {
                     signal_process(pid, Signal::HUP, "the controller");
                 }
             }
+            Happening::Drain => {
+                self.draining = true;
+                if let (Some(pid), true) = (self.controller.pid, self.controller.ready) {
+                    signal_process(pid, Signal::USR1, "the controller");
+                }
+            }
         }
     }
 
@@ -439,6 +455,9 @@ impl Node {
                             pid,
                             listen: listen.to_owned(),
                         });
+                        if self.draining {
+                            signal_process(pid, Signal::USR1, "the controller");
+                        }
                     }
                     if !self.asterisk_launched && self.mode == Mode::Running {
                         self.asterisk_launched = true;

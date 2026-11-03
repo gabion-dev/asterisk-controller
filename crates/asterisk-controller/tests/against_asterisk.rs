@@ -4189,6 +4189,14 @@ async fn calls_are_carried_from_their_first_ring_to_their_end() -> TestResult {
     let mut stand = Stand::start().await?;
     let mut outcome = every_scenario(&stand).await;
     if outcome.is_ok() {
+        // A drain is never turned back: the node is replaced at its end.
+        println!("scenario: an_emptying_node_takes_no_new_call");
+        outcome = named(
+            "an_emptying_node_takes_no_new_call",
+            an_emptying_node_takes_no_new_call(&mut stand).await,
+        );
+    }
+    if outcome.is_ok() {
         println!("scenario: the_node_without_the_application");
         outcome = named(
             "the_node_without_the_application",
@@ -5784,6 +5792,154 @@ async fn a_silent_instance_is_no_owner(stand: &Stand) -> TestResult {
     stand
         .expect_no_channels("after an instance that said nothing")
         .await
+}
+
+/// The node is told to empty before it is replaced — SIGUSR1, as the
+/// installer tells it: a call that arrives is turned away as congestion
+/// (the network hears 34, "no circuit available"), the application's
+/// request to start a conversation is refused as `node_not_ready`, and the
+/// conversation going on is carried to its end. The run directory says how
+/// many are left, down to 0. Nothing turns a drain back: the node is then
+/// replaced, as the installer replaces it — a new controller, welcomed on
+/// its service connection.
+async fn an_emptying_node_takes_no_new_call(stand: &mut Stand) -> TestResult {
+    let going_on = stand
+        .network
+        .control
+        .create_channel(&format!(
+            "endpoint=PJSIP/{DIALED_IN_URL}@the-node&app={FAR_END}&callerId={CALLER_IN_URL}"
+        ))
+        .await?;
+    let mut owner = Owner::accept(&stand.application).await?;
+    let first = hello(&mut owner).await?.first;
+    owner.send(&ApplicationMessage::Accept)?;
+    owner.command(
+        1,
+        Command::Answer {
+            participant: first.id.clone(),
+        },
+    )?;
+    let (outcome, mut events) = owner.outcome_of(1).await?;
+    if events.is_empty() {
+        events.push(owner.next_event().await?);
+    }
+    assert!(
+        matches!(outcome, CommandOutcome::Accepted)
+            && matches!(events.as_slice(), [Event::ParticipantAnswered { .. }]),
+        "answering the call going on was {outcome:?}, then {events:?}"
+    );
+
+    tell_the_controller_to_empty(stand)?;
+    let draining = PathBuf::from(stand.controller_argument("--run")?).join("draining");
+    conversations_left(&draining, "1").await?;
+
+    let turned_away = stand
+        .network
+        .control
+        .create_channel(&format!(
+            "endpoint=PJSIP/{DIALED_IN_URL}@the-node&app={FAR_END}&callerId={CALLER_IN_URL}"
+        ))
+        .await?;
+    let told = stand.network.control.reason_it_ended(&turned_away).await?;
+    assert_eq!(told, 34, "a call to an emptying node was ended with {told}");
+    let outcome = stand.ask(90, start_request(ANSWERS, "main", 5000)?).await?;
+    assert!(
+        matches!(
+            outcome,
+            RequestOutcome::Rejected {
+                reason: RequestRejection::NodeNotReady
+            }
+        ),
+        "a request to an emptying node was answered {outcome:?}"
+    );
+
+    stand
+        .network
+        .control
+        .request("DELETE", &format!("channels/{going_on}"))
+        .await?;
+    let mut ending = Vec::new();
+    while ending.len() < 2 {
+        ending.push(owner.next_event().await?);
+    }
+    assert!(
+        matches!(
+            ending.as_slice(),
+            [
+                Event::ParticipantLeft { .. },
+                Event::ConversationEnded {
+                    reason: EndReason::LastParticipantLeft
+                },
+            ]
+        ),
+        "the conversation going on ended with {ending:?}"
+    );
+    owner.closed().await?;
+    conversations_left(&draining, "0").await?;
+    if !stand
+        .controller
+        .output
+        .lock()
+        .await
+        .iter()
+        .any(|line| line.contains("draining — no conversation is left"))
+    {
+        return Err("the controller did not say the node is empty".into());
+    }
+    stand.expect_no_channels("after the node emptied").await?;
+    replace_the_controller(stand).await
+}
+
+/// Tell the controller the node is to empty, as the installer does: SIGUSR1.
+fn tell_the_controller_to_empty(stand: &Stand) -> TestResult {
+    let pid = stand
+        .controller
+        .child
+        .id()
+        .ok_or("the controller is not running")?;
+    let sent = std::process::Command::new("kill")
+        .args(["-USR1", &pid.to_string()])
+        .status()?;
+    if !sent.success() {
+        return Err("SIGUSR1 could not be sent to the controller".into());
+    }
+    Ok(())
+}
+
+/// Replace the controller, as the installer replaces an emptied node: a new
+/// one, welcomed on its service connection.
+async fn replace_the_controller(stand: &mut Stand) -> TestResult {
+    stand.kill_the_controller().await?;
+    stand.start_the_controller().await?;
+    let mut again = ServiceEnd::accept(&stand.application).await?;
+    let NodeMessage::Hello { .. } = again.next().await? else {
+        return Err("the replaced node opened its service connection without a hello".into());
+    };
+    again.send(&ApplicationServiceMessage::Welcome)?;
+    *stand.service.lock().await = Some(again);
+    Ok(())
+}
+
+/// Wait until the run directory says `left` conversations are left.
+async fn conversations_left(file: &Path, left: &str) -> TestResult {
+    let said = timeout(STEP, async {
+        loop {
+            if fs::read_to_string(file).is_ok_and(|text| text.trim() == left) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    if said.is_err() {
+        return Err(format!(
+            "{} did not say {left} conversation(s) left: {:?}",
+            file.display(),
+            fs::read_to_string(file).ok()
+        )
+        .into());
+    }
+    Ok(())
 }
 
 /// Run one scenario, saying its name first — what a scenario prints goes

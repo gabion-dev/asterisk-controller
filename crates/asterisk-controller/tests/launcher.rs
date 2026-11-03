@@ -10,8 +10,8 @@
 //! on it.
 //!
 //! What is held: the controller first and Asterisk on its ready line; a half
-//! killed is started again while the other one goes on; SIGHUP reaches the
-//! controller; a stop ends Asterisk first and the controller after it; an
+//! killed is started again while the other one goes on; SIGHUP and SIGUSR1
+//! reach the controller; a stop ends Asterisk first and the controller after it; an
 //! exhausted ladder stops the other half too and ends the launcher with its
 //! own code; an Asterisk whose HTTP port is another's is not called ready;
 //! arguments the launcher or the controller would refuse start nothing.
@@ -210,13 +210,21 @@ impl Launcher {
 
     /// Wait until stderr has a line containing `words`.
     async fn comes_to_say(&self, words: &str) -> bool {
+        self.comes_to_say_times(words, 1).await
+    }
+
+    /// Whether the launcher's stderr comes to hold `words` on `times` lines
+    /// within a step.
+    async fn comes_to_say_times(&self, words: &str, times: usize) -> bool {
         timeout(STEP, async {
-            while !self
+            while self
                 .stderr
                 .lock()
                 .await
                 .iter()
-                .any(|line| line.contains(words))
+                .filter(|line| line.contains(words))
+                .count()
+                < times
             {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
@@ -312,8 +320,9 @@ async fn the_launcher_keeps_the_node_by_its_rule() -> TestResult {
     Ok(())
 }
 
-/// Ready in order; each half started again alone; SIGHUP passed on; a stop
-/// ends Asterisk first.
+/// Ready in order; each half started again alone; SIGHUP and SIGUSR1 passed
+/// on — SIGUSR1 to a controller started again, too; a stop ends Asterisk
+/// first.
 async fn keeps_both_halves_and_stops_asterisk_first(tree: &Path) -> TestResult {
     let place = Place::new("keeps").await?;
     let mut launcher = Launcher::start(&place.arguments(tree, 2))?;
@@ -350,6 +359,22 @@ async fn keeps_both_halves_and_stops_asterisk_first(tree: &Path) -> TestResult {
     launcher.signal("HUP")?;
     if !launcher.comes_to_say("asterisk-controller: SIGHUP").await {
         return Err(launcher.failed("passed no SIGHUP on").await);
+    }
+
+    // SIGUSR1 reaches the controller: the node empties. A controller started
+    // again meanwhile is told so too, once it is ready.
+    launcher.signal("USR1")?;
+    let emptied = "asterisk-controller: draining — no conversation is left";
+    if !launcher.comes_to_say(emptied).await {
+        return Err(launcher.failed("passed no SIGUSR1 on").await);
+    }
+    send("KILL", controller)?;
+    launcher.next("exited").await?;
+    let controller = pid_of(&launcher.next("controller-ready").await?)?;
+    if !launcher.comes_to_say_times(emptied, 2).await {
+        return Err(launcher
+            .failed("did not tell a controller started again that the node empties")
+            .await);
     }
 
     // A stop: Asterisk first, the controller after it, all with code 0.

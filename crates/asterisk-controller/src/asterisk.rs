@@ -50,6 +50,8 @@ use hyper_util::rt::TokioIo;
 use tokio::{net::TcpStream, sync::mpsc};
 use tokio_tungstenite::{connect_async, tungstenite::Message as Frame};
 
+use node_protocol::messages::{RequestOutcome, RequestRejection};
+
 use crate::{
     ari,
     asterisk_files::{APPLICATION, CONTROL_USER},
@@ -120,6 +122,11 @@ impl Asterisk {
             api_key: credentials,
             routes: Mutex::new(Routes::default()),
         })
+    }
+
+    /// How many conversations the node carries now.
+    pub fn conversations(&self) -> usize {
+        self.routes().conversations.len()
     }
 
     fn routes(&self) -> MutexGuard<'_, Routes> {
@@ -628,6 +635,13 @@ fn pass_on(node: &Arc<Node>, asterisk: &Arc<Asterisk>, message: ari::Message) {
 /// The application asked the node to start a conversation: it is named now,
 /// and carried from its first call to its end.
 pub fn start_by_code(node: &Arc<Node>, asterisk: &Arc<Asterisk>, asked: conversation::Asked) {
+    if node.drain.is_on() {
+        // An emptying node starts nothing new.
+        let _ = asked.answer.send(RequestOutcome::Rejected {
+            reason: RequestRejection::NodeNotReady,
+        });
+        return;
+    }
     let id = uuid::Uuid::new_v4().to_string();
     let line = asterisk.open_line(&id, &[]);
     tokio::spawn(conversation::carry_by_code(
@@ -645,6 +659,21 @@ fn arrived(
     arguments: &[String],
     channel: ari::Channel,
 ) {
+    if node.drain.is_on() {
+        // An emptying node takes no new call: it is turned away as
+        // congestion, which the operator may take to another route.
+        eprintln!("asterisk-controller: a call was turned away — the node is draining");
+        let asterisk = Arc::clone(asterisk);
+        tokio::spawn(async move {
+            let _ = asterisk
+                .request(
+                    "DELETE",
+                    &format!("channels/{}?reason=congestion", channel.id),
+                )
+                .await;
+        });
+        return;
+    }
     match conversation::entry(arguments) {
         Ok(origin) => {
             // A conversation exists from the moment it has a participant,

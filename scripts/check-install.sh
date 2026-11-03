@@ -12,7 +12,8 @@
 # - SIGHUP (systemctl reload) reaches the controller;
 # - a launcher that dies is started again by systemd, and its halves go with
 #   it;
-# - an install again, without a secret, keeps the secret and the certificate;
+# - an install again, without a secret, keeps the secret and the certificate,
+#   and lets the running node empty before it restarts it;
 # - a secret typed at a terminal is asked for and not shown;
 # - a stop ends Asterisk first, then the controller, then the launcher, each
 #   with status 0.
@@ -91,7 +92,13 @@ ASTERISKS="$(pgrep -c -u gabion-telephony -x asterisk || true)"
 echo "== an install again keeps the secret and the certificate"
 KEPT="$(sha256sum "${STATE}/node-secret" "${STATE}/tls/node.crt" "${STATE}/tls/node.key")"
 AT="$(cursor)"
-install_node
+SAID="$(install_node)"
+echo "${SAID}"
+# The node runs, so it is let empty first: with no conversation going on,
+# the restart follows at once.
+echo "${SAID}" | grep -q "the node takes no new call" || fail "the running node was not let empty"
+echo "${SAID}" | grep -q "no conversation is left" || fail "the install did not wait for the node to empty"
+wait_for "${AT}" "draining — no conversation is left" "the controller did not empty"
 wait_for "${AT}" '"event":"asterisk-ready"' "the node did not come back after the install"
 [ "$(sha256sum "${STATE}/node-secret" "${STATE}/tls/node.crt" "${STATE}/tls/node.key")" = "${KEPT}" ] \
   || fail "the secret or the certificate changed"

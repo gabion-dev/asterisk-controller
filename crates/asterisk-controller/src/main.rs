@@ -22,6 +22,7 @@ mod config;
 mod conversation;
 mod destination;
 mod download;
+mod drain;
 mod host;
 mod install;
 mod launch;
@@ -42,7 +43,7 @@ use std::{
 };
 use tokio::{
     net::{TcpListener, TcpStream},
-    signal::unix::{SignalKind, signal},
+    signal::unix::{Signal, SignalKind, signal},
 };
 use tokio_tungstenite::{
     accept_hdr_async,
@@ -100,23 +101,10 @@ async fn main() -> ExitCode {
         }
     };
 
-    // Whoever runs the node stops the controller with SIGTERM, or with
-    // SIGINT from a terminal; either is a stop asked for, and ends it with
-    // success.
-    let mut terminate = match signal(SignalKind::terminate()) {
-        Ok(terminate) => terminate,
-        Err(error) => {
-            eprintln!("asterisk-controller: cannot listen for SIGTERM: {error}");
-            return ExitCode::FAILURE;
-        }
-    };
-
-    // Whoever renews the node's certificate for operators says so with
-    // SIGHUP: Asterisk is then given it, with no call dropped.
-    let mut hangup = match signal(SignalKind::hangup()) {
-        Ok(hangup) => hangup,
-        Err(error) => {
-            eprintln!("asterisk-controller: cannot listen for SIGHUP: {error}");
+    let (mut terminate, mut hangup, mut drain) = match signals() {
+        Ok(signals) => signals,
+        Err(problem) => {
+            eprintln!("asterisk-controller: {problem}");
             return ExitCode::FAILURE;
         }
     };
@@ -156,6 +144,7 @@ async fn main() -> ExitCode {
         door: media::Door::default(),
         lines: node::Lines::default(),
         replaced: tokio::sync::Notify::new(),
+        drain: drain::Drain::default(),
     });
     tokio::spawn(asterisk::run(Arc::clone(&node), Arc::clone(&asterisk)));
     tokio::spawn(service::run(Arc::clone(&node), Arc::clone(&asterisk)));
@@ -178,9 +167,33 @@ async fn main() -> ExitCode {
             _ = hangup.recv() => {
                 tokio::spawn(certificate_renewed(Arc::clone(&node), Arc::clone(&asterisk)));
             }
+            _ = drain.recv() => {
+                tokio::spawn(drain::begin(Arc::clone(&node), Arc::clone(&asterisk)));
+            }
             () = node.replaced.notified() => return ExitCode::FAILURE,
         }
     }
+}
+
+/// The signals the controller listens for, listened for before it says it
+/// is ready — a signal not listened for would end it:
+///
+/// - SIGTERM: whoever runs the node stops the controller with it, or with
+///   SIGINT from a terminal; either is a stop asked for, and ends it with
+///   success;
+/// - SIGHUP: whoever renews the node's certificate for operators says so
+///   with it, and Asterisk is given the certificate with no call dropped;
+/// - SIGUSR1: whoever replaces the node says so with it, and the node takes
+///   no new call ([`crate::drain`]).
+fn signals() -> Result<(Signal, Signal, Signal), String> {
+    let listen = |kind: SignalKind, name: &str| {
+        signal(kind).map_err(|error| format!("cannot listen for {name}: {error}"))
+    };
+    Ok((
+        listen(SignalKind::terminate(), "SIGTERM")?,
+        listen(SignalKind::hangup(), "SIGHUP")?,
+        listen(SignalKind::user_defined1(), "SIGUSR1")?,
+    ))
 }
 
 /// Read the node's settings and write Asterisk's configuration from them.

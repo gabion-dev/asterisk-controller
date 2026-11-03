@@ -17,8 +17,9 @@
 //! a terminal — and a certificate
 //! for SIP over TLS, made once and kept; and one systemd service that runs
 //! the launcher ([`crate::launch`]). Run again from another release, it is the
-//! update: the new version is put beside the old one and the service is
-//! pointed at it and restarted.
+//! update: the new version is put beside the old one, the service is pointed
+//! at it, and the running node is let empty — it takes no new call, the
+//! conversations going on end ([`crate::drain`]) — before it is restarted.
 //!
 //! The service follows the launcher's rule: systemd starts the launcher
 //! again when it dies, but not when it gives the node up (status 2) or
@@ -343,11 +344,64 @@ async fn install(arguments: impl Iterator<Item = String>) -> Result<(), String> 
         .map_err(|error| format!("{}: {error}", layout.unit.display()))?;
     systemctl(&["daemon-reload"])?;
     systemctl(&["enable", NAME])?;
+    if let Some(running) = main_pid()? {
+        let_it_empty(&layout, running).await?;
+    }
     systemctl(&["restart", NAME])?;
     say(&format!(
         "the service {NAME} runs; its journal: journalctl -u {NAME}"
     ));
     Ok(())
+}
+
+/// The process of the running service, if it runs.
+fn main_pid() -> Result<Option<String>, String> {
+    let output = Command::new("systemctl")
+        .args(["show", "--property=MainPID", "--value", NAME])
+        .output()
+        .map_err(|error| format!("systemctl: {error}"))?;
+    let pid = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    Ok((output.status.success() && !pid.is_empty() && pid != "0").then_some(pid))
+}
+
+/// Before a running node is replaced, let it empty: it takes no new call,
+/// and the conversations going on end as they would ([`crate::drain`]).
+/// Ctrl+C replaces it at once, ending them. A node of a release before the
+/// drain ends at the signal instead, and systemd starts it again on what
+/// was just installed: its process changes, and nothing is left to wait
+/// for.
+async fn let_it_empty(layout: &Layout, running: String) -> Result<(), String> {
+    let file = layout.run.join(crate::drain::FILE);
+    systemctl(&["kill", "--kill-whom=main", "--signal=SIGUSR1", NAME])?;
+    say(
+        "the node takes no new call; the conversations going on end first \
+         (Ctrl+C replaces it now and ends them)",
+    );
+    let mut said = None;
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                say("replaced now: the conversations going on end");
+                return Ok(());
+            }
+            () = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+        }
+        if main_pid()?.as_deref() != Some(running.as_str()) {
+            return Ok(());
+        }
+        let Ok(left) = std::fs::read_to_string(&file) else {
+            continue;
+        };
+        let left = left.trim().to_owned();
+        if left == "0" {
+            say("no conversation is left");
+            return Ok(());
+        }
+        if said.as_ref() != Some(&left) {
+            say(&format!("{left} conversation(s) go on"));
+            said = Some(left);
+        }
+    }
 }
 
 fn say(what: &str) {

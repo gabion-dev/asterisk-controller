@@ -43,6 +43,9 @@ pub struct Node {
     /// Told when another connection has taken the node's application in
     /// Asterisk from this controller, which then stops.
     pub replaced: tokio::sync::Notify,
+    /// Whether the node is emptying before it is replaced: it takes no new
+    /// call.
+    pub drain: crate::drain::Drain,
 }
 
 impl Node {

@@ -234,15 +234,25 @@ SDK Voice Connector does not check the node's certificate), made once and
 kept; and the service `gabion-telephony`, which runs the launcher with SIP
 over TLS on port 5061 (`--sip-tls-port` for another) and audio on UDP
 10000–10999 (`--audio-ports` for others). Run again from another release, it
-is the update: the new version is put beside the old one, and the service is
-pointed at it and restarted — the restart ends calls in progress. Run again
-without `--secret-from-stdin`, it keeps the secret it has.
+is the update: the new version is put beside the old one, the service is
+pointed at it, and the running node is let empty first — it takes no new call
+and the calls in progress end as they would — then it is restarted. Ctrl+C
+while it empties restarts it at once, ending those calls. Run again without
+`--secret-from-stdin`, it keeps the secret it has.
 
 The service follows the launcher's rule: systemd starts the launcher again
 when it dies, not when it gives the node up (status 2) or refuses its
 arguments (status 1) — the reason is in `journalctl -u gabion-telephony`; a
 stop signals the launcher alone, which stops Asterisk first; `systemctl
 reload gabion-telephony` is SIGHUP for a renewed certificate.
+
+SIGUSR1 to the launcher (`systemctl kill --kill-whom=main --signal=SIGUSR1
+gabion-telephony`) is what the update sends: the node empties. A call that
+arrives is turned away as congestion — the operator hears 503 and may take it
+to another of its routes — and the application's request to start a
+conversation is refused as `node_not_ready`; conversations going on are
+carried to their end. `<run>/draining` says how many are left, down to 0.
+Nothing turns it back: an emptied node is replaced.
 
 ### Settings
 
@@ -512,7 +522,7 @@ the test. The Java side is compiled with Error Prone and NullAway, every
 warning an error; its check runs the library through the shared vectors,
 plays the application on the service connection of the controller built
 from this repository, without Asterisk, holds the hand-written part to full
-documentation, and checks the controller release the library carries.
+documentation.
 
 `.github/workflows/checks.yml` runs the same checks on every push and pull
 request — once more inside Amazon Linux 2023 — and installs the node on fresh
@@ -523,17 +533,21 @@ each on a machine of its own platform after every check passed there, starts
 each binary on clean hosts, and publishes the release only when all did and
 the dependency audit of the repository passed (`.github/workflows/audit.yml`,
 also run by hand from the Actions tab: every release the repository pins is
-its newest one, or a lag declared in `gabion-audit.json` with its reason). With
-it the Java library goes to Maven Central under the same version,
-`dev.gabion:node-protocol:<version>`: it is uploaded and validated first,
-published only once the release exists, and dropped if anything fails before
-that. The library carries the SHA-256 of each of the release's four controller
-archives (`ControllerRelease`): an application that takes it knows which
-controller its node runs and how to tell an archive is that one.
-`(cd java && ./gradlew centralBundle -PcontrollerArchives=<directory>)` lays
-out the signed bundle it uploads, from the archives' `.sha256` files in
-`<directory>`; it needs `SIGNING_KEY` (an armored private key) and
-`SIGNING_PASSWORD`, and refuses to lay one out without the checksums.
+its newest one, or a lag declared in `gabion-audit.json` with its reason). It
+publishes nothing to Maven Central.
+
+The Java library goes to Maven Central as `dev.gabion:node-protocol:<version>`
+with a version of its own (`java/build.gradle.kts`), by
+`.github/workflows/library.yml` run by hand, and only when the library changed
+— its protocol description, the generator of its types or its hand-written
+part: Central counts every publication against a monthly limit. That workflow
+refuses a version Central already has, uploads the signed bundle for Central to
+validate, and publishes it last, dropping it if anything fails before. A
+controller release goes out only while the library's sources are exactly those
+published under its version (`scripts/library-is-published.sh` compares the
+sources jar built here with the one on Central), and its notes name that
+library. `(cd java && ./gradlew centralBundle)` lays out the signed bundle; it
+needs `SIGNING_KEY` (an armored private key) and `SIGNING_PASSWORD`.
 
 ## Status
 

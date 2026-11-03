@@ -29,15 +29,15 @@ plugins {
 
 group = "dev.gabion"
 
-// One version for the controller and the library that speaks to it: the
-// controller names its version to the application in every hello, and the
-// library of the same version is the one that speaks its protocol. The
-// controller's own manifest is its one owner.
-val controllerManifest = layout.projectDirectory.file("../crates/asterisk-controller/Cargo.toml")
-version = providers.fileContents(controllerManifest).asText.map { manifest ->
-    Regex("""(?m)^version = "([^"]+)"$""").find(manifest)?.groupValues?.get(1)
-        ?: throw GradleException("No version in ${controllerManifest.asFile}")
-}.get()
+// The library's own version. It changes only when what the library is
+// changes — the protocol description, the generator of its types, or its
+// hand-written part — and only then is it published: a release of the
+// controller that leaves the protocol as it was publishes nothing to Maven
+// Central, which counts every publication against a monthly limit. A
+// controller release refuses to go out while these sources differ from the
+// published library of this version (scripts/library-is-published.sh), so a
+// changed protocol cannot reach a node before the library that speaks it.
+version = "0.1.0-dev.8"
 
 val protocolPackage = "dev.gabion.telephony.protocol"
 val repositoryRoot = layout.projectDirectory.dir("..")
@@ -124,64 +124,12 @@ val generateProtocol = tasks.register<Exec>("generateProtocol") {
     }
 }
 
-// The controller release the library is published with: its version and the
-// SHA-256 of each of its four archives, read by ControllerRelease. An
-// application that takes the library knows from it which controller its node
-// runs and how to tell an archive is that one. The release gives the checksum
-// files of the archives it built (-PcontrollerArchives=<directory>); any other
-// build carries the version alone, and a bundle for Central is never made
-// without them.
-val controllerArchiveNames = listOf(
-    "asterisk-controller-linux-amd64.tar.gz",
-    "asterisk-controller-linux-arm64.tar.gz",
-    "asterisk-controller-darwin-arm64.tar.gz",
-    "asterisk-controller-darwin-amd64.tar.gz",
-)
-val controllerArchives = providers.gradleProperty("controllerArchives")
-val releaseResources = layout.buildDirectory.dir("generated/resources/controller-release")
-val writeControllerRelease = tasks.register("writeControllerRelease") {
-    description = "Writes the version and archive checksums of the controller release into the library."
-    group = "build"
-
-    val libraryVersion = version.toString()
-    val archivesDirectory = controllerArchives.map { file(it) }
-    val record = releaseResources.map {
-        it.file("${protocolPackage.replace('.', '/')}/controller-release.properties")
-    }
-    inputs.property("version", libraryVersion)
-    inputs.files(archivesDirectory.map { directory ->
-        controllerArchiveNames.map { directory.resolve("$it.sha256") }
-    }.orElse(emptyList())).optional()
-    outputs.dir(releaseResources)
-    doLast {
-        val lines = mutableListOf("version=$libraryVersion")
-        archivesDirectory.orNull?.let { directory ->
-            for (name in controllerArchiveNames) {
-                val checksumFile = directory.resolve("$name.sha256")
-                if (!checksumFile.isFile) {
-                    throw GradleException("No checksum of $name in $directory")
-                }
-                val fields = checksumFile.readText().trim().split(Regex("\\s+"))
-                val checksum = fields.firstOrNull().orEmpty()
-                if (!Regex("[0-9a-f]{64}").matches(checksum) || fields.getOrNull(1) != name) {
-                    throw GradleException("$checksumFile is not the SHA-256 line of $name")
-                }
-                lines += "$name=$checksum"
-            }
-        }
-        val target = record.get().asFile
-        target.parentFile.mkdirs()
-        target.writeText(lines.joinToString("\n", postfix = "\n"))
-    }
-}
-
 sourceSets {
     main {
         java.srcDir(files(generatedSources).builtBy(generateProtocol))
         // The checked decoding reads the description as a resource of its own
         // package.
         resources.srcDir(files(generatedResources).builtBy(generateProtocol))
-        resources.srcDir(files(releaseResources).builtBy(writeControllerRelease))
     }
 }
 
@@ -255,17 +203,8 @@ val serviceCheck = tasks.register<JavaExec>("serviceCheck") {
     )
 }
 
-val releaseCheck = tasks.register<JavaExec>("releaseCheck") {
-    description = "Checks the controller release the library carries."
-    group = "verification"
-
-    classpath = vectors.runtimeClasspath
-    mainClass = "dev.gabion.telephony.protocol.checks.ReleaseCheck"
-    args(version.toString(), if (controllerArchives.isPresent) "published" else "unpublished")
-}
-
 tasks.check {
-    dependsOn(vectorCheck, serviceCheck, releaseCheck)
+    dependsOn(vectorCheck, serviceCheck)
 }
 
 // The documentation published with the library. Every warning of the
@@ -371,17 +310,6 @@ tasks.withType<Sign>().configureEach {
 }
 
 tasks.named("publishLibraryPublicationToBundleRepository") {
-    // A published library says which controller archives it goes with: no
-    // bundle is laid out without them.
-    val published = controllerArchives.isPresent
-    doFirst {
-        if (!published) {
-            throw GradleException(
-                "-PcontrollerArchives is not set: a library for Central carries the checksums of its " +
-                    "release's controller archives.",
-            )
-        }
-    }
     // A bundle holds this version and nothing left from an earlier one.
     doFirst { delete(bundleDirectory) }
 }
