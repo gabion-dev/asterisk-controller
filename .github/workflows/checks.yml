@@ -60,6 +60,35 @@ jobs:
         working-directory: java
         run: ./gradlew check --console=plain
 
+  # The same checks on macOS, on both of its machines, as the release builds
+  # there: code compiled for one platform only says nothing of the other —
+  # what only macOS compiles is found here, not first by a release.
+  macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15, macos-15-intel]
+    runs-on: ${{ matrix.runner }}
+    # As the release builds it: for macOS 13 and newer.
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '13.0'
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+
+      - name: Rust toolchain
+        run: rustup show active-toolchain
+
+      - name: Linter (strict)
+        run: cargo clippy --all-targets --locked
+
+      - name: Host of the checks against Asterisk
+        uses: ./.github/actions/asterisk-lab-host
+
+      - name: Tests
+        run: cargo test --locked
+
   # A telephony node on a server is installed by the controller itself
   # (asterisk-controller install) as a systemd service. Installed here on a
   # fresh runner, as root, and judged: the node runs, SIGHUP reaches the

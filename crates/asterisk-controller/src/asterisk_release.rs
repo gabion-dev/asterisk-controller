@@ -30,7 +30,9 @@ pub struct Archive {
     /// The newest symbol version every glibc library must define for the
     /// tree to load. glibc defines its versions cumulatively, so a library
     /// that defines the newest one defines the older ones too. Empty on
-    /// macOS, which has no glibc.
+    /// macOS, which has no glibc. Read only where there is glibc to judge
+    /// ([`crate::host`]) and by the checks of the pin.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub glibc: &'static [(&'static str, &'static str)],
 }
 
