@@ -5876,13 +5876,12 @@ async fn an_emptying_node_takes_no_new_call(stand: &mut Stand) -> TestResult {
     );
     owner.closed().await?;
     conversations_left(&draining, "0").await?;
+    // The file says 0 before the controller's line says so: the line is
+    // waited for.
     if !stand
         .controller
-        .output
-        .lock()
+        .comes_to_say("draining — no conversation is left")
         .await
-        .iter()
-        .any(|line| line.contains("draining — no conversation is left"))
     {
         return Err("the controller did not say the node is empty".into());
     }
