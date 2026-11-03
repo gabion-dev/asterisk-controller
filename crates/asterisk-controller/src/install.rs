@@ -13,7 +13,8 @@
 //! the Asterisk tree it pins ([`crate::tree`], the machine judged first); a
 //! system user the node runs as; the node's state directory, readable by
 //! that user alone, with the node's secret — read from stdin, never from the
-//! command line, which every user of the machine sees — and a certificate
+//! command line, which every user of the machine sees; asked for, unseen, at
+//! a terminal — and a certificate
 //! for SIP over TLS, made once and kept; and one systemd service that runs
 //! the launcher ([`crate::launch`]). Run again from another release, it is the
 //! update: the new version is put beside the old one and the service is
@@ -353,22 +354,58 @@ fn say(what: &str) {
     println!("asterisk-controller install: {what}");
 }
 
-/// The node's secret, the first line of stdin.
+/// The node's secret, the first line of stdin. Typed or pasted at a
+/// terminal, it is asked for and not shown — nor is it in the shell's
+/// history, as it would be on the command line or in an `echo`.
 fn secret_from_stdin() -> Result<String, String> {
     let stdin = std::io::stdin();
-    if stdin.is_terminal() {
-        eprintln!("the node's secret:");
-    }
     let mut line = String::new();
-    stdin
-        .lock()
-        .read_line(&mut line)
-        .map_err(|error| format!("the node's secret could not be read: {error}"))?;
+    let read = if stdin.is_terminal() {
+        eprint!("the node's secret (not shown): ");
+        let hidden = Hidden::new(&stdin)?;
+        let read = stdin.lock().read_line(&mut line);
+        drop(hidden);
+        eprintln!();
+        read
+    } else {
+        stdin.lock().read_line(&mut line)
+    };
+    read.map_err(|error| format!("the node's secret could not be read: {error}"))?;
     let secret = line.trim();
     if secret.is_empty() {
         return Err("--secret-from-stdin: stdin gave no secret".into());
     }
     Ok(secret.to_owned())
+}
+
+/// A terminal that does not echo what is typed, until dropped.
+struct Hidden<'a> {
+    stdin: &'a std::io::Stdin,
+    before: rustix::termios::Termios,
+}
+
+impl<'a> Hidden<'a> {
+    fn new(stdin: &'a std::io::Stdin) -> Result<Self, String> {
+        use rustix::termios::{LocalModes, OptionalActions, tcgetattr, tcsetattr};
+        let failed =
+            |error: rustix::io::Errno| format!("the terminal cannot hide the secret: {error}");
+        let before = tcgetattr(stdin).map_err(failed)?;
+        let mut hidden = before.clone();
+        hidden.local_modes.remove(LocalModes::ECHO);
+        hidden.local_modes.insert(LocalModes::ECHONL);
+        tcsetattr(stdin, OptionalActions::Now, &hidden).map_err(failed)?;
+        Ok(Self { stdin, before })
+    }
+}
+
+impl Drop for Hidden<'_> {
+    fn drop(&mut self) {
+        let _ = rustix::termios::tcsetattr(
+            self.stdin,
+            rustix::termios::OptionalActions::Now,
+            &self.before,
+        );
+    }
 }
 
 /// Put a copy of the running binary at `into`, whole or not at all.

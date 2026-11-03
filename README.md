@@ -215,10 +215,13 @@ On a Linux server with systemd, the controller installs the node itself, as
 root, from the binary of the release to install:
 
 ```sh
-echo "<the node's secret>" | sudo ./asterisk-controller install \
+sudo ./asterisk-controller install \
     --node <name> --application wss://<host>/api/telephony/node \
     --public <the server's public address> --secret-from-stdin
 ```
+
+It asks for the node's secret and does not show what is typed, so the secret
+is in no command line and in no shell history.
 
 It puts in place, each in a directory of its own version, this binary
 (`/opt/gabion-telephony/controller/<version>/`) and the Asterisk tree it pins

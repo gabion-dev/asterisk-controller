@@ -13,6 +13,7 @@
 # - a launcher that dies is started again by systemd, and its halves go with
 #   it;
 # - an install again, without a secret, keeps the secret and the certificate;
+# - a secret typed at a terminal is asked for and not shown;
 # - a stop ends Asterisk first, then the controller, then the launcher, each
 #   with status 0.
 #
@@ -94,6 +95,22 @@ install_node
 wait_for "${AT}" '"event":"asterisk-ready"' "the node did not come back after the install"
 [ "$(sha256sum "${STATE}/node-secret" "${STATE}/tls/node.crt" "${STATE}/tls/node.key")" = "${KEPT}" ] \
   || fail "the secret or the certificate changed"
+
+echo "== a secret typed at a terminal is asked for and not shown"
+# The installer is run on a terminal of its own; the secret arrives a moment
+# later, as a person would paste it after the question.
+AT="$(cursor)"
+TRANSCRIPT="$(mktemp)"
+COMMAND="$(printf '%q ' "${BINARY}" install --node check \
+  --application wss://application.invalid/api/telephony/node --public 192.0.2.10 --secret-from-stdin)"
+(sleep 3; printf 'typed-secret-of-the-check\n') | script -qec "${COMMAND}" "${TRANSCRIPT}" >/dev/null \
+  || fail "the install on a terminal failed: $(cat "${TRANSCRIPT}")"
+grep -q "the node's secret (not shown)" "${TRANSCRIPT}" || fail "the installer did not ask for the secret"
+if grep -q "typed-secret-of-the-check" "${TRANSCRIPT}"; then
+  fail "the secret was shown on the terminal"
+fi
+[ "$(cat "${STATE}/node-secret")" = "typed-secret-of-the-check" ] || fail "the typed secret is not the node's"
+wait_for "${AT}" '"event":"asterisk-ready"' "the node did not come back after the install on a terminal"
 
 echo "== a stop: Asterisk first, then the controller, each with status 0"
 AT="$(cursor)"

@@ -2,7 +2,7 @@
 
 [package]
 name = "asterisk-controller"
-version = "0.1.0-dev.8"
+version = "0.1.0-dev.9"
 description = "Runs next to Asterisk on a Gabion telephony node and controls it on behalf of the application."
 edition.workspace = true
 license.workspace = true
@@ -23,7 +23,7 @@ hyper-util = { version = "0.1.21", features = ["tokio"] }
 node-protocol = { path = "../node-protocol" }
 phonenumber = "0.3.10"
 rcgen = { version = "0.14.10", default-features = false, features = ["ring", "pem"] }
-rustix = { version = "1.1.6", features = ["process", "system"] }
+rustix = { version = "1.1.6", features = ["process", "system", "termios"] }
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-native-certs = "0.8.5"
 serde = { version = "1.0.229", features = ["derive"] }
