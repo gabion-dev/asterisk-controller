@@ -31,9 +31,14 @@ fail() {
   exit 1
 }
 
-# The journal's position now: what a step waits for must come after it.
+# The journal's position now: what a step waits for must come after it. The
+# whole journal's, not the unit's — before the first install the unit has no
+# lines, and no position.
 cursor() {
-  journalctl -u "${UNIT}" -n 0 --show-cursor --no-pager | sed -n 's/^-- cursor: //p'
+  local position
+  position="$(journalctl -n 0 --show-cursor --no-pager | sed -n 's/^-- cursor: //p')"
+  [ -n "${position}" ] || fail "the journal gives no position"
+  echo "${position}"
 }
 
 # Wait up to a minute for a line of the unit's journal after <cursor>.
