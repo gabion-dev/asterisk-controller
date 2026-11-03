@@ -134,7 +134,7 @@ impl Application {
             .map_err(|error| format!("the node's credentials cannot be sent: {error}"))?;
         authorization.set_sensitive(true);
         let tls = if config.application_url.starts_with("wss://") {
-            Some(Arc::new(tls()?))
+            Some(Arc::new(tls("the application's certificate")?))
         } else {
             None
         };
@@ -375,16 +375,19 @@ fn secret(state: &Path) -> Result<String, String> {
     Ok(secret.to_owned())
 }
 
-/// TLS towards the application: rustls with the ring provider, judging the
-/// application's certificate against the roots the machine trusts.
-fn tls() -> Result<rustls::ClientConfig, String> {
+/// TLS from this machine: rustls with the ring provider, judging the
+/// server's certificate against the roots the machine trusts — towards the
+/// application, and towards where the Asterisk tree is downloaded from
+/// ([`crate::download`]). `judged` names whose certificate it is, for the
+/// refusal.
+pub(crate) fn tls(judged: &str) -> Result<rustls::ClientConfig, String> {
     let found = rustls_native_certs::load_native_certs();
     let mut roots = rustls::RootCertStore::empty();
     let (added, _ignored) = roots.add_parsable_certificates(found.certs);
     if added == 0 {
         return Err(format!(
-            "the machine trusts no root certificate this controller can read, so the \
-             application's certificate cannot be judged{}",
+            "the machine trusts no root certificate this controller can read, so {judged} \
+             cannot be judged{}",
             if found.errors.is_empty() {
                 String::new()
             } else {

@@ -135,7 +135,7 @@ jobs:
       - name: Run on clean hosts (nothing installed)
         run: |
           set -euxo pipefail
-          for img in almalinux:9-minimal almalinux:10-minimal ubuntu:22.04 ubuntu:24.04 ubuntu:26.04 debian:12 debian:13 fedora:latest; do
+          for img in almalinux:9-minimal almalinux:10-minimal amazonlinux:2023 ubuntu:22.04 ubuntu:24.04 ubuntu:26.04 debian:12 debian:13 fedora:latest; do
             echo "=== ${img} (${{ matrix.arch }}) ==="
             docker run --rm \
               -v "${PWD}:/src:ro" \
@@ -308,6 +308,19 @@ jobs:
       CENTRAL: https://central.sonatype.com/api/v1/publisher
 
     steps:
+      - name: Check out
+        uses: actions/checkout@v7
+
+      # The release notes name the Asterisk the controller drives; it is
+      # pinned in one place, the controller's code.
+      - name: The Asterisk release the controller pins
+        run: |
+          set -euo pipefail
+          RELEASE="$(sed -n 's/^pub const RELEASE: &str = "\(.*\)";$/\1/p' \
+            crates/asterisk-controller/src/asterisk_release.rs)"
+          [ -n "${RELEASE}" ] || { echo "ERROR: no Asterisk release in asterisk_release.rs" >&2; exit 1; }
+          echo "ASTERISK_RELEASE=${RELEASE}" >> "${GITHUB_ENV}"
+
       - name: Download all artifacts
         uses: actions/download-artifact@v8
         with:
@@ -361,9 +374,9 @@ jobs:
           name: asterisk-controller ${{ github.event.inputs.version }}
           prerelease: ${{ contains(github.event.inputs.version, '-') }}
           body: |
-            The controller of a Gabion telephony node, for Asterisk 22.11.0 (release `22.11.0-r3` of gabion-dev/asterisk-server). How to run it — the README in each archive.
+            The controller of a Gabion telephony node, for Asterisk release `${{ env.ASTERISK_RELEASE }}` of gabion-dev/asterisk-server. How to run it — the README in each archive.
 
-            Every archive was built on a native machine of its platform, where every check of this repository passed first — the controller against the pinned Asterisk included — and was then started on clean hosts: Linux — AlmaLinux 9 and 10, Ubuntu 22.04, 24.04 and 26.04, Debian 12 and 13, Fedora; macOS — 14, 15, 26 and 27 on Apple Silicon, 15 and 26 on Intel.
+            Every archive was built on a native machine of its platform, where every check of this repository passed first — the controller against the pinned Asterisk included — and was then started on clean hosts: Linux — AlmaLinux 9 and 10, Amazon Linux 2023, Ubuntu 22.04, 24.04 and 26.04, Debian 12 and 13, Fedora; macOS — 14, 15, 26 and 27 on Apple Silicon, 15 and 26 on Intel.
 
             ## Platforms
             - `asterisk-controller-linux-amd64.tar.gz` — Linux x64, glibc 2.34+

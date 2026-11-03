@@ -59,3 +59,52 @@ jobs:
       - name: Java side against the shared vectors
         working-directory: java
         run: ./gradlew check --console=plain
+
+  # A telephony node on a server is installed by the controller itself
+  # (asterisk-controller install) as a systemd service. Installed here on a
+  # fresh runner, as root, and judged: the node runs, SIGHUP reaches the
+  # controller, a launcher that dies is started again, an install again keeps
+  # the node's secret and certificate, a stop ends Asterisk first.
+  install:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+
+      - name: Rust toolchain
+        run: rustup show active-toolchain
+
+      - name: Build
+        run: cargo build --locked -p asterisk-controller
+
+      - name: Install as a telephony node
+        run: sudo bash scripts/check-install.sh "${PWD}/target/debug/asterisk-controller"
+
+  # A telephony node on AWS runs on Amazon Linux 2023: every check of the
+  # repository there, on its own glibc 2.34 — the pinned Asterisk tree put in
+  # place by the controller's `tree`, and run against.
+  amazon-linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+
+      - name: Every check on Amazon Linux 2023
+        run: |
+          set -euxo pipefail
+          mkdir -p out
+          docker run --rm \
+            -v "${PWD}:/src:ro" \
+            -v "${PWD}/out:/out" \
+            amazonlinux:2023 \
+            bash /src/scripts/build-release-linux.sh /src /out

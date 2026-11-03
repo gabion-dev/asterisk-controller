@@ -15,23 +15,25 @@ workspace = true
 
 [dependencies]
 data-encoding = "2.11.1"
+flate2 = "1.1.10"
 futures-util = "0.3.34"
 http-body-util = "0.1.5"
 hyper = { version = "1.12.0", features = ["client", "http1"] }
 hyper-util = { version = "0.1.21", features = ["tokio"] }
 node-protocol = { path = "../node-protocol" }
 phonenumber = "0.3.10"
-rustix = { version = "1.1.6", features = ["process"] }
+rcgen = { version = "0.14.10", default-features = false, features = ["ring", "pem"] }
+rustix = { version = "1.1.6", features = ["process", "system"] }
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-native-certs = "0.8.5"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 sha2 = "0.11.1"
+tar = { version = "0.4.46", default-features = false }
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal", "io-util", "fs", "process"] }
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring"] }
 tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-native-roots"] }
 uuid = { version = "1.29.0", features = ["v4"] }
 
 [dev-dependencies]
-rcgen = { version = "0.14.10", default-features = false, features = ["ring", "pem"] }
 tokio = { version = "1.54.1", features = ["process", "rt-multi-thread", "macros", "net", "sync", "time", "io-util"] }

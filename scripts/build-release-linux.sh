@@ -7,6 +7,10 @@
 #   docker run --rm -v "$PWD:/src:ro" -v "$PWD/out:/out" almalinux:9 \
 #     bash /src/scripts/build-release-linux.sh /src /out
 #
+# The Checks workflow runs it inside Amazon Linux 2023 as well — the system a
+# telephony node on AWS runs: every check there, the controller against the
+# pinned Asterisk included, on that system's own glibc 2.34.
+#
 # glibc is compatible only upward, so a binary built on glibc 2.34 runs on any
 # host the Asterisk tree runs on: the node's platforms are one fact. Before the
 # binary is kept, every check of the repository runs here — the controller
@@ -19,8 +23,8 @@ OUT="$2"
 FLOOR="2.34"
 
 # A C compiler for ring, `kill` for the test that renews the node's
-# certificate, `readelf` for the floor.
-dnf install -y --setopt=install_weak_deps=False gcc util-linux binutils tar gzip >/dev/null
+# certificate, `readelf` for the floor, `useradd` for the builder.
+dnf install -y --setopt=install_weak_deps=False gcc util-linux binutils tar gzip shadow-utils >/dev/null
 
 # The checks run as an ordinary user, as a node runs: a builder of its own,
 # with a copy of the checkout it can write to.

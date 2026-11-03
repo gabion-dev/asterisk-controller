@@ -17,9 +17,13 @@ mod application;
 mod ari;
 mod asterisk;
 mod asterisk_files;
+mod asterisk_release;
 mod config;
 mod conversation;
 mod destination;
+mod download;
+mod host;
+mod install;
 mod launch;
 mod media;
 mod node;
@@ -30,6 +34,7 @@ mod reports;
 mod service;
 mod settings;
 mod state_files;
+mod tree;
 
 use std::{
     process::ExitCode,
@@ -55,12 +60,16 @@ use crate::{config::Config, node::Node};
 #[tokio::main]
 async fn main() -> ExitCode {
     // `launch` starts the node — Asterisk together with this controller —
-    // and keeps it running (crate::launch); without it, this is the
-    // controller.
+    // and keeps it running (crate::launch); `tree` puts the pinned Asterisk
+    // tree in place (crate::tree); `install` makes a Linux server a node
+    // (crate::install); without any of them, this is the controller.
     let mut arguments = std::env::args().skip(1).peekable();
-    if arguments.peek().is_some_and(|first| first == "launch") {
-        arguments.next();
-        return launch::run(arguments).await;
+    let mode = arguments.peek().cloned();
+    match mode.as_deref() {
+        Some("launch") => return launch::run(arguments.skip(1)).await,
+        Some("tree") => return tree::run(arguments.skip(1)).await,
+        Some("install") => return install::run(arguments.skip(1)).await,
+        _ => {}
     }
 
     let config = match Config::from_arguments(arguments) {

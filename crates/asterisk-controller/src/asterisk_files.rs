@@ -33,9 +33,8 @@ use crate::{
 const KNOWN_ASTERISK_VERSIONS: &[&str] = &["22.11.0"];
 
 /// The modules of the Asterisk build this controller is checked against —
-/// release `22.11.0-r3` of gabion-dev/asterisk-server, the one
-/// `scripts/fetch-asterisk.sh` fetches — on every platform, apart from the
-/// timer, which is each platform's own ([`TIMING_MODULE`]).
+/// the pinned release ([`crate::asterisk_release`]) — on every platform, apart
+/// from the timer, which is each platform's own ([`TIMING_MODULE`]).
 ///
 /// A build record names the Asterisk version and not the revision of the
 /// build, and two revisions of one version differ in exactly this: what they
@@ -240,8 +239,9 @@ fn known_modules(record: &Path, modules: &[String]) -> Result<(), String> {
     }
     let mut problem = format!(
         "{} is not the Asterisk build this controller is checked against \
-         (release 22.11.0-r3 of gabion-dev/asterisk-server):",
-        record.display()
+         (release {} of gabion-dev/asterisk-server):",
+        record.display(),
+        crate::asterisk_release::RELEASE
     );
     if !unknown.is_empty() {
         let _ = write!(
@@ -1035,7 +1035,7 @@ mod tests {
             .unwrap_or_default();
         assert!(
             lacking.contains("lacks modules the controller drives (chan_bridge_media.so)")
-                && lacking.contains("22.11.0-r3"),
+                && lacking.contains(crate::asterisk_release::RELEASE),
             "{lacking:?}"
         );
         Ok(())

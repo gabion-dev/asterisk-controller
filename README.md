@@ -64,10 +64,24 @@ You need:
   drives only that build: it reads the version and the list of modules from
   `<tree>/BUILD-INFO.txt` and does not start with another version, with
   other modules than that build's, or without that file.
-  `scripts/fetch-asterisk.sh` fetches that tree — release `22.11.0-r3` of
-  [gabion-dev/asterisk-server](https://github.com/gabion-dev/asterisk-server),
-  for Linux (x86_64, aarch64) and macOS (arm64, x86_64) — checks its pinned
-  SHA-256 and unpacks it into `target/asterisk-server`. The tree is only read;
+  The controller puts that tree in place itself:
+
+  ```sh
+  asterisk-controller tree <directory>
+  ```
+
+  downloads release `22.11.0-r3` of
+  [gabion-dev/asterisk-server](https://github.com/gabion-dev/asterisk-server)
+  for this platform — Linux (x86_64, aarch64) or macOS (arm64, x86_64) —
+  refuses it unless its SHA-256 is the one pinned in the controller, and
+  unpacks it into `<directory>`, stamped with the release in
+  `<directory>/.release`; a directory already stamped with it is kept as it
+  is. Before anything is downloaded the machine is judged: on Linux every
+  glibc library the tree needs must define the symbol version the tree asks
+  for (the RHEL 9 family's and Amazon Linux 2023's glibc 2.34 do, a stock
+  2.34 does not), on macOS Darwin 22 (macOS 13) or later is needed; a
+  machine that falls short is told what it lacks. `scripts/fetch-asterisk.sh`
+  runs it for `target/asterisk-server`. The tree is only read;
 - a state directory for the node, with the node's secret in it
   ([below](#the-state-directory)).
 
@@ -194,6 +208,38 @@ It tells what happens on standard output, one JSON object per line, with the
 field `event` first: `controller-ready`, `asterisk-ready`,
 `asterisk-unusable`, `exited`, `given-up`, `stopped`. The output of the
 controller goes to standard error as it is, Asterisk's after `asterisk: `.
+
+### Installing on a Linux server
+
+On a Linux server with systemd, the controller installs the node itself, as
+root, from the binary of the release to install:
+
+```sh
+echo "<the node's secret>" | sudo ./asterisk-controller install \
+    --node <name> --application wss://<host>/api/telephony/node \
+    --public <the server's public address> --secret-from-stdin
+```
+
+It puts in place, each in a directory of its own version, this binary
+(`/opt/gabion-telephony/controller/<version>/`) and the Asterisk tree it pins
+(`/opt/gabion-telephony/asterisk-server/<release>/`, as `tree` does, the
+machine judged first); a system user `gabion-telephony`; the state directory
+`/var/lib/gabion-telephony`, readable by that user alone, with the node's
+secret — read from stdin, never from the command line, which every user of the
+machine sees — and a self-signed certificate for SIP over TLS (Amazon Chime
+SDK Voice Connector does not check the node's certificate), made once and
+kept; and the service `gabion-telephony`, which runs the launcher with SIP
+over TLS on port 5061 (`--sip-tls-port` for another) and audio on UDP
+10000–10999 (`--audio-ports` for others). Run again from another release, it
+is the update: the new version is put beside the old one, and the service is
+pointed at it and restarted — the restart ends calls in progress. Run again
+without `--secret-from-stdin`, it keeps the secret it has.
+
+The service follows the launcher's rule: systemd starts the launcher again
+when it dies, not when it gives the node up (status 2) or refuses its
+arguments (status 1) — the reason is in `journalctl -u gabion-telephony`; a
+stop signals the launcher alone, which stops Asterisk first; `systemctl
+reload gabion-telephony` is SIGHUP for a renewed certificate.
 
 ### Settings
 
@@ -430,8 +476,8 @@ The machine needs:
   rustup installs it on first use;
 - a C compiler: `ring`, the cryptography library of the controller's TLS,
   compiles C code;
-- for `scripts/fetch-asterisk.sh`: bash, curl, tar, `sha256sum` or `shasum`,
-  and access to github.com;
+- for `scripts/fetch-asterisk.sh`: bash and access to github.com — the
+  controller downloads and unpacks the tree itself;
 - for the tests: the Asterisk tree (from the script, or `ASTERISK_TREE`
   pointing at one), `127.0.0.2` and `127.0.0.3` as addresses of the machine,
   and the `kill` command; the path of
