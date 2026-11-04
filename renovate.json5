@@ -15,10 +15,48 @@
 // by checksum (java/gradle/verification-metadata.xml): a pull request that
 // moves one of them stays red until the metadata is regenerated with the
 // Gradle wrapper.
+//
+// The Asterisk tree the controller drives is pinned here
+// (crates/asterisk-controller/src/asterisk_release.rs), and so is the watch
+// on new Asterisk releases: the pin is the release of Asterisk plus the
+// revision of the gabion-dev/asterisk-server build ("-r4"); upstream knows
+// only the release, so a proposed update carries no revision, and the
+// build of that release in gabion-dev/asterisk-server supplies it with the
+// checksums, glibc symbol versions and modules the pin needs.
 {
   $schema: "https://docs.renovatebot.com/renovate-schema.json",
   extends: ["local>gabion-dev/renovate-config"],
+  customDatasources: {
+    // The release archives of Asterisk, one link per release on the page.
+    "asterisk-releases": {
+      defaultRegistryUrlTemplate: "https://downloads.asterisk.org/pub/telephony/asterisk/releases/",
+      format: "html",
+    },
+  },
+  customManagers: [
+    {
+      description: "The Asterisk tree the controller drives: the release of gabion-dev/asterisk-server it pins.",
+      customType: "regex",
+      managerFilePatterns: ["/^crates/asterisk-controller/src/asterisk_release\\.rs$/"],
+      matchStrings: ["pub const RELEASE: &str = \"(?<currentValue>[^\"]+)\";"],
+      datasourceTemplate: "custom.asterisk-releases",
+      depNameTemplate: "asterisk",
+      versioningTemplate: "regex:^(?<major>\\d+)\\.(?<minor>\\d+)\\.(?<patch>\\d+)(?:-r(?<build>\\d+))?$",
+      extractVersionTemplate: "^asterisk-(?<version>\\d+\\.\\d+\\.\\d+)\\.tar\\.gz$",
+    },
+  ],
   packageRules: [
+    {
+      description: "A new Asterisk moves with a build of it in gabion-dev/asterisk-server — its revision, the four checksums, the glibc symbol versions and the modules of the tree: the update is approved on the Dependency Dashboard, and the pull request stays red until the build exists and the pin is completed. The listing page carries no release timestamps.",
+      matchDatasources: ["custom.asterisk-releases"],
+      dependencyDashboardApproval: true,
+      minimumReleaseAgeBehaviour: "timestamp-optional",
+    },
+    {
+      description: "Asterisk: a telephony node runs on a long-term-support series, and those are the even majors.",
+      matchDatasources: ["custom.asterisk-releases"],
+      allowedVersions: "/^\\d*[02468]\\./",
+    },
     {
       description: "schemars 1 waits for typify, which generates the Rust types of the node protocol from its description: it builds on typify-impl, whose newest release requires schemars 0.8, and build.rs hands typify a schemars 0.8 RootSchema. Approve on the Dependency Dashboard when a release of typify-impl admits schemars 1.",
       matchDatasources: ["crate"],
