@@ -152,6 +152,9 @@ const OPERATOR_ROOTS: &str = "operator-roots.pem";
 /// The label of the step of an entry where its fallback begins.
 pub const FALLBACK_LABEL: &str = "fallback";
 const FALLBACK_STEP: &str = "(fallback)";
+/// The label of the step of an entry that follows telling the caller's
+/// network that the call rings.
+const RUNG_LABEL: &str = "rung";
 
 /// Files Asterisk looks for and the node has nothing to say in. They exist
 /// so that Asterisk finds them: a missing optional file is reported as an
@@ -601,6 +604,13 @@ fn connections(config: &Config, secret: &str) -> String {
 /// The dialplan: how a call from the telephone network enters, and what
 /// becomes of it when it cannot.
 ///
+/// First the caller's network is told that the call rings: until somebody
+/// answers — the application, the one a fallback dials, or the fallback's
+/// message — the caller hears ringback, whoever is in charge of the call and
+/// whether anybody is. Only a caller still unanswered is told so: to a call
+/// already answered Asterisk would play the ringing tone itself, into the
+/// call.
+///
 /// A number that is an entry leads to the node's application. A call cannot
 /// enter while the controller is not connected: Asterisk then says so at
 /// once, and the call tries again a second later, [`ENTRY_TRIES`] times in
@@ -628,7 +638,12 @@ fn dialplan(config: &Config, settings: &Settings) -> String {
                 steps.extend(fallback(config, settings, &entry.fallback));
                 steps.push("Hangup()".to_owned());
 
-                let _ = writeln!(text, "exten = {number},1,Set(GABION_TRIES=0)");
+                let _ = writeln!(
+                    text,
+                    "exten = {number},1,GotoIf($[\"${{CHANNEL(state)}}\" = \"Up\"]?{RUNG_LABEL})\n \
+                     same = n,Ringing()\n \
+                     same = n({RUNG_LABEL}),Set(GABION_TRIES=0)"
+                );
                 let last = steps.len() - 1;
                 for (position, step) in steps.iter().enumerate() {
                     // The steps the others jump to are the ones with names.
@@ -1115,7 +1130,11 @@ mod tests {
         let dialplan = |fallback: &[&str]| {
             [
                 "[gabion-from-network]",
-                "exten = +19715870050,1,Set(GABION_TRIES=0)",
+                // The caller hears ringback until somebody answers; one
+                // already answered would hear the tone played into the call.
+                r#"exten = +19715870050,1,GotoIf($["${CHANNEL(state)}" = "Up"]?rung)"#,
+                " same = n,Ringing()",
+                " same = n(rung),Set(GABION_TRIES=0)",
                 " same = n(enter),Stasis(gabion,dialed_number,+19715870050)",
                 r#" same = n,GotoIf($["${STASISSTATUS}" = "SUCCESS"]?done)"#,
                 " same = n,Set(GABION_TRIES=$[${GABION_TRIES}+1])",

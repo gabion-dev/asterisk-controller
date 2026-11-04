@@ -834,6 +834,41 @@ impl ControlInterface {
         heard.map_err(|_| format!("channel {channel} did not hear {count} digits").into())
     }
 
+    /// A call this Asterisk placed is told, before anyone answers it, that it
+    /// rings: its channel comes to the state `Ringing`, which Asterisk gives
+    /// it on the answer that says so (180) — and on nothing else. Waited for,
+    /// since the word takes a moment to come; `what` names the call.
+    async fn hears_it_ring(&self, channel: &str, what: &str) -> TestResult {
+        let mut state = String::new();
+        let rang = timeout(STEP, async {
+            loop {
+                let (status, body) = self.request("GET", &format!("channels/{channel}")).await?;
+                if status != 200 {
+                    return Err::<(), Box<dyn Error>>(
+                        format!("{what}: the call ended without ringing: {status} {body}").into(),
+                    );
+                }
+                read_asterisk(&body)?
+                    .get("state")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .clone_into(&mut state);
+                if state == "Ringing" {
+                    return Ok(());
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        match rang {
+            Ok(result) => result,
+            Err(_) => Err(format!(
+                "{what}: the caller's network was not told the call rings — its end is {state:?}"
+            )
+            .into()),
+        }
+    }
+
     /// The telephone network's reason for the end of a channel that was in
     /// the test's own application — waited for, since the end takes a moment.
     async fn reason_it_ended(&self, channel: &str) -> TestResult<i64> {
@@ -2689,6 +2724,13 @@ async fn a_call_arrives_from_the_operator(stand: &Stand) -> TestResult {
         Some(CALLER),
         "the caller's number did not arrive with the call"
     );
+    // Until somebody answers, the caller hears ringback: their network is
+    // told the call rings.
+    stand
+        .network
+        .control
+        .hears_it_ring(&caller, "a call from the operator, before it is answered")
+        .await?;
 
     owner.send(&ApplicationMessage::Accept)?;
     owner.command(
@@ -5405,6 +5447,14 @@ async fn asterisk_alone_gives_fallbacks(stand: &Stand, network_end: &str) -> Tes
         .create_channel(&from_the_operator(DIALED_WITH_TRANSFER))
         .await?;
     let turned_away = network.create_channel(&from_the_operator(DIALED)).await?;
+    // With nobody in charge, both callers hear ringback while Asterisk waits
+    // for a controller: their network is told the calls ring.
+    for (call, what) in [
+        (&transferred, "a call to be transferred by Asterisk alone"),
+        (&turned_away, "a call to be turned away by Asterisk alone"),
+    ] {
+        network.hears_it_ring(call, what).await?;
+    }
 
     // The first is connected to the number of its entry's fallback: the
     // network gets a call from the node for that number, showing the line's.
