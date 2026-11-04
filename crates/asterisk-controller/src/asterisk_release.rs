@@ -14,9 +14,17 @@
 //! its archives, the glibc symbol versions its Linux trees need (`readelf
 //! -V` of every ELF file of the tree, newest per library) and the modules it
 //! carries ([`crate::asterisk_files`]).
+//!
+//! `asterisk-controller asterisk-release` prints the pin — the release and,
+//! for each archive, where it is published, its checksum and what its tree
+//! needs of glibc — for whoever has to know what a node of this controller
+//! runs without running one: a scanner of the archives a node downloads
+//! reads it here rather than keeping a copy that would drift.
+
+use std::process::ExitCode;
 
 /// The release of gabion-dev/asterisk-server.
-pub const RELEASE: &str = "22.11.0-r3";
+pub const RELEASE: &str = "22.11.0-r4";
 
 /// Where the archives of every release are published.
 const DOWNLOADS: &str = "https://github.com/gabion-dev/asterisk-server/releases/download";
@@ -30,9 +38,8 @@ pub struct Archive {
     /// The newest symbol version every glibc library must define for the
     /// tree to load. glibc defines its versions cumulatively, so a library
     /// that defines the newest one defines the older ones too. Empty on
-    /// macOS, which has no glibc. Read only where there is glibc to judge
-    /// ([`crate::host`]) and by the checks of the pin.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    /// macOS, which has no glibc. Judged where there is glibc
+    /// ([`crate::host`]); told with the pin everywhere.
     pub glibc: &'static [(&'static str, &'static str)],
 }
 
@@ -49,7 +56,7 @@ impl Archive {
 /// release number, is what the dynamic loader checks.
 const LINUX_AMD64: Archive = Archive {
     name: "asterisk-server-linux-amd64.tar.gz",
-    sha256: "28145d8df5909528580bc04abff350af770f2e4086bae0084d978352ad463a21",
+    sha256: "13d4d99fa4ae68f8ccf685008cc14c81061a8abae7bc74caca07031ae038d509",
     glibc: &[
         ("libc.so.6", "GLIBC_2.35"),
         ("libm.so.6", "GLIBC_2.29"),
@@ -59,7 +66,7 @@ const LINUX_AMD64: Archive = Archive {
 
 const LINUX_ARM64: Archive = Archive {
     name: "asterisk-server-linux-arm64.tar.gz",
-    sha256: "f43c5a4eb868d9ec64c3cc0ee15e44615c13923b0af050aaf3f6d3e2da2b5ba4",
+    sha256: "6862b85a22015cf7ea93a70087781b36db06cb32ea49a1f1ee8c25fa65b97b70",
     glibc: &[
         ("libc.so.6", "GLIBC_2.35"),
         ("libm.so.6", "GLIBC_2.29"),
@@ -69,15 +76,57 @@ const LINUX_ARM64: Archive = Archive {
 
 const DARWIN_ARM64: Archive = Archive {
     name: "asterisk-server-darwin-arm64.tar.gz",
-    sha256: "dad28302be12f39f687e509f45a4de7fa3396d0514524cc681d2e3392633aca4",
+    sha256: "95609c142d83598bc676572ae5e4064225d0d7746445488da961a7403aebf6c8",
     glibc: &[],
 };
 
 const DARWIN_AMD64: Archive = Archive {
     name: "asterisk-server-darwin-amd64.tar.gz",
-    sha256: "56791a5a2f1c04ad5eabcb94d9e8e5055885101454ca3d2c7a141520b731e676",
+    sha256: "bfd650e25616c78fa068cf736003294147622a8117f4abd786b17a6149e36cf7",
     glibc: &[],
 };
+
+/// Every archive of the release.
+const ARCHIVES: [&Archive; 4] = [&LINUX_AMD64, &LINUX_ARM64, &DARWIN_ARM64, &DARWIN_AMD64];
+
+/// The pin, as `asterisk-controller asterisk-release` prints it.
+fn pin() -> serde_json::Value {
+    let archives: Vec<serde_json::Value> = ARCHIVES
+        .iter()
+        .map(|archive| {
+            let glibc: serde_json::Map<String, serde_json::Value> = archive
+                .glibc
+                .iter()
+                .map(|&(library, version)| (library.to_owned(), version.into()))
+                .collect();
+            serde_json::json!({
+                "name": archive.name,
+                "url": archive.url(),
+                "sha256": archive.sha256,
+                "glibc": glibc,
+            })
+        })
+        .collect();
+    serde_json::json!({ "release": RELEASE, "archives": archives })
+}
+
+/// Run `asterisk-controller asterisk-release`: print the pin.
+pub fn run(mut arguments: impl Iterator<Item = String>) -> ExitCode {
+    if arguments.next().is_some() {
+        eprintln!("usage: asterisk-controller asterisk-release");
+        return ExitCode::FAILURE;
+    }
+    match serde_json::to_string_pretty(&pin()) {
+        Ok(text) => {
+            println!("{text}");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("asterisk-controller asterisk-release: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
 
 /// The archive of the platform this controller is built for — the one it
 /// runs on.
@@ -101,7 +150,7 @@ mod tests {
 
     #[test]
     fn every_archive_is_pinned_by_a_whole_checksum_and_linux_ones_by_their_glibc_needs() {
-        for archive in [&LINUX_AMD64, &LINUX_ARM64, &DARWIN_ARM64, &DARWIN_AMD64] {
+        for archive in ARCHIVES {
             assert_eq!(archive.sha256.len(), 64, "{}", archive.name);
             assert!(
                 archive.sha256.chars().all(|c| c.is_ascii_hexdigit()),
@@ -114,6 +163,34 @@ mod tests {
                 "{}",
                 archive.name
             );
+        }
+    }
+
+    #[test]
+    fn the_printed_pin_is_the_pin_of_every_archive() {
+        let field = |value: &serde_json::Value, key: &str| value.get(key).cloned();
+        let pin = pin();
+        assert_eq!(field(&pin, "release"), Some(RELEASE.into()));
+        let printed = field(&pin, "archives")
+            .and_then(|archives| archives.as_array().cloned())
+            .unwrap_or_default();
+        assert_eq!(printed.len(), ARCHIVES.len());
+        for (archive, printed) in ARCHIVES.iter().zip(&printed) {
+            assert_eq!(field(printed, "name"), Some(archive.name.into()));
+            assert_eq!(field(printed, "url"), Some(archive.url().into()));
+            assert_eq!(field(printed, "sha256"), Some(archive.sha256.into()));
+            let glibc = field(printed, "glibc")
+                .and_then(|glibc| glibc.as_object().cloned())
+                .unwrap_or_default();
+            assert_eq!(glibc.len(), archive.glibc.len(), "{}", archive.name);
+            for &(library, version) in archive.glibc {
+                assert_eq!(
+                    glibc.get(library),
+                    Some(&version.into()),
+                    "{}",
+                    archive.name
+                );
+            }
         }
     }
 

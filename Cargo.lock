@@ -58,7 +58,7 @@ dependencies = [
 
 [[package]]
 name = "asterisk-controller"
-version = "0.1.0-dev.9"
+version = "0.1.0-dev.10"
 dependencies = [
  "data-encoding",
  "flate2",

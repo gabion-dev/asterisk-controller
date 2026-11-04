@@ -70,7 +70,7 @@ You need:
   asterisk-controller tree <directory>
   ```
 
-  downloads release `22.11.0-r3` of
+  downloads release `22.11.0-r4` of
   [gabion-dev/asterisk-server](https://github.com/gabion-dev/asterisk-server)
   for this platform — Linux (x86_64, aarch64) or macOS (arm64, x86_64) —
   refuses it unless its SHA-256 is the one pinned in the controller, and
@@ -81,7 +81,16 @@ You need:
   for (the RHEL 9 family's and Amazon Linux 2023's glibc 2.34 do, a stock
   2.34 does not), on macOS Darwin 22 (macOS 13) or later is needed; a
   machine that falls short is told what it lacks. `scripts/fetch-asterisk.sh`
-  runs it for `target/asterisk-server`. The tree is only read;
+  runs it for `target/asterisk-server`. The tree is only read.
+
+  ```sh
+  asterisk-controller asterisk-release
+  ```
+
+  prints that pin as JSON — the release and, for each of the four archives,
+  its name, its address, its SHA-256 and the glibc symbol version its tree
+  needs of each glibc library (none on macOS) — for whoever has to know what
+  a node of this controller runs without running one;
 - a state directory for the node, with the node's secret in it
   ([below](#the-state-directory)).
 

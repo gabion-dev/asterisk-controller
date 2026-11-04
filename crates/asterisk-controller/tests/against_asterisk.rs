@@ -133,6 +133,12 @@ const STRANGER_ADDRESS: &str = "127.0.0.2";
 /// The address of the operator the node reaches over TLS: an operator is
 /// known by the address its calls come from, so it has one of its own.
 const SECURE_ADDRESS: &str = "127.0.0.3";
+/// The name the certificate of the operator's calls to the node carries,
+/// and nothing else — as a real operator's certificate carries its name
+/// while its messages name an address. In a domain reserved for tests
+/// (RFC 6761): nothing resolves it, and nothing has to — the node only
+/// answers the calls of the operator it names.
+const SECURE_NAME: &str = "operator.test";
 
 fn asterisk_tree() -> TestResult<PathBuf> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -153,17 +159,27 @@ fn asterisk_tree() -> TestResult<PathBuf> {
 /// of RTP and RTCP in pairs.
 const AUDIO_PORTS: u16 = 20;
 
-/// Where the operators of the test's telephone network are: the plain one
-/// and the one reached over TLS.
+/// Where the operators of the test's telephone network are: the plain one,
+/// the one the node calls out through over TLS, and the one whose calls
+/// reach the node over TLS.
 #[derive(Clone, Copy)]
 struct OperatorPorts {
     plain: u16,
     secure: u16,
+    secure_by_name: u16,
 }
 
 /// The settings the node of the test starts on: three entries, and the
 /// operators whose trunks are the test's telephone network — one over UDP,
-/// one over TLS — with lines through them.
+/// two over TLS — with lines through them.
+///
+/// Over TLS the network is two operators at one address, as a real operator
+/// is for the node: the node calls out through one reached at an address,
+/// whose certificate carries that address; the other's calls reach the node,
+/// and it is reached by name — its certificate carries the name, and its
+/// messages the address. Requests within a call it began go to the address,
+/// and the connection there is judged by the name: the hang-up from the
+/// node's side of such a call reaches the network only so.
 fn settings(operators: OperatorPorts) -> serde_json::Value {
     serde_json::json!({
         "operators": [{
@@ -180,6 +196,13 @@ fn settings(operators: OperatorPorts) -> serde_json::Value {
             "port": operators.secure,
             "transport": "tls",
             "credentials": { "username": "node", "password": OPERATOR_PASSWORD },
+            "source_networks": [],
+            "countries": ["US"]
+        }, {
+            "id": "the test's secure operator by name",
+            "host": SECURE_NAME,
+            "port": operators.secure_by_name,
+            "transport": "tls",
             "source_networks": [format!("{SECURE_ADDRESS}/32")],
             "countries": ["US"]
         }],
@@ -255,6 +278,9 @@ struct NetworkPorts {
     stranger: u16,
     /// Where the operator's trunk over TLS is.
     secure: u16,
+    /// Where the operator over TLS calls the node from and names in its
+    /// messages: the trunk whose certificate carries its name alone.
+    secure_by_name: u16,
     audio: u16,
     /// Where the node listens for operators.
     node: u16,
@@ -273,6 +299,7 @@ impl NetworkPorts {
             operator: ports.one().await?,
             stranger: ports.one().await?,
             secure: ports.one().await?,
+            secure_by_name: ports.one().await?,
             audio: ports.range(AUDIO_PORTS).await?,
             node,
             node_secure: ports.one().await?,
@@ -281,8 +308,8 @@ impl NetworkPorts {
 }
 
 /// The certificates of the test: the node's, which the network judges, and
-/// the network's, which the node judges — each made for the address it is
-/// reached at.
+/// the network's two, which the node judges — each made for the address or
+/// the name it is reached at.
 struct Certificates {
     node: PathBuf,
     node_key: PathBuf,
@@ -290,6 +317,12 @@ struct Certificates {
     node_der: Vec<u8>,
     network: PathBuf,
     network_key: PathBuf,
+    /// The certificate of the trunk the operator calls the node from: for
+    /// its name alone.
+    network_by_name: PathBuf,
+    network_by_name_key: PathBuf,
+    /// Both certificates of the network: the roots the controller trusts.
+    network_roots: PathBuf,
 }
 
 impl Certificates {
@@ -308,12 +341,21 @@ impl Certificates {
         };
         let (node, node_key, node_der) = made("127.0.0.1", "node")?;
         let (network, network_key, _) = made(SECURE_ADDRESS, "network")?;
+        let (network_by_name, network_by_name_key, _) = made(SECURE_NAME, "network-by-name")?;
+        let network_roots = directory.join("network-roots.pem");
+        fs::write(
+            &network_roots,
+            [fs::read(&network)?, fs::read(&network_by_name)?].concat(),
+        )?;
         Ok(Self {
             node,
             node_key,
             node_der,
             network,
             network_key,
+            network_by_name,
+            network_by_name_key,
+            network_roots,
         })
     }
 }
@@ -434,9 +476,12 @@ fn network_dialplan() -> String {
 /// (`moh_passthrough`), not by playing music of its own.
 ///
 /// The secure operator reaches the node over TLS, at its own address, with
-/// encrypted audio, and judges the node's certificate. Calls the node places
-/// through it come from the node's address and are taken by `the-node`,
-/// which takes encrypted audio when it is offered and plain audio otherwise.
+/// encrypted audio, and judges the node's certificate. It has two trunks
+/// there: `secure`, whose certificate carries the address, takes the calls
+/// the node places — they come from the node's address and are taken by
+/// `the-node`, which takes encrypted audio when it is offered and plain
+/// audio otherwise; `secure-by-name`, whose certificate carries only the
+/// name, places the calls to the node and is the address its messages name.
 fn network_sides(ports: &NetworkPorts, certificates: &Certificates) -> String {
     let side = |name: &str, transport: &str, more: &str| {
         format!(
@@ -447,7 +492,7 @@ fn network_sides(ports: &NetworkPorts, certificates: &Certificates) -> String {
         )
     };
     let secure_side = format!(
-        "[the-node-secure]\ntype = endpoint\ntransport = secure\ncontext = from-the-node\n\
+        "[the-node-secure]\ntype = endpoint\ntransport = secure-by-name\ncontext = from-the-node\n\
          disallow = all\nallow = ulaw\naors = the-node-secure\ndirect_media = no\n\
          media_encryption = sdes\nmedia_encryption_optimistic = no\nrtp_keepalive = 1\n\n\
          [the-node-secure]\ntype = aor\ncontact = sip:127.0.0.1:{}\\;transport=tls\n\n",
@@ -460,6 +505,9 @@ fn network_sides(ports: &NetworkPorts, certificates: &Certificates) -> String {
          [secure]\ntype = transport\nprotocol = tls\nbind = {SECURE_ADDRESS}:{}\n\
          method = tlsv1_2\ncert_file = {}\npriv_key_file = {}\nca_list_file = {}\n\
          verify_server = yes\n\n\
+         [secure-by-name]\ntype = transport\nprotocol = tls\nbind = {SECURE_ADDRESS}:{}\n\
+         method = tlsv1_2\ncert_file = {}\npriv_key_file = {}\nca_list_file = {}\n\
+         verify_server = yes\n\n\
          {}{}{}{secure_side}\
          [the-node]\ntype = identify\nendpoint = the-node\nmatch = 127.0.0.1/32\n\n\
          [the-node-credentials]\ntype = auth\nauth_type = userpass\nusername = node\n\
@@ -469,6 +517,10 @@ fn network_sides(ports: &NetworkPorts, certificates: &Certificates) -> String {
         ports.secure,
         certificates.network.display(),
         certificates.network_key.display(),
+        certificates.node.display(),
+        ports.secure_by_name,
+        certificates.network_by_name.display(),
+        certificates.network_by_name_key.display(),
         certificates.node.display(),
         // The operator asks the node who it is, and knows the same password
         // the node's settings carry.
@@ -1890,6 +1942,7 @@ impl Stand {
         let operators = OperatorPorts {
             plain: network_ports.operator,
             secure: network_ports.secure,
+            secure_by_name: network_ports.secure_by_name,
         };
         let certificates = Certificates::make(&root.join("certificates"))?;
         what_the_node_is_given(&state, operators)?;
@@ -1925,7 +1978,8 @@ impl Stand {
             certificates.node_key.clone().into_os_string(),
         ]
         .into();
-        let controller = start_controller(&controller_arguments, &certificates.network).await?;
+        let controller =
+            start_controller(&controller_arguments, &certificates.network_roots).await?;
 
         // Asterisk is started on what the controller wrote, and on nothing else.
         let mut asterisk =
@@ -2057,7 +2111,7 @@ impl Stand {
     /// Start a controller in place of the one that was killed.
     async fn start_the_controller(&mut self) -> TestResult {
         self.controller =
-            start_controller(&self.controller_arguments, &self.certificates.network).await?;
+            start_controller(&self.controller_arguments, &self.certificates.network_roots).await?;
         Ok(())
     }
 
@@ -2845,7 +2899,10 @@ async fn secured(stand: &Stand, channel: &str) -> TestResult {
 /// Calls over TLS, with encrypted audio: the operator reached over TLS calls
 /// the node, and the node calls through it. Asterisk itself says each call's
 /// signalling and audio are secured, and the application hears and speaks
-/// as on any call.
+/// as on any call. The application ends the conversation, so the node hangs
+/// up the call the operator began: to the address the operator's messages
+/// name, on a connection judged by the operator's name — unless the hang-up
+/// reaches the network, its end of the call stays.
 async fn calls_go_over_tls(stand: &Stand) -> TestResult {
     let caller = stand
         .network

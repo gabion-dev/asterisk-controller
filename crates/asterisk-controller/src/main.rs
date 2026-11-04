@@ -62,13 +62,15 @@ use crate::{config::Config, node::Node};
 async fn main() -> ExitCode {
     // `launch` starts the node — Asterisk together with this controller —
     // and keeps it running (crate::launch); `tree` puts the pinned Asterisk
-    // tree in place (crate::tree); `install` makes a Linux server a node
+    // tree in place (crate::tree); `asterisk-release` prints that pin
+    // (crate::asterisk_release); `install` makes a Linux server a node
     // (crate::install); without any of them, this is the controller.
     let mut arguments = std::env::args().skip(1).peekable();
     let mode = arguments.peek().cloned();
     match mode.as_deref() {
         Some("launch") => return launch::run(arguments.skip(1)).await,
         Some("tree") => return tree::run(arguments.skip(1)).await,
+        Some("asterisk-release") => return asterisk_release::run(arguments.skip(1)),
         Some("install") => return install::run(arguments.skip(1)).await,
         _ => {}
     }
